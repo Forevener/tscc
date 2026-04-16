@@ -1,0 +1,23 @@
+[package]
+name = "tscc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tscc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tscc"
+path = "src/main.rs"
+
+[dependencies]
+oxc_parser = "0.124"
+oxc_allocator = "0.124"
+oxc_span = "0.124"
+oxc_ast = "0.124"
+wasm-encoder = "0.226"
+
+[dev-dependencies]
+wasmtime = { version = "31", default-features = false, features = ["cranelift", "runtime"] }
+wasmparser = "0.226"
