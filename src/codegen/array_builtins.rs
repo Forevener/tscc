@@ -194,6 +194,26 @@ fn extract_arrow_params(arrow: &ArrowFunctionExpression) -> Result<Vec<String>, 
     Ok(names)
 }
 
+/// Build the `param_locals` and `param_class_types` vectors for an arrow
+/// callback that takes `(elem)` or `(elem, index)`.
+/// `params` must have 1 or 2 entries; the second (if present) is bound to the
+/// loop index local.
+fn build_elem_index_bindings(
+    params: &[String],
+    elem_local: u32,
+    elem_ty: WasmType,
+    i_local: u32,
+    elem_class: Option<&str>,
+) -> (Vec<(u32, WasmType)>, Vec<Option<String>>) {
+    let mut locals = vec![(elem_local, elem_ty)];
+    let mut classes: Vec<Option<String>> = vec![elem_class.map(|s| s.to_string())];
+    if params.len() >= 2 {
+        locals.push((i_local, WasmType::I32));
+        classes.push(None);
+    }
+    (locals, classes)
+}
+
 /// Evaluate an arrow function body inline.
 /// For expression arrows (`x => expr`), evaluates the expression and returns its type.
 /// For block arrows (`x => { stmts; return val; }`), evaluates statements.
@@ -474,9 +494,9 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
-        if params.len() != 1 {
+        if params.is_empty() || params.len() > 2 {
             return Err(CompileError::codegen(
-                "some/every predicate must take 1 parameter",
+                "some/every predicate must take 1-2 parameters",
             ));
         }
         let esize = elem_size(elem_ty)?;
@@ -490,8 +510,6 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(src_len));
 
         let result_local = self.alloc_local(WasmType::I32);
-        // `every` starts true, flips to false on first failure.
-        // `some` starts false, flips to true on first success.
         self.push(Instruction::I32Const(if all { 1 } else { 0 }));
         self.push(Instruction::LocalSet(result_local));
 
@@ -512,12 +530,9 @@ impl<'a> FuncContext<'a> {
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(elem_local));
 
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(elem_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string())],
-        );
+        let (param_locals, param_classes) =
+            build_elem_index_bindings(&params, elem_local, elem_ty, i_local, elem_class);
+        let scope = setup_arrow_scope(self, &params, &param_locals, &param_classes);
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
             return Err(CompileError::type_err(
@@ -576,9 +591,9 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
-        if params.len() != 1 {
+        if params.is_empty() || params.len() > 2 {
             return Err(CompileError::codegen(
-                "find predicate must take 1 parameter",
+                "find predicate must take 1-2 parameters",
             ));
         }
         let esize = elem_size(elem_ty)?;
@@ -597,7 +612,6 @@ impl<'a> FuncContext<'a> {
         let found_val = self.alloc_local(elem_ty);
         self.push(Instruction::I32Const(-1));
         self.push(Instruction::LocalSet(found_idx));
-        // Initialize found_val to default
         match elem_ty {
             WasmType::F64 => {
                 self.push(Instruction::F64Const(0.0));
@@ -635,12 +649,9 @@ impl<'a> FuncContext<'a> {
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(elem_local));
 
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(elem_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string())],
-        );
+        let (param_locals, param_classes) =
+            build_elem_index_bindings(&params, elem_local, elem_ty, i_local, elem_class);
+        let scope = setup_arrow_scope(self, &params, &param_locals, &param_classes);
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
             return Err(CompileError::type_err(
@@ -685,57 +696,45 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
-        if params.len() != 1 {
+        if params.is_empty() || params.len() > 2 {
             return Err(CompileError::codegen(
-                "filter callback must have exactly 1 parameter",
+                "filter callback must have 1-2 parameters",
             ));
         }
         let esize = elem_size(elem_ty)?;
 
-        // Evaluate source array
         let src_local = self.alloc_local(WasmType::I32);
         self.emit_expr(arr_expr)?;
         self.push(Instruction::LocalSet(src_local));
 
-        // Get source length (= max capacity for result)
         let src_len = self.alloc_local(WasmType::I32);
         emit_arr_length(self, src_local);
         self.push(Instruction::LocalSet(src_len));
 
-        // Allocate result array with capacity = source length
         let result_local = emit_alloc_array(self, src_len, elem_ty)?;
 
-        // Loop: for i = 0; i < src_len; i++
         let i_local = self.alloc_local(WasmType::I32);
         self.push(Instruction::I32Const(0));
         self.push(Instruction::LocalSet(i_local));
 
-        // Temp local for element value
         let elem_local = self.alloc_local(elem_ty);
 
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty));
         self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-        // if i >= src_len, break
         self.push(Instruction::LocalGet(i_local));
         self.push(Instruction::LocalGet(src_len));
         self.push(Instruction::I32GeU);
         self.push(Instruction::BrIf(1));
 
-        // Load element: src[i]
         emit_elem_addr(self, src_local, i_local, esize);
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(elem_local));
 
-        // Set up arrow scope: bind param to elem_local
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(elem_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string())],
-        );
+        let (param_locals, param_classes) =
+            build_elem_index_bindings(&params, elem_local, elem_ty, i_local, elem_class);
+        let scope = setup_arrow_scope(self, &params, &param_locals, &param_classes);
 
-        // Evaluate predicate
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
             return Err(CompileError::type_err(
@@ -777,19 +776,17 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
-        if params.len() != 1 {
+        if params.is_empty() || params.len() > 2 {
             return Err(CompileError::codegen(
-                "map callback must have exactly 1 parameter",
+                "map callback must have 1-2 parameters",
             ));
         }
         let esize = elem_size(elem_ty)?;
 
-        // Evaluate source array
         let src_local = self.alloc_local(WasmType::I32);
         self.emit_expr(arr_expr)?;
         self.push(Instruction::LocalSet(src_local));
 
-        // Source length = exact capacity for result
         let src_len = self.alloc_local(WasmType::I32);
         emit_arr_length(self, src_local);
         self.push(Instruction::LocalSet(src_len));
@@ -843,13 +840,9 @@ impl<'a> FuncContext<'a> {
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(elem_local));
 
-        // Set up arrow scope
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(elem_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string())],
-        );
+        let (param_locals, param_classes) =
+            build_elem_index_bindings(&params, elem_local, elem_ty, i_local, elem_class);
+        let scope = setup_arrow_scope(self, &params, &param_locals, &param_classes);
 
         // Evaluate arrow body — result value is on the stack
         let _result_ty = eval_arrow_body(self, arrow)?;
@@ -885,14 +878,13 @@ impl<'a> FuncContext<'a> {
     ) -> Result<(), CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
-        if params.len() != 1 {
+        if params.is_empty() || params.len() > 2 {
             return Err(CompileError::codegen(
-                "forEach callback must have exactly 1 parameter",
+                "forEach callback must have 1-2 parameters",
             ));
         }
         let esize = elem_size(elem_ty)?;
 
-        // Evaluate source array
         let src_local = self.alloc_local(WasmType::I32);
         self.emit_expr(arr_expr)?;
         self.push(Instruction::LocalSet(src_local));
@@ -909,26 +901,19 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty));
         self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-        // if i >= src_len, break
         self.push(Instruction::LocalGet(i_local));
         self.push(Instruction::LocalGet(src_len));
         self.push(Instruction::I32GeU);
         self.push(Instruction::BrIf(1));
 
-        // Load element
         emit_elem_addr(self, src_local, i_local, esize);
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(elem_local));
 
-        // Set up arrow scope
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(elem_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string())],
-        );
+        let (param_locals, param_classes) =
+            build_elem_index_bindings(&params, elem_local, elem_ty, i_local, elem_class);
+        let scope = setup_arrow_scope(self, &params, &param_locals, &param_classes);
 
-        // Evaluate arrow body, drop result if any
         let body_ty = eval_arrow_body(self, arrow)?;
         if body_ty != WasmType::Void {
             self.push(Instruction::Drop);

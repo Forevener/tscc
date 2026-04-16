@@ -109,7 +109,7 @@ impl<'a> FuncContext<'a> {
                 Ok(Some(elem_ty))
             }
             "fill" => {
-                if !matches!(call.arguments.len(), 1 | 2 | 3) {
+                if !matches!(call.arguments.len(), 1..=3) {
                     return Err(CompileError::codegen("Array.fill expects 1-3 arguments"));
                 }
                 self.emit_array_fill(&member.object, elem_ty, call)?;

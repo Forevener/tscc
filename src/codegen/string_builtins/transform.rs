@@ -3,135 +3,7 @@ use wasm_encoder::{Function, Instruction, ValType};
 use super::{
     STRING_HEADER_SIZE, emit_is_whitespace, mem_load_i32, mem_load8_u, mem_store_i32, mem_store8,
 };
-// ============================================================
-// __str_slice(s: i32, start: i32, end: i32) -> i32
-// Arena-allocates a new string with bytes [start..end)
-// ============================================================
-pub(super) fn build_str_slice(arena_idx: u32) -> Function {
-    // Params: s=0, start=1, end=2
-    // Locals: len=3, new_len=4, total=5, ptr=6
-    let locals = vec![
-        (1, ValType::I32), // len
-        (1, ValType::I32), // new_len
-        (1, ValType::I32), // total
-        (1, ValType::I32), // ptr
-    ];
-    let mut func = Function::new(locals);
-    let (s, start, end) = (0u32, 1, 2);
-    let (len, new_len, total, ptr) = (3u32, 4, 5, 6);
-
-    // len = load(s)
-    func.instruction(&Instruction::LocalGet(s));
-    func.instruction(&mem_load_i32(0));
-    func.instruction(&Instruction::LocalSet(len));
-
-    // Clamp start: if start < 0: start = max(0, len + start)
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::I32LtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    // start = len + start
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalSet(start));
-    // if still < 0: start = 0
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::I32LtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::LocalSet(start));
-    func.instruction(&Instruction::End);
-    func.instruction(&Instruction::End);
-
-    // Clamp start to len
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::I32GtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::LocalSet(start));
-    func.instruction(&Instruction::End);
-
-    // Clamp end: if end < 0: end = max(0, len + end)
-    func.instruction(&Instruction::LocalGet(end));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::I32LtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::LocalGet(end));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalSet(end));
-    func.instruction(&Instruction::LocalGet(end));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::I32LtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::LocalSet(end));
-    func.instruction(&Instruction::End);
-    func.instruction(&Instruction::End);
-
-    // Clamp end to len
-    func.instruction(&Instruction::LocalGet(end));
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::I32GtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::LocalSet(end));
-    func.instruction(&Instruction::End);
-
-    // new_len = max(0, end - start)
-    func.instruction(&Instruction::LocalGet(end));
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::I32Sub);
-    func.instruction(&Instruction::LocalSet(new_len));
-    func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::I32LtS);
-    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
-    func.instruction(&Instruction::I32Const(0));
-    func.instruction(&Instruction::LocalSet(new_len));
-    func.instruction(&Instruction::End);
-
-    // total = new_len + 4
-    func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalSet(total));
-
-    // ptr = arena_alloc(total)
-    func.instruction(&Instruction::GlobalGet(arena_idx));
-    func.instruction(&Instruction::LocalSet(ptr));
-    func.instruction(&Instruction::GlobalGet(arena_idx));
-    func.instruction(&Instruction::LocalGet(total));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::GlobalSet(arena_idx));
-
-    // store length
-    func.instruction(&Instruction::LocalGet(ptr));
-    func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&mem_store_i32(0));
-
-    // memory.copy(ptr+4, s+4+start, new_len)
-    func.instruction(&Instruction::LocalGet(ptr));
-    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalGet(s));
-    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalGet(start));
-    func.instruction(&Instruction::I32Add);
-    func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&Instruction::MemoryCopy {
-        src_mem: 0,
-        dst_mem: 0,
-    });
-
-    func.instruction(&Instruction::LocalGet(ptr));
-    func.instruction(&Instruction::End);
-    func
-}
+// __str_slice — now implemented via Rust→WASM pipeline (helpers/src/string.rs)
 // ============================================================
 // __str_toLower(s: i32) -> i32
 // ============================================================
@@ -832,6 +704,307 @@ fn build_pad(arena_idx: u32, pad_start: bool) -> Function {
         func.instruction(&Instruction::End);
         func.instruction(&Instruction::End);
     }
+
+    func.instruction(&Instruction::LocalGet(ptr));
+    func.instruction(&Instruction::End);
+    func
+}
+
+// ============================================================
+// __str_replaceAll(s: i32, search: i32, replacement: i32) -> i32
+// Replace ALL non-overlapping occurrences of search with replacement.
+// Two-pass: (1) count occurrences to compute result length,
+//           (2) build the output by copying segments + replacements.
+// ============================================================
+pub(super) fn build_str_replace_all(arena_idx: u32) -> Function {
+    // Params: s=0, search=1, replacement=2
+    // Locals: s_len=3, search_len=4, repl_len=5, count=6, i=7, j=8, matched=9,
+    //         new_len=10, ptr=11, src_pos=12, dst_pos=13, limit=14
+    let locals = vec![
+        (1, ValType::I32), // s_len
+        (1, ValType::I32), // search_len
+        (1, ValType::I32), // repl_len
+        (1, ValType::I32), // count
+        (1, ValType::I32), // i
+        (1, ValType::I32), // j
+        (1, ValType::I32), // matched
+        (1, ValType::I32), // new_len
+        (1, ValType::I32), // ptr
+        (1, ValType::I32), // src_pos
+        (1, ValType::I32), // dst_pos
+        (1, ValType::I32), // limit
+    ];
+    let mut func = Function::new(locals);
+    let (s, search, replacement) = (0u32, 1, 2);
+    let (s_len, search_len, repl_len, count, i, j, matched, new_len, ptr, src_pos, dst_pos, limit) =
+        (3u32, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+
+    // Load lengths
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&mem_load_i32(0));
+    func.instruction(&Instruction::LocalSet(s_len));
+    func.instruction(&Instruction::LocalGet(search));
+    func.instruction(&mem_load_i32(0));
+    func.instruction(&Instruction::LocalSet(search_len));
+    func.instruction(&Instruction::LocalGet(replacement));
+    func.instruction(&mem_load_i32(0));
+    func.instruction(&Instruction::LocalSet(repl_len));
+
+    // If search_len == 0, return s (avoid infinite loop)
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // If search_len > s_len, no match possible
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::LocalGet(s_len));
+    func.instruction(&Instruction::I32GtU);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // limit = s_len - search_len
+    func.instruction(&Instruction::LocalGet(s_len));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::LocalSet(limit));
+
+    // === Pass 1: count occurrences ===
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(count));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(i));
+
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $count_break
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // $count_loop
+    func.instruction(&Instruction::LocalGet(i));
+    func.instruction(&Instruction::LocalGet(limit));
+    func.instruction(&Instruction::I32GtS);
+    func.instruction(&Instruction::BrIf(1));
+
+    // Check if search matches at position i
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::LocalSet(matched));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(j));
+
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $match_break
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // $match_loop
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+    // Compare s[i+j] vs search[j]
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(i));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&mem_load8_u(0));
+    func.instruction(&Instruction::LocalGet(search));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&mem_load8_u(0));
+    func.instruction(&Instruction::I32Ne);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(matched));
+    func.instruction(&Instruction::Br(2)); // break match
+    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(j));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // end match loop
+    func.instruction(&Instruction::End); // end match block
+
+    // If matched, count++ and skip past the match (non-overlapping)
+    func.instruction(&Instruction::LocalGet(matched));
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(count));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(count));
+    func.instruction(&Instruction::LocalGet(i));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(i));
+    func.instruction(&Instruction::Br(1)); // continue count_loop
+    func.instruction(&Instruction::End);
+
+    // Not matched: i++
+    func.instruction(&Instruction::LocalGet(i));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(i));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // end count loop
+    func.instruction(&Instruction::End); // end count block
+
+    // If count == 0, return s unchanged
+    func.instruction(&Instruction::LocalGet(count));
+    func.instruction(&Instruction::I32Eqz);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::Return);
+    func.instruction(&Instruction::End);
+
+    // === Compute result length ===
+    // new_len = s_len - count * search_len + count * repl_len
+    //         = s_len + count * (repl_len - search_len)
+    func.instruction(&Instruction::LocalGet(s_len));
+    func.instruction(&Instruction::LocalGet(count));
+    func.instruction(&Instruction::LocalGet(repl_len));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Sub);
+    func.instruction(&Instruction::I32Mul);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(new_len));
+
+    // === Allocate result ===
+    func.instruction(&Instruction::GlobalGet(arena_idx));
+    func.instruction(&Instruction::LocalSet(ptr));
+    func.instruction(&Instruction::GlobalGet(arena_idx));
+    func.instruction(&Instruction::LocalGet(new_len));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(arena_idx));
+    func.instruction(&Instruction::LocalGet(ptr));
+    func.instruction(&Instruction::LocalGet(new_len));
+    func.instruction(&mem_store_i32(0));
+
+    // === Pass 2: build result ===
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(src_pos));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(dst_pos));
+
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $build_break
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // $build_loop
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::LocalGet(s_len));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+
+    // Check if search matches at src_pos (and there's room)
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(matched));
+
+    // Only try matching if src_pos + search_len <= s_len
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(s_len));
+    func.instruction(&Instruction::I32LeU);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::LocalSet(matched));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(j));
+
+    func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // $m2_break
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // $m2_loop
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32GeU);
+    func.instruction(&Instruction::BrIf(1));
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&mem_load8_u(0));
+    func.instruction(&Instruction::LocalGet(search));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&mem_load8_u(0));
+    func.instruction(&Instruction::I32Ne);
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+    func.instruction(&Instruction::I32Const(0));
+    func.instruction(&Instruction::LocalSet(matched));
+    func.instruction(&Instruction::Br(2)); // break m2
+    func.instruction(&Instruction::End);
+    func.instruction(&Instruction::LocalGet(j));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(j));
+    func.instruction(&Instruction::Br(0));
+    func.instruction(&Instruction::End); // end m2 loop
+    func.instruction(&Instruction::End); // end m2 block
+
+    func.instruction(&Instruction::End); // end "if room" check
+
+    // If matched: copy replacement, advance src_pos by search_len
+    func.instruction(&Instruction::LocalGet(matched));
+    func.instruction(&Instruction::If(wasm_encoder::BlockType::Empty));
+
+    // memory.copy(ptr + 4 + dst_pos, replacement + 4, repl_len)
+    func.instruction(&Instruction::LocalGet(ptr));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(dst_pos));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(replacement));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(repl_len));
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
+    func.instruction(&Instruction::LocalGet(dst_pos));
+    func.instruction(&Instruction::LocalGet(repl_len));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(dst_pos));
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::LocalGet(search_len));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(src_pos));
+
+    func.instruction(&Instruction::Else);
+
+    // Not matched: copy 1 byte from s[src_pos] to result[dst_pos]
+    func.instruction(&Instruction::LocalGet(ptr));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(dst_pos));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(s));
+    func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&mem_load8_u(0));
+    func.instruction(&mem_store8(0));
+    func.instruction(&Instruction::LocalGet(dst_pos));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(dst_pos));
+    func.instruction(&Instruction::LocalGet(src_pos));
+    func.instruction(&Instruction::I32Const(1));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::LocalSet(src_pos));
+
+    func.instruction(&Instruction::End); // end if matched
+
+    func.instruction(&Instruction::Br(0)); // continue build loop
+    func.instruction(&Instruction::End); // end build loop
+    func.instruction(&Instruction::End); // end build block
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);

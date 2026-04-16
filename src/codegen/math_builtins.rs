@@ -248,10 +248,10 @@ impl Scanner {
                             self.walk_expr(init);
                         }
                     }
-                } else if let Some(init) = &f.init {
-                    if let Some(e) = init.as_expression() {
-                        self.walk_expr(e);
-                    }
+                } else if let Some(init) = &f.init
+                    && let Some(e) = init.as_expression()
+                {
+                    self.walk_expr(e);
                 }
                 if let Some(test) = &f.test {
                     self.walk_expr(test);
@@ -307,21 +307,20 @@ impl Scanner {
             Statement::ExportDefaultDeclaration(e) => {
                 if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) =
                     &e.declaration
+                    && let Some(body) = &f.body
                 {
-                    if let Some(body) = &f.body {
-                        for s in &body.statements {
-                            self.walk_stmt(s);
-                        }
+                    for s in &body.statements {
+                        self.walk_stmt(s);
                     }
                 }
             }
             Statement::ClassDeclaration(c) => {
                 for elem in &c.body.body {
-                    if let ClassElement::MethodDefinition(m) = elem {
-                        if let Some(body) = &m.value.body {
-                            for s in &body.statements {
-                                self.walk_stmt(s);
-                            }
+                    if let ClassElement::MethodDefinition(m) = elem
+                        && let Some(body) = &m.value.body
+                    {
+                        for s in &body.statements {
+                            self.walk_stmt(s);
                         }
                     }
                 }

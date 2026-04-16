@@ -379,6 +379,69 @@ fn string_index_of_not_found() {
 }
 
 #[test]
+fn string_last_index_of_found() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "hello world hello";
+            return s.lastIndexOf("hello");
+        }
+    "#,
+    );
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    assert_eq!(test.call(&mut store, ()).unwrap(), 12);
+}
+
+#[test]
+fn string_last_index_of_not_found() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "hello world";
+            return s.lastIndexOf("xyz");
+        }
+    "#,
+    );
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    assert_eq!(test.call(&mut store, ()).unwrap(), -1);
+}
+
+#[test]
+fn string_last_index_of_empty_needle() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "hello";
+            return s.lastIndexOf("");
+        }
+    "#,
+    );
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    assert_eq!(test.call(&mut store, ()).unwrap(), 5); // returns haystack length
+}
+
+#[test]
 fn string_includes() {
     let wasm = compile(
         r#"
@@ -1402,6 +1465,336 @@ fn mixed_numeric_inside_plus_chain_still_numeric() {
         .unwrap();
     let len = test.call(&mut store, ()).unwrap();
     assert_eq!(len, 2, r#"(1+2) + "x" should be "3x" (length 2)"#);
+}
+
+#[test]
+fn number_to_string_i32() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: i32 = 42;
+            return x.toString();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "42");
+}
+
+#[test]
+fn number_to_string_f64() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 3.14;
+            return x.toString();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "3.14");
+}
+
+#[test]
+fn number_to_fixed_basic() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 3.14159;
+            return x.toFixed(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "3.14");
+}
+
+#[test]
+fn number_to_fixed_zero_digits() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 3.7;
+            return x.toFixed(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "4");
+}
+
+#[test]
+fn number_to_fixed_padding() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 1.5;
+            return x.toFixed(4);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.5000");
+}
+
+#[test]
+fn number_to_fixed_negative() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -2.567;
+            return x.toFixed(1);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-2.6");
+}
+
+#[test]
+fn number_to_precision_basic() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 123.456;
+            return x.toPrecision(5);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "123.46");
+}
+
+#[test]
+fn number_to_precision_fewer_than_int_digits() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 12345.0;
+            return x.toPrecision(3);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "12300");
+}
+
+#[test]
+fn number_to_precision_small_value() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.00456;
+            return x.toPrecision(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "0.0046");
+}
+
+#[test]
+fn number_to_precision_zero() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.0;
+            return x.toPrecision(3);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "0.00");
+}
+
+#[test]
+fn number_to_precision_negative() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -45.678;
+            return x.toPrecision(4);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-45.68");
+}
+
+#[test]
+fn string_replace_all() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "aXbXcXd";
+            return s.replaceAll("X", "-");
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "a-b-c-d");
+}
+
+#[test]
+fn string_replace_all_longer_replacement() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "abab";
+            return s.replaceAll("a", "XY");
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "XYbXYb");
+}
+
+#[test]
+fn string_replace_all_no_match() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "hello";
+            return s.replaceAll("z", "X");
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "hello");
+}
+
+#[test]
+fn string_replace_all_remove() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let s: string = "a--b--c";
+            return s.replaceAll("--", "");
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "abc");
 }
 
 #[test]

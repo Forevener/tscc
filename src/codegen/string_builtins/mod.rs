@@ -42,6 +42,10 @@ pub const STRING_HELPER_NAMES: &[&str] = &[
     "__str_padStart",
     "__str_padEnd",
     "__str_concat",
+    "__str_replaceAll",
+    "__str_toFixed",
+    "__str_toPrecision",
+    "__str_lastIndexOf",
 ];
 
 /// Register all string runtime helper functions in the module.
@@ -65,6 +69,15 @@ pub fn register_string_helpers(ctx: &mut ModuleContext, used: &HashSet<String>) 
         // __str_indexOf(haystack: i32, needle: i32) -> i32
         (
             "__str_indexOf",
+            vec![
+                ("haystack".into(), WasmType::I32),
+                ("needle".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
+        // __str_lastIndexOf(haystack: i32, needle: i32) -> i32
+        (
+            "__str_lastIndexOf",
             vec![
                 ("haystack".into(), WasmType::I32),
                 ("needle".into(), WasmType::I32),
@@ -218,6 +231,31 @@ pub fn register_string_helpers(ctx: &mut ModuleContext, used: &HashSet<String>) 
             vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
             WasmType::I32,
         ),
+        // __str_replaceAll(s: i32, search: i32, replacement: i32) -> i32
+        (
+            "__str_replaceAll",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("search".into(), WasmType::I32),
+                ("replacement".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
+        // __str_toFixed(n: f64, digits: i32) -> i32
+        (
+            "__str_toFixed",
+            vec![("n".into(), WasmType::F64), ("digits".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
+        // __str_toPrecision(n: f64, precision: i32) -> i32
+        (
+            "__str_toPrecision",
+            vec![
+                ("n".into(), WasmType::F64),
+                ("precision".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
     ];
 
     for (name, params, ret) in helpers {
@@ -294,6 +332,7 @@ impl Scanner {
             "trimStart",
             "trimEnd",
             "replace",
+            "replaceAll",
             "repeat",
             "padStart",
             "padEnd",
@@ -325,6 +364,7 @@ impl Scanner {
 
         let method_map: &[(&str, &str)] = &[
             ("indexOf", "__str_indexOf"),
+            ("lastIndexOf", "__str_lastIndexOf"),
             ("includes", "__str_includes"),
             ("startsWith", "__str_startsWith"),
             ("endsWith", "__str_endsWith"),
@@ -337,6 +377,7 @@ impl Scanner {
             ("trimEnd", "__str_trimEnd"),
             ("split", "__str_split"),
             ("replace", "__str_replace"),
+            ("replaceAll", "__str_replaceAll"),
             ("repeat", "__str_repeat"),
             ("padStart", "__str_padStart"),
             ("padEnd", "__str_padEnd"),
@@ -345,6 +386,22 @@ impl Scanner {
             if self.method_names.contains(*method) {
                 add(helper, &mut used);
             }
+        }
+
+        // Number.prototype.toString() needs the coercion helpers.
+        if self.method_names.contains("toString") {
+            add("__str_from_i32", &mut used);
+            add("__str_from_f64", &mut used);
+        }
+
+        // Number.prototype.toFixed(digits) needs the dedicated helper.
+        if self.method_names.contains("toFixed") {
+            add("__str_toFixed", &mut used);
+        }
+
+        // Number.prototype.toPrecision(digits) needs the dedicated helper.
+        if self.method_names.contains("toPrecision") {
+            add("__str_toPrecision", &mut used);
         }
 
         // `parseInt` / `parseFloat` can appear as bare identifiers OR as
@@ -635,7 +692,10 @@ fn compile_helper(name: &str, arena_idx: u32) -> Function {
         "__str_eq" => compare::build_str_eq(),
         "__str_cmp" => compare::build_str_cmp(),
         "__str_indexOf" => search::build_str_index_of(),
-        "__str_slice" => transform::build_str_slice(arena_idx),
+        "__str_lastIndexOf" | "__str_slice" => {
+            super::precompiled::precompiled_function(name)
+                .unwrap_or_else(|| panic!("precompiled {name} not found"))
+        }
         "__str_startsWith" => search::build_str_starts_with(),
         "__str_endsWith" => search::build_str_ends_with(),
         "__str_includes" => search::build_str_includes(),
@@ -655,6 +715,9 @@ fn compile_helper(name: &str, arena_idx: u32) -> Function {
         "__str_padStart" => transform::build_str_pad_start(arena_idx),
         "__str_padEnd" => transform::build_str_pad_end(arena_idx),
         "__str_concat" => transform::build_str_concat(arena_idx),
+        "__str_replaceAll" => transform::build_str_replace_all(arena_idx),
+        "__str_toFixed" => convert::build_str_to_fixed(arena_idx),
+        "__str_toPrecision" => convert::build_str_to_precision(arena_idx),
         _ => unreachable!("unknown string helper: {name}"),
     }
 }

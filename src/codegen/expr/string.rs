@@ -258,13 +258,16 @@ impl<'a> FuncContext<'a> {
                                 | "trimStart"
                                 | "trimEnd"
                                 | "replace"
+                                | "replaceAll"
                                 | "repeat"
                                 | "padStart"
                                 | "padEnd"
                                 | "concat"
                         )
                     } else {
-                        false
+                        // Number instance methods that return strings
+                        let method = member.property.name.as_str();
+                        matches!(method, "toString" | "toFixed" | "toPrecision")
                     }
                 } else if let Expression::Identifier(ident) = &call.callee {
                     // Check if function returns string
@@ -483,6 +486,17 @@ impl<'a> FuncContext<'a> {
                 self.push(Instruction::Call(func_idx));
                 Ok(Some(WasmType::I32))
             }
+            "lastIndexOf" => {
+                if call.arguments.len() != 1 {
+                    return Err(CompileError::codegen("lastIndexOf expects 1 argument"));
+                }
+                self.emit_expr(&member.object)?;
+                self.emit_expr(call.arguments[0].to_expression())?;
+                let (func_idx, _) =
+                    self.module_ctx.get_func("__str_lastIndexOf").unwrap();
+                self.push(Instruction::Call(func_idx));
+                Ok(Some(WasmType::I32))
+            }
             "includes" => {
                 if call.arguments.len() != 1 {
                     return Err(CompileError::codegen("includes expects 1 argument"));
@@ -657,6 +671,17 @@ impl<'a> FuncContext<'a> {
                 self.emit_expr(call.arguments[0].to_expression())?;
                 self.emit_expr(call.arguments[1].to_expression())?;
                 let (func_idx, _) = self.module_ctx.get_func("__str_replace").unwrap();
+                self.push(Instruction::Call(func_idx));
+                Ok(Some(WasmType::I32))
+            }
+            "replaceAll" => {
+                if call.arguments.len() != 2 {
+                    return Err(CompileError::codegen("replaceAll expects 2 arguments"));
+                }
+                self.emit_expr(&member.object)?;
+                self.emit_expr(call.arguments[0].to_expression())?;
+                self.emit_expr(call.arguments[1].to_expression())?;
+                let (func_idx, _) = self.module_ctx.get_func("__str_replaceAll").unwrap();
                 self.push(Instruction::Call(func_idx));
                 Ok(Some(WasmType::I32))
             }

@@ -812,3 +812,41 @@ fn math_hyperbolic_inverse_and_log1p_expm1() {
     assert!((vals[4] - 1.0_f64.exp_m1()).abs() < 1e-12);
 }
 
+#[test]
+fn global_nan_constant() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const x: f64 = NaN;
+            // NaN != NaN → isNaN returns true
+            sink(isNaN(x) ? 1.0 : 0.0);
+            // NaN + 1 is still NaN
+            sink(isNaN(x + 1.0) ? 1.0 : 0.0);
+        }
+    "#,
+    );
+    assert_eq!(vals[0], 1.0, "NaN global should produce NaN");
+    assert_eq!(vals[1], 1.0, "NaN + 1 should still be NaN");
+}
+
+#[test]
+fn global_infinity_constant() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const x: f64 = Infinity;
+            sink(x);
+            sink(-Infinity);
+            sink(isFinite(x) ? 1.0 : 0.0);
+            sink(isFinite(42.0) ? 1.0 : 0.0);
+        }
+    "#,
+    );
+    assert!(vals[0].is_infinite() && vals[0] > 0.0, "Infinity should be +inf");
+    assert!(vals[1].is_infinite() && vals[1] < 0.0, "-Infinity should be -inf");
+    assert_eq!(vals[2], 0.0, "Infinity is not finite");
+    assert_eq!(vals[3], 1.0, "42.0 is finite");
+}
+

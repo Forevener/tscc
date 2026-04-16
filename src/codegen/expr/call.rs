@@ -65,6 +65,11 @@ impl<'a> FuncContext<'a> {
             return Ok(result);
         }
 
+        // Check for number instance method calls (x.toString(), x.toFixed())
+        if let Some(result) = self.try_emit_number_instance_call(call)? {
+            return Ok(result);
+        }
+
         // Check for obj.method(args) calls
         if let Some(result) = self.try_emit_method_call(call)? {
             return Ok(result);
@@ -479,6 +484,100 @@ impl<'a> FuncContext<'a> {
         }
     }
 
+    /// Number instance method calls: x.toString(), x.toFixed(digits).
+    /// Returns Some if recognized as a number method, None otherwise.
+    pub(crate) fn try_emit_number_instance_call(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
+        let member = match &call.callee {
+            Expression::StaticMemberExpression(m) => m,
+            _ => return Ok(None),
+        };
+
+        let method = member.property.name.as_str();
+        if !matches!(method, "toString" | "toFixed" | "toPrecision") {
+            return Ok(None);
+        }
+
+        // Don't intercept string/array/class method calls
+        if self.resolve_expr_is_string(&member.object) {
+            return Ok(None);
+        }
+        if self.resolve_expr_array_elem(&member.object).is_some() {
+            return Ok(None);
+        }
+        if self.resolve_expr_class(&member.object).is_ok() {
+            return Ok(None);
+        }
+
+        match method {
+            "toString" => {
+                if !call.arguments.is_empty() {
+                    return Err(CompileError::codegen(
+                        "Number.prototype.toString() does not accept arguments in tscc",
+                    ));
+                }
+                let ty = self.emit_expr(&member.object)?;
+                match ty {
+                    WasmType::I32 => {
+                        let (func_idx, _) =
+                            self.module_ctx.get_func("__str_from_i32").unwrap();
+                        self.push(Instruction::Call(func_idx));
+                    }
+                    WasmType::F64 => {
+                        let (func_idx, _) =
+                            self.module_ctx.get_func("__str_from_f64").unwrap();
+                        self.push(Instruction::Call(func_idx));
+                    }
+                    _ => {
+                        return Err(CompileError::type_err(
+                            "toString() requires a numeric receiver",
+                        ));
+                    }
+                }
+                Ok(Some(WasmType::I32))
+            }
+            "toFixed" => {
+                if call.arguments.len() != 1 {
+                    return Err(CompileError::codegen(
+                        "toFixed() expects 1 argument (digits)",
+                    ));
+                }
+                let ty = self.emit_expr(&member.object)?;
+                if ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                }
+                self.emit_expr(call.arguments[0].to_expression())?;
+                let (func_idx, _) = self
+                    .module_ctx
+                    .get_func("__str_toFixed")
+                    .ok_or_else(|| CompileError::codegen("__str_toFixed not registered"))?;
+                self.push(Instruction::Call(func_idx));
+                Ok(Some(WasmType::I32))
+            }
+            "toPrecision" => {
+                if call.arguments.len() != 1 {
+                    return Err(CompileError::codegen(
+                        "toPrecision() expects 1 argument (precision)",
+                    ));
+                }
+                let ty = self.emit_expr(&member.object)?;
+                if ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                }
+                self.emit_expr(call.arguments[0].to_expression())?;
+                let (func_idx, _) = self
+                    .module_ctx
+                    .get_func("__str_toPrecision")
+                    .ok_or_else(|| CompileError::codegen("__str_toPrecision not registered"))?;
+                self.push(Instruction::Call(func_idx));
+                Ok(Some(WasmType::I32))
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn try_emit_math_call(
         &mut self,
         call: &CallExpression<'a>,
@@ -541,7 +640,7 @@ impl<'a> FuncContext<'a> {
             "round" => {
                 self.expect_args(call, 1, "Math.round")?;
                 self.emit_expr(call.arguments[0].to_expression())?;
-                self.push(Instruction::F64Const(0.5f64.into()));
+                self.push(Instruction::F64Const(0.5f64));
                 self.push(Instruction::F64Add);
                 self.push(Instruction::F64Floor);
                 Ok(Some(WasmType::F64))

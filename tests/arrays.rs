@@ -1533,6 +1533,98 @@ fn array_destructuring_rest_only() {
 }
 
 #[test]
+fn array_map_with_index() {
+    // map((val, idx) => val * 10 + idx) should use both element and index
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const arr: Array<f64> = new Array<f64>(3);
+            arr.push(1.0); arr.push(2.0); arr.push(3.0);
+            const mapped: Array<f64> = arr.map((v: f64, i: i32): f64 => v * 10.0 + f64(i));
+            sink(mapped[0]); // 1*10 + 0 = 10
+            sink(mapped[1]); // 2*10 + 1 = 21
+            sink(mapped[2]); // 3*10 + 2 = 32
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![10.0, 21.0, 32.0]);
+}
+
+#[test]
+fn array_filter_with_index() {
+    // filter((val, idx) => idx % 2 == 0) — keep even-indexed elements
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const arr: Array<f64> = new Array<f64>(5);
+            arr.push(10.0); arr.push(20.0); arr.push(30.0); arr.push(40.0); arr.push(50.0);
+            const evens: Array<f64> = arr.filter((v: f64, i: i32): i32 => i % 2 == 0);
+            sink(f64(evens.length)); // 3
+            sink(evens[0]); // 10
+            sink(evens[1]); // 30
+            sink(evens[2]); // 50
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 10.0, 30.0, 50.0]);
+}
+
+#[test]
+fn array_foreach_with_index() {
+    // forEach((val, idx) => sink(val + idx)) �� use both element and index
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const arr: Array<f64> = new Array<f64>(3);
+            arr.push(100.0); arr.push(200.0); arr.push(300.0);
+            arr.forEach((v: f64, i: i32) => { sink(v + f64(i)); });
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![100.0, 201.0, 302.0]);
+}
+
+#[test]
+fn array_find_index_with_index_param() {
+    // findIndex((val, idx) => idx > 1 && val > 20) — use index in predicate
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const arr: Array<i32> = new Array<i32>(5);
+            arr.push(10); arr.push(30); arr.push(15); arr.push(25); arr.push(5);
+            const idx: i32 = arr.findIndex((v: i32, i: i32): i32 => i > 1 && v > 20);
+            sink(f64(idx)); // should be 3 (value 25 at index 3, first where idx>1 && val>20)
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0]);
+}
+
+#[test]
+fn array_some_every_with_index() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const arr: Array<i32> = new Array<i32>(3);
+            arr.push(0); arr.push(1); arr.push(2);
+            // some: val == idx is always true for [0,1,2]
+            const s: i32 = arr.some((v: i32, i: i32): i32 => v == i);
+            sink(f64(s));
+            // every: val == idx is always true for [0,1,2]
+            const e: i32 = arr.every((v: i32, i: i32): i32 => v == i);
+            sink(f64(e));
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 1.0]);
+}
+
+#[test]
 fn array_destructuring_rest_does_not_alias_source() {
     // Mutating rest must not affect the original array.
     let wasm = compile(
