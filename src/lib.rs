@@ -1,4 +1,3 @@
-pub(crate) mod classes;
 pub(crate) mod codegen;
 pub mod error;
 pub(crate) mod parse;
