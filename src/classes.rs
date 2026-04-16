@@ -107,7 +107,10 @@ impl ClassRegistry {
         }
     }
 
-    #[allow(clippy::map_entry, reason = "override and new-slot branches are not symmetric")]
+    #[allow(
+        clippy::map_entry,
+        reason = "override and new-slot branches are not symmetric"
+    )]
     pub fn register_class(
         &mut self,
         class: &Class,
@@ -115,9 +118,13 @@ impl ClassRegistry {
         parent_name: Option<String>,
         is_polymorphic: bool,
     ) -> Result<(), CompileError> {
-        let name = class.id.as_ref()
+        let name = class
+            .id
+            .as_ref()
             .ok_or_else(|| CompileError::parse("class without name"))?
-            .name.as_str().to_string();
+            .name
+            .as_str()
+            .to_string();
 
         // Start with inherited fields from parent (if any)
         let mut fields = Vec::new();
@@ -156,11 +163,12 @@ impl ClassRegistry {
             // Continue field offsets after parent's fields
             // Parent's size includes alignment padding; use the raw end of last field instead
             if let Some((_name, last_offset, last_ty)) = parent_layout.fields.last() {
-                offset = last_offset + match last_ty {
-                    WasmType::F64 => 8,
-                    WasmType::I32 => 4,
-                    _ => 4,
-                };
+                offset = last_offset
+                    + match last_ty {
+                        WasmType::F64 => 8,
+                        WasmType::I32 => 4,
+                        _ => 4,
+                    };
             }
             // If parent had no own fields but is polymorphic, offset stays at 4
         }
@@ -180,9 +188,10 @@ impl ClassRegistry {
                     // Track field class type if it's a class reference
                     if let Some(ann) = &prop.type_annotation {
                         if let Some(class_type) = types::get_class_type_name(ann)
-                            && class_names.contains(&class_type) {
-                                field_class_types.insert(field_name.clone(), class_type);
-                            }
+                            && class_names.contains(&class_type)
+                        {
+                            field_class_types.insert(field_name.clone(), class_type);
+                        }
                         // Track string fields
                         if types::is_string_type(ann) {
                             field_string_types.insert(field_name.clone());
@@ -215,8 +224,14 @@ impl ClassRegistry {
                         // Validate constructor params have type annotations
                         for param in &func.params.items {
                             let pname = match &param.pattern {
-                                BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
-                                _ => return Err(CompileError::unsupported("destructured constructor param")),
+                                BindingPattern::BindingIdentifier(ident) => {
+                                    ident.name.as_str().to_string()
+                                }
+                                _ => {
+                                    return Err(CompileError::unsupported(
+                                        "destructured constructor param",
+                                    ));
+                                }
                             };
                             if let Some(ann) = &param.type_annotation {
                                 types::resolve_type_annotation_with_classes(ann, class_names)?;
@@ -231,8 +246,14 @@ impl ClassRegistry {
                         let mut params = Vec::new();
                         for param in &func.params.items {
                             let pname = match &param.pattern {
-                                BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
-                                _ => return Err(CompileError::unsupported("destructured method param")),
+                                BindingPattern::BindingIdentifier(ident) => {
+                                    ident.name.as_str().to_string()
+                                }
+                                _ => {
+                                    return Err(CompileError::unsupported(
+                                        "destructured method param",
+                                    ));
+                                }
                             };
                             let pty = if let Some(ann) = &param.type_annotation {
                                 types::resolve_type_annotation_with_classes(ann, class_names)?
@@ -249,10 +270,19 @@ impl ClassRegistry {
                             WasmType::Void
                         };
                         // Track return class type
-                        let return_class = func.return_type.as_ref()
+                        let return_class = func
+                            .return_type
+                            .as_ref()
                             .and_then(|ann| types::get_class_type_name(ann))
                             .filter(|cn| class_names.contains(cn));
-                        methods.insert(method_name.clone(), MethodSig { params, return_type: ret, return_class });
+                        methods.insert(
+                            method_name.clone(),
+                            MethodSig {
+                                params,
+                                return_type: ret,
+                                return_class,
+                            },
+                        );
 
                         // Update vtable: override existing slot or append new
                         if is_polymorphic {
@@ -260,11 +290,14 @@ impl ClassRegistry {
                                 // Override: validate signature matches parent's
                                 if let Some(ref parent) = parent_name
                                     && let Some(parent_layout) = self.classes.get(parent)
-                                    && let Some(parent_sig) = parent_layout.methods.get(&method_name)
+                                    && let Some(parent_sig) =
+                                        parent_layout.methods.get(&method_name)
                                 {
                                     let child_sig = methods.get(&method_name).unwrap();
-                                    let parent_types: Vec<WasmType> = parent_sig.params.iter().map(|(_, t)| *t).collect();
-                                    let child_types: Vec<WasmType> = child_sig.params.iter().map(|(_, t)| *t).collect();
+                                    let parent_types: Vec<WasmType> =
+                                        parent_sig.params.iter().map(|(_, t)| *t).collect();
+                                    let child_types: Vec<WasmType> =
+                                        child_sig.params.iter().map(|(_, t)| *t).collect();
                                     if parent_types != child_types {
                                         return Err(CompileError::type_err(format!(
                                             "override of method '{}' in class '{}' has different parameter types than parent '{}'",
@@ -294,21 +327,24 @@ impl ClassRegistry {
         // Align total size to 8 bytes
         let size = if offset == 0 { 0 } else { (offset + 7) & !7 };
 
-        self.classes.insert(name.clone(), ClassLayout {
-            name,
-            size,
-            fields,
-            field_map,
-            field_class_types,
-            field_string_types,
-            methods,
-            parent: parent_name,
-            is_polymorphic,
-            vtable_methods,
-            vtable_method_map,
-            vtable_offset: 0, // set later during vtable construction
-            own_field_names,
-        });
+        self.classes.insert(
+            name.clone(),
+            ClassLayout {
+                name,
+                size,
+                fields,
+                field_map,
+                field_class_types,
+                field_string_types,
+                methods,
+                parent: parent_name,
+                is_polymorphic,
+                vtable_methods,
+                vtable_method_map,
+                vtable_offset: 0, // set later during vtable construction
+                own_field_names,
+            },
+        );
 
         Ok(())
     }
@@ -324,7 +360,8 @@ pub fn topo_sort_classes(
     let mut visited: HashSet<String> = HashSet::new();
     let mut visiting: HashSet<String> = HashSet::new();
 
-    let info_map: HashMap<&str, Option<&str>> = class_info.iter()
+    let info_map: HashMap<&str, Option<&str>> = class_info
+        .iter()
         .map(|(n, p)| (n.as_str(), p.as_deref()))
         .collect();
 
@@ -340,7 +377,9 @@ pub fn topo_sort_classes(
             return Ok(());
         }
         if visiting.contains(name) {
-            return Err(CompileError::codegen(format!("circular inheritance involving '{name}'")));
+            return Err(CompileError::codegen(format!(
+                "circular inheritance involving '{name}'"
+            )));
         }
         visiting.insert(name.to_string());
 
@@ -362,7 +401,14 @@ pub fn topo_sort_classes(
     }
 
     for (name, _) in class_info {
-        visit(name, &info_map, &name_set, &mut visited, &mut visiting, &mut result)?;
+        visit(
+            name,
+            &info_map,
+            &name_set,
+            &mut visited,
+            &mut visiting,
+            &mut result,
+        )?;
     }
 
     Ok(result)

@@ -55,7 +55,12 @@ struct LoopLabels {
 }
 
 impl<'a> FuncContext<'a> {
-    pub fn new(module_ctx: &'a ModuleContext, params: &[(String, WasmType)], return_type: WasmType, source: &'a str) -> Self {
+    pub fn new(
+        module_ctx: &'a ModuleContext,
+        params: &[(String, WasmType)],
+        return_type: WasmType,
+        source: &'a str,
+    ) -> Self {
         let mut locals = HashMap::new();
         for (i, (name, ty)) in params.iter().enumerate() {
             locals.insert(name.clone(), (i as u32, *ty));
@@ -90,7 +95,8 @@ impl<'a> FuncContext<'a> {
 
     /// Record a source location for the next instruction to be emitted.
     pub fn mark_loc(&mut self, source_offset: u32) {
-        self.source_map.push((self.instructions.len(), source_offset));
+        self.source_map
+            .push((self.instructions.len(), source_offset));
     }
 
     pub fn alloc_local(&mut self, ty: WasmType) -> u32 {
@@ -110,14 +116,18 @@ impl<'a> FuncContext<'a> {
     /// If __arena_alloc is registered (overflow checking enabled), calls it.
     /// Otherwise, does inline bump (original behavior).
     pub fn emit_arena_alloc_to_local(&mut self, size_on_stack: bool) -> Result<u32, CompileError> {
-        let arena_idx = self.module_ctx.arena_ptr_global
+        let arena_idx = self
+            .module_ctx
+            .arena_ptr_global
             .ok_or_else(|| CompileError::codegen("arena not initialized"))?;
         let ptr_local = self.alloc_local(WasmType::I32);
 
         if let Some(alloc_idx) = self.module_ctx.arena_alloc_func {
             // size is already on stack
             if !size_on_stack {
-                return Err(CompileError::codegen("emit_arena_alloc_to_local requires size on stack"));
+                return Err(CompileError::codegen(
+                    "emit_arena_alloc_to_local requires size on stack",
+                ));
             }
             self.push(Instruction::Call(alloc_idx));
             self.push(Instruction::LocalSet(ptr_local));
@@ -133,7 +143,9 @@ impl<'a> FuncContext<'a> {
                 self.push(Instruction::I32Add);
                 self.push(Instruction::GlobalSet(arena_idx));
             } else {
-                return Err(CompileError::codegen("emit_arena_alloc_to_local requires size on stack"));
+                return Err(CompileError::codegen(
+                    "emit_arena_alloc_to_local requires size on stack",
+                ));
             }
         }
         Ok(ptr_local)
@@ -147,7 +159,8 @@ impl<'a> FuncContext<'a> {
     /// Finish the function, returning the encoded WASM function and a source map.
     /// Source map entries are (byte_offset_in_func_body, source_byte_offset).
     pub fn finish(self) -> (Function, Vec<(u32, u32)>) {
-        let local_groups: Vec<(u32, ValType)> = self.local_types.iter().map(|vt| (1, *vt)).collect();
+        let local_groups: Vec<(u32, ValType)> =
+            self.local_types.iter().map(|vt| (1, *vt)).collect();
         let mut func = Function::new(local_groups);
 
         // Track byte offset of each instruction within the function body
@@ -159,9 +172,13 @@ impl<'a> FuncContext<'a> {
         func.instruction(&Instruction::End);
 
         // Convert source_map from instruction indices to byte offsets
-        let byte_source_map: Vec<(u32, u32)> = self.source_map.iter()
+        let byte_source_map: Vec<(u32, u32)> = self
+            .source_map
+            .iter()
             .filter_map(|&(inst_idx, src_offset)| {
-                inst_byte_offsets.get(inst_idx).map(|&byte_off| (byte_off, src_offset))
+                inst_byte_offsets
+                    .get(inst_idx)
+                    .map(|&byte_off| (byte_off, src_offset))
             })
             .collect();
 
@@ -203,28 +220,40 @@ impl<'a> FuncContext<'a> {
         }
     }
 
-    fn emit_var_declaration(&mut self, var_decl: &VariableDeclaration<'a>) -> Result<(), CompileError> {
+    fn emit_var_declaration(
+        &mut self,
+        var_decl: &VariableDeclaration<'a>,
+    ) -> Result<(), CompileError> {
         for declarator in &var_decl.declarations {
             self.emit_var_declarator(declarator)?;
             // Track const for immutability enforcement
             if var_decl.kind == VariableDeclarationKind::Const
-                && let BindingPattern::BindingIdentifier(ident) = &declarator.id {
-                    self.const_locals.insert(ident.name.as_str().to_string());
-                }
+                && let BindingPattern::BindingIdentifier(ident) = &declarator.id
+            {
+                self.const_locals.insert(ident.name.as_str().to_string());
+            }
         }
         Ok(())
     }
 
-    pub fn emit_var_declarator(&mut self, decl: &VariableDeclarator<'a>) -> Result<(), CompileError> {
+    pub fn emit_var_declarator(
+        &mut self,
+        decl: &VariableDeclarator<'a>,
+    ) -> Result<(), CompileError> {
         match &decl.id {
             BindingPattern::BindingIdentifier(_) => self.emit_simple_var_declarator(decl),
             BindingPattern::ObjectPattern(obj_pat) => self.emit_object_destructuring(obj_pat, decl),
             BindingPattern::ArrayPattern(arr_pat) => self.emit_array_destructuring(arr_pat, decl),
-            _ => Err(CompileError::unsupported("assignment pattern with default value in destructuring")),
+            _ => Err(CompileError::unsupported(
+                "assignment pattern with default value in destructuring",
+            )),
         }
     }
 
-    fn emit_simple_var_declarator(&mut self, decl: &VariableDeclarator<'a>) -> Result<(), CompileError> {
+    fn emit_simple_var_declarator(
+        &mut self,
+        decl: &VariableDeclarator<'a>,
+    ) -> Result<(), CompileError> {
         let name = match &decl.id {
             BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
             _ => unreachable!(),
@@ -241,11 +270,13 @@ impl<'a> FuncContext<'a> {
                 self.local_class_types.insert(name.clone(), class_name);
             }
             // Track array element type
-            if let Some(elem_ty) = types::get_array_element_type(ann, &self.module_ctx.class_names) {
+            if let Some(elem_ty) = types::get_array_element_type(ann, &self.module_ctx.class_names)
+            {
                 self.local_array_elem_types.insert(name.clone(), elem_ty);
                 // Track array element class if applicable
                 if let Some(elem_class) = types::get_array_element_class(ann) {
-                    self.local_array_elem_classes.insert(name.clone(), elem_class);
+                    self.local_array_elem_classes
+                        .insert(name.clone(), elem_class);
                 }
             }
             // Track string type
@@ -257,20 +288,26 @@ impl<'a> FuncContext<'a> {
         } else if let Some(init) = &decl.init {
             // Infer closure sig from arrow initializer
             if let Expression::ArrowFunctionExpression(arrow) = init
-                && let Some(sig) = self.infer_arrow_sig(arrow) {
-                    self.local_closure_sigs.insert(name.clone(), sig);
-                }
+                && let Some(sig) = self.infer_arrow_sig(arrow)
+            {
+                self.local_closure_sigs.insert(name.clone(), sig);
+            }
             // Infer closure sig from function call that returns a closure
             if let Expression::CallExpression(call) = init
                 && let Expression::Identifier(ident) = &call.callee
-                    && let Some(sig) = self.module_ctx.func_return_closure_sigs.get(ident.name.as_str()) {
-                        self.local_closure_sigs.insert(name.clone(), sig.clone());
-                    }
+                && let Some(sig) = self
+                    .module_ctx
+                    .func_return_closure_sigs
+                    .get(ident.name.as_str())
+            {
+                self.local_closure_sigs.insert(name.clone(), sig.clone());
+            }
             // Infer string from string literal initializer
             if matches!(init, Expression::StringLiteral(_)) {
                 self.local_string_vars.insert(name.clone());
             }
-            let (inferred_ty, inferred_class) = self.infer_init_type(init)
+            let (inferred_ty, inferred_class) = self
+                .infer_init_type(init)
                 .map_err(|e| self.locate(e, decl.span.start))?;
             if let Some(class_name) = inferred_class {
                 self.local_class_types.insert(name.clone(), class_name);
@@ -278,7 +315,9 @@ impl<'a> FuncContext<'a> {
             inferred_ty
         } else {
             return Err(self.locate(
-                CompileError::type_err(format!("variable '{name}' requires a type annotation or initializer")),
+                CompileError::type_err(format!(
+                    "variable '{name}' requires a type annotation or initializer"
+                )),
                 decl.span.start,
             ));
         };
@@ -288,7 +327,9 @@ impl<'a> FuncContext<'a> {
             // Boxed: local holds a pointer into arena memory
             self.boxed_var_types.insert(name.clone(), ty);
             let ptr_idx = self.declare_local(&name, WasmType::I32);
-            let arena_idx = self.module_ctx.arena_ptr_global
+            let arena_idx = self
+                .module_ctx
+                .arena_ptr_global
                 .ok_or_else(|| CompileError::codegen("arena not initialized"))?;
             let size = if ty == WasmType::F64 { 8u32 } else { 4u32 };
 
@@ -318,10 +359,14 @@ impl<'a> FuncContext<'a> {
             }
             match ty {
                 WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
-                    offset: 0, align: 3, memory_index: 0,
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
                 })),
                 _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
-                    offset: 0, align: 2, memory_index: 0,
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
                 })),
             }
 
@@ -350,28 +395,36 @@ impl<'a> FuncContext<'a> {
         obj_pat: &ObjectPattern<'a>,
         decl: &VariableDeclarator<'a>,
     ) -> Result<(), CompileError> {
-        let init = decl.init.as_ref()
+        let init = decl
+            .init
+            .as_ref()
             .ok_or_else(|| CompileError::codegen("destructuring requires an initializer"))?;
 
         // Resolve the class type of the initializer
         let class_name = match init {
             Expression::Identifier(ident) => {
                 let name = ident.name.as_str();
-                self.local_class_types.get(name).cloned()
-                    .ok_or_else(|| CompileError::codegen(format!(
+                self.local_class_types.get(name).cloned().ok_or_else(|| {
+                    CompileError::codegen(format!(
                         "cannot destructure '{name}' — not a known class instance"
-                    )))?
+                    ))
+                })?
             }
-            Expression::ThisExpression(_) => {
-                self.this_class.clone()
-                    .ok_or_else(|| CompileError::codegen("`this` used outside of a method"))?
+            Expression::ThisExpression(_) => self
+                .this_class
+                .clone()
+                .ok_or_else(|| CompileError::codegen("`this` used outside of a method"))?,
+            _ => {
+                return Err(CompileError::unsupported(
+                    "object destructuring only supported on class instances",
+                ));
             }
-            _ => return Err(CompileError::unsupported(
-                "object destructuring only supported on class instances"
-            )),
         };
 
-        let layout = self.module_ctx.class_registry.get(&class_name)
+        let layout = self
+            .module_ctx
+            .class_registry
+            .get(&class_name)
             .ok_or_else(|| CompileError::codegen(format!("unknown class '{class_name}'")))?
             .clone();
 
@@ -387,10 +440,9 @@ impl<'a> FuncContext<'a> {
                 _ => return Err(CompileError::unsupported("computed destructuring key")),
             };
 
-            let &(offset, field_ty) = layout.field_map.get(field_name)
-                .ok_or_else(|| CompileError::codegen(format!(
-                    "class '{class_name}' has no field '{field_name}'"
-                )))?;
+            let &(offset, field_ty) = layout.field_map.get(field_name).ok_or_else(|| {
+                CompileError::codegen(format!("class '{class_name}' has no field '{field_name}'"))
+            })?;
 
             // Get the local variable name (may differ from field name in non-shorthand)
             let var_name = match &prop.value {
@@ -404,7 +456,8 @@ impl<'a> FuncContext<'a> {
             // Propagate class-type / string tracking from field metadata to the
             // new local so further destructuring or method calls on it work.
             if let Some(field_class) = layout.field_class_types.get(field_name) {
-                self.local_class_types.insert(var_name.clone(), field_class.clone());
+                self.local_class_types
+                    .insert(var_name.clone(), field_class.clone());
             }
             if layout.field_string_types.contains(field_name) {
                 self.local_string_vars.insert(var_name.clone());
@@ -413,10 +466,14 @@ impl<'a> FuncContext<'a> {
             self.push(Instruction::LocalGet(obj_local));
             match field_ty {
                 WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
-                    offset: offset as u64, align: 3, memory_index: 0,
+                    offset: offset as u64,
+                    align: 3,
+                    memory_index: 0,
                 })),
                 WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: offset as u64, align: 2, memory_index: 0,
+                    offset: offset as u64,
+                    align: 2,
+                    memory_index: 0,
                 })),
                 _ => return Err(CompileError::codegen("void field in destructuring")),
             }
@@ -424,7 +481,9 @@ impl<'a> FuncContext<'a> {
         }
 
         if obj_pat.rest.is_some() {
-            return Err(CompileError::unsupported("rest element in object destructuring"));
+            return Err(CompileError::unsupported(
+                "rest element in object destructuring",
+            ));
         }
 
         Ok(())
@@ -436,21 +495,29 @@ impl<'a> FuncContext<'a> {
         arr_pat: &ArrayPattern<'a>,
         decl: &VariableDeclarator<'a>,
     ) -> Result<(), CompileError> {
-        let init = decl.init.as_ref()
+        let init = decl
+            .init
+            .as_ref()
             .ok_or_else(|| CompileError::codegen("destructuring requires an initializer"))?;
 
         // Resolve the array element type
         let elem_ty = match init {
             Expression::Identifier(ident) => {
                 let name = ident.name.as_str();
-                self.local_array_elem_types.get(name).copied()
-                    .ok_or_else(|| CompileError::codegen(format!(
-                        "cannot destructure '{name}' — not a known array"
-                    )))?
+                self.local_array_elem_types
+                    .get(name)
+                    .copied()
+                    .ok_or_else(|| {
+                        CompileError::codegen(format!(
+                            "cannot destructure '{name}' — not a known array"
+                        ))
+                    })?
             }
-            _ => return Err(CompileError::unsupported(
-                "array destructuring only supported on Array<T> variables"
-            )),
+            _ => {
+                return Err(CompileError::unsupported(
+                    "array destructuring only supported on Array<T> variables",
+                ));
+            }
         };
 
         let elem_size: i32 = match elem_ty {
@@ -461,9 +528,10 @@ impl<'a> FuncContext<'a> {
 
         // Also get element class if applicable
         let elem_class = match init {
-            Expression::Identifier(ident) => {
-                self.local_array_elem_classes.get(ident.name.as_str()).cloned()
-            }
+            Expression::Identifier(ident) => self
+                .local_array_elem_classes
+                .get(ident.name.as_str())
+                .cloned(),
             _ => None,
         };
 
@@ -488,7 +556,8 @@ impl<'a> FuncContext<'a> {
 
             // Track class type for destructured elements
             if let Some(ref class_name) = elem_class {
-                self.local_class_types.insert(var_name.clone(), class_name.clone());
+                self.local_class_types
+                    .insert(var_name.clone(), class_name.clone());
             }
 
             // Compute element address: arr + 8 + i * elem_size
@@ -501,10 +570,14 @@ impl<'a> FuncContext<'a> {
             // Load element (no bounds check — destructuring is a compile-time pattern)
             match elem_ty {
                 WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
-                    offset: 0, align: 3, memory_index: 0,
+                    offset: 0,
+                    align: 3,
+                    memory_index: 0,
                 })),
                 WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
-                    offset: 0, align: 2, memory_index: 0,
+                    offset: 0,
+                    align: 2,
+                    memory_index: 0,
                 })),
                 _ => unreachable!(),
             }
@@ -517,9 +590,11 @@ impl<'a> FuncContext<'a> {
             // element type (and class, if any).
             let rest_name = match &rest.argument {
                 BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
-                _ => return Err(CompileError::unsupported(
-                    "rest element in array destructuring must bind a plain identifier",
-                )),
+                _ => {
+                    return Err(CompileError::unsupported(
+                        "rest element in array destructuring must bind a plain identifier",
+                    ));
+                }
             };
             let prefix_count = arr_pat.elements.len() as i32;
 
@@ -527,7 +602,9 @@ impl<'a> FuncContext<'a> {
             let rest_len_signed = self.alloc_local(WasmType::I32);
             self.push(Instruction::LocalGet(arr_local));
             self.push(Instruction::I32Load(wasm_encoder::MemArg {
-                offset: 0, align: 2, memory_index: 0,
+                offset: 0,
+                align: 2,
+                memory_index: 0,
             }));
             self.push(Instruction::I32Const(prefix_count));
             self.push(Instruction::I32Sub);
@@ -555,12 +632,16 @@ impl<'a> FuncContext<'a> {
             self.push(Instruction::LocalGet(rest_ptr));
             self.push(Instruction::LocalGet(rest_len));
             self.push(Instruction::I32Store(wasm_encoder::MemArg {
-                offset: 0, align: 2, memory_index: 0,
+                offset: 0,
+                align: 2,
+                memory_index: 0,
             }));
             self.push(Instruction::LocalGet(rest_ptr));
             self.push(Instruction::LocalGet(rest_len));
             self.push(Instruction::I32Store(wasm_encoder::MemArg {
-                offset: 4, align: 2, memory_index: 0,
+                offset: 4,
+                align: 2,
+                memory_index: 0,
             }));
 
             // memory.copy(rest_ptr + 8, arr_local + 8 + prefix_count*elem_size, rest_len*elem_size)
@@ -573,15 +654,20 @@ impl<'a> FuncContext<'a> {
             self.push(Instruction::LocalGet(rest_len));
             self.push(Instruction::I32Const(elem_size));
             self.push(Instruction::I32Mul);
-            self.push(Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+            self.push(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
 
             // Declare `rest` local and bind the new pointer; track as an array.
             let rest_local = self.declare_local(&rest_name, WasmType::I32);
             self.push(Instruction::LocalGet(rest_ptr));
             self.push(Instruction::LocalSet(rest_local));
-            self.local_array_elem_types.insert(rest_name.clone(), elem_ty);
+            self.local_array_elem_types
+                .insert(rest_name.clone(), elem_ty);
             if let Some(ref class_name) = elem_class {
-                self.local_array_elem_classes.insert(rest_name, class_name.clone());
+                self.local_array_elem_classes
+                    .insert(rest_name, class_name.clone());
             }
         }
 
@@ -627,7 +713,10 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Loop(BlockType::Empty));
         self.block_depth += 1;
         let continue_depth = self.block_depth; // loop = continue target
-        self.loop_stack.push(LoopLabels { break_depth, continue_depth });
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
 
         // Condition
         self.emit_expr(&while_stmt.test)?;
@@ -662,7 +751,10 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Loop(BlockType::Empty));
         self.block_depth += 1;
         let continue_depth = self.block_depth; // loop = continue target
-        self.loop_stack.push(LoopLabels { break_depth, continue_depth });
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
 
         // Body first (executes at least once)
         self.emit_statement(&do_while.body)?;
@@ -728,7 +820,10 @@ impl<'a> FuncContext<'a> {
         self.block_depth += 1;
 
         let continue_depth = self.block_depth;
-        self.loop_stack.push(LoopLabels { break_depth, continue_depth });
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
 
         // Body
         self.emit_statement(&for_stmt.body)?;
@@ -773,19 +868,26 @@ impl<'a> FuncContext<'a> {
                     return Err(CompileError::codegen("empty for..of binding"));
                 }
             }
-            _ => return Err(CompileError::unsupported("for..of requires a variable declaration")),
+            _ => {
+                return Err(CompileError::unsupported(
+                    "for..of requires a variable declaration",
+                ));
+            }
         };
 
         // Resolve array element type from the right-hand expression
-        let elem_ty = self.resolve_expr_array_elem(&for_of.right)
-            .ok_or_else(|| CompileError::codegen(
-                "for..of requires an Array<T> — cannot resolve element type"
-            ))?;
+        let elem_ty = self.resolve_expr_array_elem(&for_of.right).ok_or_else(|| {
+            CompileError::codegen("for..of requires an Array<T> — cannot resolve element type")
+        })?;
         let elem_class = self.resolve_expr_array_elem_class(&for_of.right);
         let elem_size: i32 = match elem_ty {
             WasmType::F64 => 8,
             WasmType::I32 => 4,
-            _ => return Err(CompileError::type_err("invalid array element type for for..of")),
+            _ => {
+                return Err(CompileError::type_err(
+                    "invalid array element type for for..of",
+                ));
+            }
         };
 
         // Evaluate array, save to local
@@ -796,7 +898,11 @@ impl<'a> FuncContext<'a> {
         // Load length
         let len_local = self.alloc_local(WasmType::I32);
         self.push(Instruction::LocalGet(arr_local));
-        self.push(Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 }));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
         self.push(Instruction::LocalSet(len_local));
 
         // Loop counter
@@ -807,14 +913,16 @@ impl<'a> FuncContext<'a> {
         // Declare element local
         let elem_local = self.declare_local(&elem_name, elem_ty);
         if let Some(class_name) = &elem_class {
-            self.local_class_types.insert(elem_name.clone(), class_name.clone());
+            self.local_class_types
+                .insert(elem_name.clone(), class_name.clone());
         }
 
         // Track as const if declared with const
         if let ForStatementLeft::VariableDeclaration(var_decl) = &for_of.left
-            && var_decl.kind == VariableDeclarationKind::Const {
-                self.const_locals.insert(elem_name.clone());
-            }
+            && var_decl.kind == VariableDeclarationKind::Const
+        {
+            self.const_locals.insert(elem_name.clone());
+        }
 
         // block $break
         //   loop $loop
@@ -849,8 +957,16 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Mul);
         self.push(Instruction::I32Add);
         match elem_ty {
-            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg { offset: 0, align: 3, memory_index: 0 })),
-            WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg { offset: 0, align: 2, memory_index: 0 })),
+            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 3,
+                memory_index: 0,
+            })),
+            WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            })),
             _ => unreachable!(),
         }
         self.push(Instruction::LocalSet(elem_local));
@@ -860,7 +976,10 @@ impl<'a> FuncContext<'a> {
         self.block_depth += 1;
 
         let continue_depth = self.block_depth;
-        self.loop_stack.push(LoopLabels { break_depth, continue_depth });
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
 
         // Body
         self.emit_statement(&for_of.body)?;
@@ -902,7 +1021,10 @@ impl<'a> FuncContext<'a> {
 
         // Push a fake loop entry so `break` inside switch works
         // (break in switch = br to the outer block)
-        self.loop_stack.push(LoopLabels { break_depth: switch_depth, continue_depth: switch_depth });
+        self.loop_stack.push(LoopLabels {
+            break_depth: switch_depth,
+            continue_depth: switch_depth,
+        });
 
         let mut default_idx: Option<usize> = None;
 
@@ -920,7 +1042,11 @@ impl<'a> FuncContext<'a> {
             match disc_ty {
                 WasmType::I32 => self.push(Instruction::I32Eq),
                 WasmType::F64 => self.push(Instruction::F64Eq),
-                _ => return Err(CompileError::type_err("switch discriminant must be i32 or f64")),
+                _ => {
+                    return Err(CompileError::type_err(
+                        "switch discriminant must be i32 or f64",
+                    ));
+                }
             }
 
             self.push(Instruction::If(BlockType::Empty));
@@ -961,7 +1087,9 @@ impl<'a> FuncContext<'a> {
     }
 
     fn emit_break(&mut self) -> Result<(), CompileError> {
-        let labels = self.loop_stack.last()
+        let labels = self
+            .loop_stack
+            .last()
             .ok_or_else(|| CompileError::codegen("break outside of loop"))?;
         // br to the outer block (break target)
         // break_depth points at the outer block's depth level
@@ -971,7 +1099,9 @@ impl<'a> FuncContext<'a> {
     }
 
     fn emit_continue(&mut self) -> Result<(), CompileError> {
-        let labels = self.loop_stack.last()
+        let labels = self
+            .loop_stack
+            .last()
             .ok_or_else(|| CompileError::codegen("continue outside of loop"))?;
         // In a for loop, continue jumps to the continue_target block end,
         // which falls through to the update expression
@@ -982,7 +1112,10 @@ impl<'a> FuncContext<'a> {
 
     /// Infer the type of an expression without emitting WASM code.
     /// Used for type inference when no annotation is provided.
-    pub fn infer_init_type(&self, expr: &Expression<'a>) -> Result<(WasmType, Option<String>), CompileError> {
+    pub fn infer_init_type(
+        &self,
+        expr: &Expression<'a>,
+    ) -> Result<(WasmType, Option<String>), CompileError> {
         match expr {
             Expression::NumericLiteral(lit) => {
                 if lit.raw.as_ref().is_some_and(|r| r.contains('.')) || lit.value.fract() != 0.0 {
@@ -994,7 +1127,7 @@ impl<'a> FuncContext<'a> {
             Expression::BooleanLiteral(_) => Ok((WasmType::I32, None)),
             Expression::StringLiteral(_) => Ok((WasmType::I32, None)),
             Expression::NullLiteral(_) => Err(CompileError::type_err(
-                "cannot infer type from null — add a type annotation"
+                "cannot infer type from null — add a type annotation",
             )),
             Expression::Identifier(ident) => {
                 let name = ident.name.as_str();
@@ -1005,7 +1138,9 @@ impl<'a> FuncContext<'a> {
                     let class = self.module_ctx.var_class_types.get(name).cloned();
                     Ok((ty, class))
                 } else {
-                    Err(CompileError::type_err(format!("cannot infer type from undefined variable '{name}'")))
+                    Err(CompileError::type_err(format!(
+                        "cannot infer type from undefined variable '{name}'"
+                    )))
                 }
             }
             Expression::NewExpression(new_expr) => {
@@ -1015,7 +1150,7 @@ impl<'a> FuncContext<'a> {
                         // Array<T> → i32, but we need the element type from type params
                         // For now, require annotation for arrays
                         return Err(CompileError::type_err(
-                            "Array variables require a type annotation: Array<T>"
+                            "Array variables require a type annotation: Array<T>",
                         ));
                     }
                     if self.module_ctx.class_names.contains(class_name) {
@@ -1028,8 +1163,12 @@ impl<'a> FuncContext<'a> {
                 if let Expression::Identifier(ident) = &call.callee {
                     let name = ident.name.as_str();
                     // Type cast functions
-                    if name == "f64" { return Ok((WasmType::F64, None)); }
-                    if name == "i32" { return Ok((WasmType::I32, None)); }
+                    if name == "f64" {
+                        return Ok((WasmType::F64, None));
+                    }
+                    if name == "i32" {
+                        return Ok((WasmType::I32, None));
+                    }
                     // Look up function return type
                     if let Some((_, ret_ty)) = self.module_ctx.get_func(name) {
                         return Ok((ret_ty, None));
@@ -1042,18 +1181,25 @@ impl<'a> FuncContext<'a> {
                 // Check for Math.* calls
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && let Expression::Identifier(ident) = &member.object
-                        && ident.name.as_str() == "Math" {
-                            return Ok((WasmType::F64, None));
-                        }
-                Err(CompileError::type_err("cannot infer type from this expression — add a type annotation"))
+                    && ident.name.as_str() == "Math"
+                {
+                    return Ok((WasmType::F64, None));
+                }
+                Err(CompileError::type_err(
+                    "cannot infer type from this expression — add a type annotation",
+                ))
             }
             Expression::BinaryExpression(bin) => {
                 // Comparisons always return i32
                 match bin.operator {
-                    BinaryOperator::LessThan | BinaryOperator::LessEqualThan |
-                    BinaryOperator::GreaterThan | BinaryOperator::GreaterEqualThan |
-                    BinaryOperator::StrictEquality | BinaryOperator::Equality |
-                    BinaryOperator::StrictInequality | BinaryOperator::Inequality => {
+                    BinaryOperator::LessThan
+                    | BinaryOperator::LessEqualThan
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterEqualThan
+                    | BinaryOperator::StrictEquality
+                    | BinaryOperator::Equality
+                    | BinaryOperator::StrictInequality
+                    | BinaryOperator::Inequality => {
                         return Ok((WasmType::I32, None));
                     }
                     _ => {}
@@ -1061,29 +1207,37 @@ impl<'a> FuncContext<'a> {
                 // For arithmetic, infer from left operand
                 self.infer_init_type(&bin.left)
             }
-            Expression::UnaryExpression(un) => {
-                match un.operator {
-                    UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot => Ok((WasmType::I32, None)),
-                    _ => self.infer_init_type(&un.argument),
-                }
-            }
+            Expression::UnaryExpression(un) => match un.operator {
+                UnaryOperator::LogicalNot | UnaryOperator::BitwiseNot => Ok((WasmType::I32, None)),
+                _ => self.infer_init_type(&un.argument),
+            },
             Expression::ParenthesizedExpression(paren) => self.infer_init_type(&paren.expression),
             Expression::ConditionalExpression(cond) => self.infer_init_type(&cond.consequent),
             Expression::StaticMemberExpression(member) => {
                 // e.field — try to resolve class and field type
                 let class_name = match self.resolve_expr_class(&member.object) {
                     Ok(name) => name,
-                    Err(_) => return Err(CompileError::type_err("cannot infer type — add a type annotation")),
+                    Err(_) => {
+                        return Err(CompileError::type_err(
+                            "cannot infer type — add a type annotation",
+                        ));
+                    }
                 };
                 if let Some(layout) = self.module_ctx.class_registry.get(&class_name)
-                    && let Some(&(_, field_ty)) = layout.field_map.get(member.property.name.as_str()) {
-                        return Ok((field_ty, None));
-                    }
-                Err(CompileError::type_err("cannot infer type — add a type annotation"))
+                    && let Some(&(_, field_ty)) =
+                        layout.field_map.get(member.property.name.as_str())
+                {
+                    return Ok((field_ty, None));
+                }
+                Err(CompileError::type_err(
+                    "cannot infer type — add a type annotation",
+                ))
             }
             // Arrow functions are closure pointers (i32)
             Expression::ArrowFunctionExpression(_) => Ok((WasmType::I32, None)),
-            _ => Err(CompileError::type_err("cannot infer type from this expression — add a type annotation")),
+            _ => Err(CompileError::type_err(
+                "cannot infer type from this expression — add a type annotation",
+            )),
         }
     }
 
@@ -1092,7 +1246,8 @@ impl<'a> FuncContext<'a> {
         let mut param_types = Vec::new();
         for param in &arrow.params.items {
             let ty = if let Some(ann) = &param.type_annotation {
-                types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names).ok()?
+                types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names)
+                    .ok()?
             } else {
                 return None;
             };
@@ -1112,7 +1267,10 @@ impl<'a> FuncContext<'a> {
                 WasmType::Void
             }
         };
-        Some(ClosureSig { param_types, return_type })
+        Some(ClosureSig {
+            param_types,
+            return_type,
+        })
     }
 }
 
@@ -1121,8 +1279,8 @@ impl<'a> FuncContext<'a> {
 
 /// Analyze a function body and return the set of variable names that need boxing.
 pub fn analyze_boxed_vars(body: &[Statement]) -> HashSet<String> {
-    let mut captured = HashSet::new();  // vars referenced inside arrow bodies
-    let mut mutated = HashSet::new();   // vars assigned or updated anywhere
+    let mut captured = HashSet::new(); // vars referenced inside arrow bodies
+    let mut mutated = HashSet::new(); // vars assigned or updated anywhere
 
     for stmt in body {
         scan_stmt_for_boxing(stmt, &mut captured, &mut mutated, false);
@@ -1139,7 +1297,9 @@ fn scan_stmt_for_boxing<'a>(
     in_arrow: bool,
 ) {
     match stmt {
-        Statement::ExpressionStatement(e) => scan_expr_for_boxing(&e.expression, captured, mutated, in_arrow),
+        Statement::ExpressionStatement(e) => {
+            scan_expr_for_boxing(&e.expression, captured, mutated, in_arrow)
+        }
         Statement::ReturnStatement(r) => {
             if let Some(arg) = &r.argument {
                 scan_expr_for_boxing(arg, captured, mutated, in_arrow);
@@ -1175,8 +1335,12 @@ fn scan_stmt_for_boxing<'a>(
                     }
                 }
             }
-            if let Some(test) = &f.test { scan_expr_for_boxing(test, captured, mutated, in_arrow); }
-            if let Some(update) = &f.update { scan_expr_for_boxing(update, captured, mutated, in_arrow); }
+            if let Some(test) = &f.test {
+                scan_expr_for_boxing(test, captured, mutated, in_arrow);
+            }
+            if let Some(update) = &f.update {
+                scan_expr_for_boxing(update, captured, mutated, in_arrow);
+            }
             scan_stmt_for_boxing(&f.body, captured, mutated, in_arrow);
         }
         Statement::ForOfStatement(f) => {
@@ -1184,13 +1348,19 @@ fn scan_stmt_for_boxing<'a>(
             scan_stmt_for_boxing(&f.body, captured, mutated, in_arrow);
         }
         Statement::BlockStatement(b) => {
-            for s in &b.body { scan_stmt_for_boxing(s, captured, mutated, in_arrow); }
+            for s in &b.body {
+                scan_stmt_for_boxing(s, captured, mutated, in_arrow);
+            }
         }
         Statement::SwitchStatement(s) => {
             scan_expr_for_boxing(&s.discriminant, captured, mutated, in_arrow);
             for case in &s.cases {
-                if let Some(test) = &case.test { scan_expr_for_boxing(test, captured, mutated, in_arrow); }
-                for s in &case.consequent { scan_stmt_for_boxing(s, captured, mutated, in_arrow); }
+                if let Some(test) = &case.test {
+                    scan_expr_for_boxing(test, captured, mutated, in_arrow);
+                }
+                for s in &case.consequent {
+                    scan_stmt_for_boxing(s, captured, mutated, in_arrow);
+                }
             }
         }
         _ => {}
@@ -1228,7 +1398,10 @@ fn scan_expr_for_boxing<'a>(
         }
         Expression::ArrowFunctionExpression(arrow) => {
             // Collect arrow parameter names to exclude from captures
-            let param_names: HashSet<String> = arrow.params.items.iter()
+            let param_names: HashSet<String> = arrow
+                .params
+                .items
+                .iter()
                 .filter_map(|p| match &p.pattern {
                     BindingPattern::BindingIdentifier(id) => Some(id.name.as_str().to_string()),
                     _ => None,
@@ -1270,12 +1443,18 @@ fn scan_expr_for_boxing<'a>(
             scan_expr_for_boxing(&l.left, captured, mutated, in_arrow);
             scan_expr_for_boxing(&l.right, captured, mutated, in_arrow);
         }
-        Expression::UnaryExpression(u) => scan_expr_for_boxing(&u.argument, captured, mutated, in_arrow),
+        Expression::UnaryExpression(u) => {
+            scan_expr_for_boxing(&u.argument, captured, mutated, in_arrow)
+        }
         Expression::CallExpression(c) => {
             scan_expr_for_boxing(&c.callee, captured, mutated, in_arrow);
-            for arg in &c.arguments { scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow); }
+            for arg in &c.arguments {
+                scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow);
+            }
         }
-        Expression::StaticMemberExpression(m) => scan_expr_for_boxing(&m.object, captured, mutated, in_arrow),
+        Expression::StaticMemberExpression(m) => {
+            scan_expr_for_boxing(&m.object, captured, mutated, in_arrow)
+        }
         Expression::ComputedMemberExpression(m) => {
             scan_expr_for_boxing(&m.object, captured, mutated, in_arrow);
             scan_expr_for_boxing(&m.expression, captured, mutated, in_arrow);
@@ -1285,25 +1464,33 @@ fn scan_expr_for_boxing<'a>(
             scan_expr_for_boxing(&c.consequent, captured, mutated, in_arrow);
             scan_expr_for_boxing(&c.alternate, captured, mutated, in_arrow);
         }
-        Expression::ParenthesizedExpression(p) => scan_expr_for_boxing(&p.expression, captured, mutated, in_arrow),
-        Expression::NewExpression(n) => {
-            for arg in &n.arguments { scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow); }
+        Expression::ParenthesizedExpression(p) => {
+            scan_expr_for_boxing(&p.expression, captured, mutated, in_arrow)
         }
-        Expression::TSAsExpression(a) => scan_expr_for_boxing(&a.expression, captured, mutated, in_arrow),
-        Expression::ChainExpression(c) => {
-            match &c.expression {
-                ChainElement::StaticMemberExpression(m) => scan_expr_for_boxing(&m.object, captured, mutated, in_arrow),
-                ChainElement::ComputedMemberExpression(m) => {
-                    scan_expr_for_boxing(&m.object, captured, mutated, in_arrow);
-                    scan_expr_for_boxing(&m.expression, captured, mutated, in_arrow);
-                }
-                ChainElement::CallExpression(c) => {
-                    scan_expr_for_boxing(&c.callee, captured, mutated, in_arrow);
-                    for arg in &c.arguments { scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow); }
-                }
-                _ => {}
+        Expression::NewExpression(n) => {
+            for arg in &n.arguments {
+                scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow);
             }
         }
+        Expression::TSAsExpression(a) => {
+            scan_expr_for_boxing(&a.expression, captured, mutated, in_arrow)
+        }
+        Expression::ChainExpression(c) => match &c.expression {
+            ChainElement::StaticMemberExpression(m) => {
+                scan_expr_for_boxing(&m.object, captured, mutated, in_arrow)
+            }
+            ChainElement::ComputedMemberExpression(m) => {
+                scan_expr_for_boxing(&m.object, captured, mutated, in_arrow);
+                scan_expr_for_boxing(&m.expression, captured, mutated, in_arrow);
+            }
+            ChainElement::CallExpression(c) => {
+                scan_expr_for_boxing(&c.callee, captured, mutated, in_arrow);
+                for arg in &c.arguments {
+                    scan_expr_for_boxing(arg.to_expression(), captured, mutated, in_arrow);
+                }
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -1319,11 +1506,15 @@ fn collect_local_decls(stmt: &Statement, out: &mut HashSet<String>) {
             }
         }
         Statement::BlockStatement(b) => {
-            for s in &b.body { collect_local_decls(s, out); }
+            for s in &b.body {
+                collect_local_decls(s, out);
+            }
         }
         Statement::IfStatement(i) => {
             collect_local_decls(&i.consequent, out);
-            if let Some(alt) = &i.alternate { collect_local_decls(alt, out); }
+            if let Some(alt) = &i.alternate {
+                collect_local_decls(alt, out);
+            }
         }
         Statement::ForStatement(f) => {
             if let Some(ForStatementInit::VariableDeclaration(v)) = &f.init {

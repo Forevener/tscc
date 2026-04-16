@@ -21,10 +21,14 @@ fn elem_size(ty: WasmType) -> Result<i32, CompileError> {
 fn emit_elem_load(func_ctx: &mut FuncContext, ty: WasmType) {
     match ty {
         WasmType::F64 => func_ctx.push(Instruction::F64Load(wasm_encoder::MemArg {
-            offset: 0, align: 3, memory_index: 0,
+            offset: 0,
+            align: 3,
+            memory_index: 0,
         })),
         WasmType::I32 => func_ctx.push(Instruction::I32Load(wasm_encoder::MemArg {
-            offset: 0, align: 2, memory_index: 0,
+            offset: 0,
+            align: 2,
+            memory_index: 0,
         })),
         _ => {}
     }
@@ -35,10 +39,14 @@ fn emit_elem_load(func_ctx: &mut FuncContext, ty: WasmType) {
 fn emit_elem_store(func_ctx: &mut FuncContext, ty: WasmType) {
     match ty {
         WasmType::F64 => func_ctx.push(Instruction::F64Store(wasm_encoder::MemArg {
-            offset: 0, align: 3, memory_index: 0,
+            offset: 0,
+            align: 3,
+            memory_index: 0,
         })),
         WasmType::I32 => func_ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-            offset: 0, align: 2, memory_index: 0,
+            offset: 0,
+            align: 2,
+            memory_index: 0,
         })),
         _ => {}
     }
@@ -60,13 +68,19 @@ fn emit_elem_addr(func_ctx: &mut FuncContext, arr_local: u32, idx_local: u32, es
 fn emit_arr_length(func_ctx: &mut FuncContext, arr_local: u32) {
     func_ctx.push(Instruction::LocalGet(arr_local));
     func_ctx.push(Instruction::I32Load(wasm_encoder::MemArg {
-        offset: 0, align: 2, memory_index: 0,
+        offset: 0,
+        align: 2,
+        memory_index: 0,
     }));
 }
 
 /// Helper: emit inline push — store element at end, increment length.
 /// Expects: result_local = array pointer, elem value on stack.
-fn emit_inline_push(func_ctx: &mut FuncContext, result_local: u32, elem_ty: WasmType) -> Result<(), CompileError> {
+fn emit_inline_push(
+    func_ctx: &mut FuncContext,
+    result_local: u32,
+    elem_ty: WasmType,
+) -> Result<(), CompileError> {
     let esize = elem_size(elem_ty)?;
 
     // Save the value to push
@@ -91,7 +105,9 @@ fn emit_inline_push(func_ctx: &mut FuncContext, result_local: u32, elem_ty: Wasm
     func_ctx.push(Instruction::I32Const(1));
     func_ctx.push(Instruction::I32Add);
     func_ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-        offset: 0, align: 2, memory_index: 0,
+        offset: 0,
+        align: 2,
+        memory_index: 0,
     }));
 
     Ok(())
@@ -99,9 +115,15 @@ fn emit_inline_push(func_ctx: &mut FuncContext, result_local: u32, elem_ty: Wasm
 
 /// Helper: allocate a new array via arena bump.
 /// Returns the local index holding the new array pointer.
-fn emit_alloc_array(func_ctx: &mut FuncContext, capacity_local: u32, elem_ty: WasmType) -> Result<u32, CompileError> {
+fn emit_alloc_array(
+    func_ctx: &mut FuncContext,
+    capacity_local: u32,
+    elem_ty: WasmType,
+) -> Result<u32, CompileError> {
     let esize = elem_size(elem_ty)?;
-    let arena_idx = func_ctx.module_ctx.arena_ptr_global
+    let arena_idx = func_ctx
+        .module_ctx
+        .arena_ptr_global
         .ok_or_else(|| CompileError::codegen("arena not initialized"))?;
 
     // total_size = 8 + capacity * elem_size
@@ -128,14 +150,18 @@ fn emit_alloc_array(func_ctx: &mut FuncContext, capacity_local: u32, elem_ty: Wa
     func_ctx.push(Instruction::LocalGet(ptr_local));
     func_ctx.push(Instruction::I32Const(0));
     func_ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-        offset: 0, align: 2, memory_index: 0,
+        offset: 0,
+        align: 2,
+        memory_index: 0,
     }));
 
     // capacity
     func_ctx.push(Instruction::LocalGet(ptr_local));
     func_ctx.push(Instruction::LocalGet(capacity_local));
     func_ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-        offset: 4, align: 2, memory_index: 0,
+        offset: 4,
+        align: 2,
+        memory_index: 0,
     }));
 
     Ok(ptr_local)
@@ -143,7 +169,9 @@ fn emit_alloc_array(func_ctx: &mut FuncContext, capacity_local: u32, elem_ty: Wa
 
 /// Extract the arrow function from a call argument.
 /// Returns the ArrowFunctionExpression or an error.
-pub fn extract_arrow<'a, 'b>(arg: &'b Expression<'a>) -> Result<&'b ArrowFunctionExpression<'a>, CompileError> {
+pub fn extract_arrow<'a, 'b>(
+    arg: &'b Expression<'a>,
+) -> Result<&'b ArrowFunctionExpression<'a>, CompileError> {
     match arg {
         Expression::ArrowFunctionExpression(arrow) => Ok(arrow),
         Expression::ParenthesizedExpression(paren) => extract_arrow(&paren.expression),
@@ -170,16 +198,20 @@ fn extract_arrow_params(arrow: &ArrowFunctionExpression) -> Result<Vec<String>, 
 /// For expression arrows (`x => expr`), evaluates the expression and returns its type.
 /// For block arrows (`x => { stmts; return val; }`), evaluates statements.
 /// Returns the type of the result left on the WASM stack.
-fn eval_arrow_body<'a>(func_ctx: &mut FuncContext<'a>, arrow: &ArrowFunctionExpression<'a>) -> Result<WasmType, CompileError> {
+fn eval_arrow_body<'a>(
+    func_ctx: &mut FuncContext<'a>,
+    arrow: &ArrowFunctionExpression<'a>,
+) -> Result<WasmType, CompileError> {
     // Record source location for the arrow body (inline closures in array builtins)
     func_ctx.mark_loc(arrow.span().start);
 
     if arrow.expression {
         // Expression body: single statement that IS the return value
         if let Some(stmt) = arrow.body.statements.first()
-            && let Statement::ExpressionStatement(expr_stmt) = stmt {
-                return func_ctx.emit_expr(&expr_stmt.expression);
-            }
+            && let Statement::ExpressionStatement(expr_stmt) = stmt
+        {
+            return func_ctx.emit_expr(&expr_stmt.expression);
+        }
         Err(CompileError::codegen("empty arrow expression body"))
     } else {
         // Block body: emit all statements.
@@ -231,9 +263,15 @@ fn setup_arrow_scope<'a>(
     for (i, name) in params.iter().enumerate() {
         // Save existing bindings
         scope.saved_locals.push(func_ctx.locals.get(name).copied());
-        scope.saved_class_types.push(func_ctx.local_class_types.get(name).cloned());
-        scope.saved_array_elem_types.push(func_ctx.local_array_elem_types.get(name).copied());
-        scope.saved_array_elem_classes.push(func_ctx.local_array_elem_classes.get(name).cloned());
+        scope
+            .saved_class_types
+            .push(func_ctx.local_class_types.get(name).cloned());
+        scope
+            .saved_array_elem_types
+            .push(func_ctx.local_array_elem_types.get(name).copied());
+        scope
+            .saved_array_elem_classes
+            .push(func_ctx.local_array_elem_classes.get(name).cloned());
 
         // Bind arrow parameter
         let (local_idx, local_ty) = param_locals[i];
@@ -241,7 +279,9 @@ fn setup_arrow_scope<'a>(
 
         // Set class type if applicable
         if let Some(class_name) = &param_class_types[i] {
-            func_ctx.local_class_types.insert(name.clone(), class_name.clone());
+            func_ctx
+                .local_class_types
+                .insert(name.clone(), class_name.clone());
         } else {
             func_ctx.local_class_types.remove(name);
         }
@@ -266,7 +306,9 @@ fn restore_arrow_scope(func_ctx: &mut FuncContext, scope: ArrowScope) {
 
         // Restore class types
         if let Some(prev) = &scope.saved_class_types[i] {
-            func_ctx.local_class_types.insert(name.clone(), prev.clone());
+            func_ctx
+                .local_class_types
+                .insert(name.clone(), prev.clone());
         } else {
             func_ctx.local_class_types.remove(name);
         }
@@ -280,7 +322,9 @@ fn restore_arrow_scope(func_ctx: &mut FuncContext, scope: ArrowScope) {
 
         // Restore array elem classes
         if let Some(prev) = &scope.saved_array_elem_classes[i] {
-            func_ctx.local_array_elem_classes.insert(name.clone(), prev.clone());
+            func_ctx
+                .local_array_elem_classes
+                .insert(name.clone(), prev.clone());
         } else {
             func_ctx.local_array_elem_classes.remove(name);
         }
@@ -292,7 +336,10 @@ fn restore_arrow_scope(func_ctx: &mut FuncContext, scope: ArrowScope) {
 impl<'a> FuncContext<'a> {
     /// Try to emit an array builtin method call.
     /// Returns Some(type) if this was a recognized builtin, None otherwise.
-    pub fn try_emit_array_builtin(&mut self, call: &CallExpression<'a>) -> Result<Option<WasmType>, CompileError> {
+    pub fn try_emit_array_builtin(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
         let member = match &call.callee {
             Expression::StaticMemberExpression(m) => m,
             _ => return Ok(None),
@@ -313,52 +360,99 @@ impl<'a> FuncContext<'a> {
                 if call.arguments.len() != 1 {
                     return Err(CompileError::codegen("Array.filter() expects 1 argument"));
                 }
-                let result = self.emit_array_filter(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression())?;
+                let result = self.emit_array_filter(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                )?;
                 Ok(Some(result))
             }
             "map" => {
                 if call.arguments.len() != 1 {
                     return Err(CompileError::codegen("Array.map() expects 1 argument"));
                 }
-                let result = self.emit_array_map(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression())?;
+                let result = self.emit_array_map(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                )?;
                 Ok(Some(result))
             }
             "forEach" => {
                 if call.arguments.len() != 1 {
                     return Err(CompileError::codegen("Array.forEach() expects 1 argument"));
                 }
-                self.emit_array_foreach(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression())?;
+                self.emit_array_foreach(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                )?;
                 Ok(Some(WasmType::Void))
             }
             "reduce" => {
                 if call.arguments.len() != 2 {
-                    return Err(CompileError::codegen("Array.reduce() expects 2 arguments (callback, initialValue)"));
+                    return Err(CompileError::codegen(
+                        "Array.reduce() expects 2 arguments (callback, initialValue)",
+                    ));
                 }
-                let result = self.emit_array_reduce(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression(), call.arguments[1].to_expression())?;
+                let result = self.emit_array_reduce(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                    call.arguments[1].to_expression(),
+                )?;
                 Ok(Some(result))
             }
             "some" | "every" => {
                 if call.arguments.len() != 1 {
-                    return Err(CompileError::codegen(format!("Array.{method_name}() expects 1 argument")));
+                    return Err(CompileError::codegen(format!(
+                        "Array.{method_name}() expects 1 argument"
+                    )));
                 }
                 let all = method_name == "every";
-                let result = self.emit_array_some_every(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression(), all)?;
+                let result = self.emit_array_some_every(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                    all,
+                )?;
                 Ok(Some(result))
             }
             "find" | "findIndex" | "findLast" | "findLastIndex" => {
                 if call.arguments.len() != 1 {
-                    return Err(CompileError::codegen(format!("Array.{method_name}() expects 1 argument")));
+                    return Err(CompileError::codegen(format!(
+                        "Array.{method_name}() expects 1 argument"
+                    )));
                 }
                 let reverse = method_name.starts_with("findLast");
                 let return_index = method_name.ends_with("Index");
-                let result = self.emit_array_find(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression(), reverse, return_index)?;
+                let result = self.emit_array_find(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                    reverse,
+                    return_index,
+                )?;
                 Ok(Some(result))
             }
             "sort" => {
                 if call.arguments.len() != 1 {
-                    return Err(CompileError::codegen("Array.sort() expects 1 argument (comparator)"));
+                    return Err(CompileError::codegen(
+                        "Array.sort() expects 1 argument (comparator)",
+                    ));
                 }
-                self.emit_array_sort(&member.object, elem_ty, elem_class.as_deref(), call.arguments[0].to_expression())?;
+                self.emit_array_sort(
+                    &member.object,
+                    elem_ty,
+                    elem_class.as_deref(),
+                    call.arguments[0].to_expression(),
+                )?;
                 // sort returns the same array (mutates in place)
                 self.emit_expr(&member.object)?;
                 Ok(Some(WasmType::I32))
@@ -381,7 +475,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 1 {
-            return Err(CompileError::codegen("some/every predicate must take 1 parameter"));
+            return Err(CompileError::codegen(
+                "some/every predicate must take 1 parameter",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -424,7 +520,9 @@ impl<'a> FuncContext<'a> {
         );
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
-            return Err(CompileError::type_err("some/every predicate must return i32/bool"));
+            return Err(CompileError::type_err(
+                "some/every predicate must return i32/bool",
+            ));
         }
         restore_arrow_scope(self, scope);
 
@@ -479,7 +577,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 1 {
-            return Err(CompileError::codegen("find predicate must take 1 parameter"));
+            return Err(CompileError::codegen(
+                "find predicate must take 1 parameter",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -499,8 +599,14 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(found_idx));
         // Initialize found_val to default
         match elem_ty {
-            WasmType::F64 => { self.push(Instruction::F64Const(0.0)); self.push(Instruction::LocalSet(found_val)); }
-            _ => { self.push(Instruction::I32Const(0)); self.push(Instruction::LocalSet(found_val)); }
+            WasmType::F64 => {
+                self.push(Instruction::F64Const(0.0));
+                self.push(Instruction::LocalSet(found_val));
+            }
+            _ => {
+                self.push(Instruction::I32Const(0));
+                self.push(Instruction::LocalSet(found_val));
+            }
         }
 
         if reverse {
@@ -537,7 +643,9 @@ impl<'a> FuncContext<'a> {
         );
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
-            return Err(CompileError::type_err("find predicate must return i32/bool"));
+            return Err(CompileError::type_err(
+                "find predicate must return i32/bool",
+            ));
         }
         restore_arrow_scope(self, scope);
 
@@ -578,7 +686,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 1 {
-            return Err(CompileError::codegen("filter callback must have exactly 1 parameter"));
+            return Err(CompileError::codegen(
+                "filter callback must have exactly 1 parameter",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -628,7 +738,9 @@ impl<'a> FuncContext<'a> {
         // Evaluate predicate
         let pred_ty = eval_arrow_body(self, arrow)?;
         if pred_ty != WasmType::I32 {
-            return Err(CompileError::type_err("filter predicate must return i32/bool"));
+            return Err(CompileError::type_err(
+                "filter predicate must return i32/bool",
+            ));
         }
 
         // Restore scope
@@ -666,7 +778,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 1 {
-            return Err(CompileError::codegen("map callback must have exactly 1 parameter"));
+            return Err(CompileError::codegen(
+                "map callback must have exactly 1 parameter",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -772,7 +886,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 1 {
-            return Err(CompileError::codegen("forEach callback must have exactly 1 parameter"));
+            return Err(CompileError::codegen(
+                "forEach callback must have exactly 1 parameter",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -846,7 +962,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 2 {
-            return Err(CompileError::codegen("reduce callback must have exactly 2 parameters (acc, elem)"));
+            return Err(CompileError::codegen(
+                "reduce callback must have exactly 2 parameters (acc, elem)",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -932,7 +1050,9 @@ impl<'a> FuncContext<'a> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 2 {
-            return Err(CompileError::codegen("sort comparator must have exactly 2 parameters"));
+            return Err(CompileError::codegen(
+                "sort comparator must have exactly 2 parameters",
+            ));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -967,7 +1087,7 @@ impl<'a> FuncContext<'a> {
 
         // === Outer loop: while width < len ===
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $outer_break (depth 0 from block = br(1) from loop)
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $outer_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $outer_loop
 
         // if width >= len, break
         self.push(Instruction::LocalGet(width_local));
@@ -981,7 +1101,7 @@ impl<'a> FuncContext<'a> {
 
         // === Inner loop: while i < len ===
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $inner_break
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $inner_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $inner_loop
 
         // if i >= len, break inner
         self.push(Instruction::LocalGet(i_local));
@@ -1049,7 +1169,7 @@ impl<'a> FuncContext<'a> {
 
         // === Merge loop: while l < mid && r < right ===
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $merge_break
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $merge_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $merge_loop
 
         // if l >= mid, break merge
         self.push(Instruction::LocalGet(l_local));
@@ -1078,7 +1198,10 @@ impl<'a> FuncContext<'a> {
             self,
             &params,
             &[(a_local, elem_ty), (b_local, elem_ty)],
-            &[elem_class.map(|s| s.to_string()), elem_class.map(|s| s.to_string())],
+            &[
+                elem_class.map(|s| s.to_string()),
+                elem_class.map(|s| s.to_string()),
+            ],
         );
 
         let cmp_ty = eval_arrow_body(self, arrow)?;
@@ -1096,7 +1219,11 @@ impl<'a> FuncContext<'a> {
                 self.push(Instruction::F64Const(0.0f64));
                 self.push(Instruction::F64Le);
             }
-            _ => return Err(CompileError::type_err("sort comparator must return i32 or f64")),
+            _ => {
+                return Err(CompileError::type_err(
+                    "sort comparator must return i32 or f64",
+                ));
+            }
         }
 
         // if-else: comparator <= 0 means take from left
@@ -1138,7 +1265,7 @@ impl<'a> FuncContext<'a> {
 
         // === Copy remaining left elements: while l < mid ===
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $left_break
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $left_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $left_loop
 
         self.push(Instruction::LocalGet(l_local));
         self.push(Instruction::LocalGet(mid_local));
@@ -1168,7 +1295,7 @@ impl<'a> FuncContext<'a> {
 
         // === Copy remaining right elements: while r < right ===
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $right_break
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $right_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $right_loop
 
         self.push(Instruction::LocalGet(r_local));
         self.push(Instruction::LocalGet(right_local));
@@ -1213,7 +1340,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(copy_idx));
 
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty)); // $copy_break
-        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));  // $copy_loop
+        self.push(Instruction::Loop(wasm_encoder::BlockType::Empty)); // $copy_loop
 
         self.push(Instruction::LocalGet(copy_idx));
         self.push(Instruction::LocalGet(len_local));
@@ -1260,15 +1387,19 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         // If the arrow has a return type annotation, use it
         if let Some(ret_ann) = &arrow.return_type {
-            return crate::types::resolve_type_annotation_with_classes(ret_ann, &self.module_ctx.class_names);
+            return crate::types::resolve_type_annotation_with_classes(
+                ret_ann,
+                &self.module_ctx.class_names,
+            );
         }
 
         // For expression arrows, try to infer from the body expression
         if arrow.expression
             && let Some(stmt) = arrow.body.statements.first()
-                && let Statement::ExpressionStatement(expr_stmt) = stmt {
-                    return self.infer_expr_type(&expr_stmt.expression, params, elem_ty, elem_class);
-                }
+            && let Statement::ExpressionStatement(expr_stmt) = stmt
+        {
+            return self.infer_expr_type(&expr_stmt.expression, params, elem_ty, elem_class);
+        }
 
         // Default to same type as input element
         Ok(elem_ty)
@@ -1313,10 +1444,11 @@ impl<'a> FuncContext<'a> {
                     let name = ident.name.as_str();
                     if arrow_params.contains(&name.to_string())
                         && let Some(class_name) = elem_class
-                            && let Some(layout) = self.module_ctx.class_registry.get(class_name)
-                                && let Some(&(_, ty)) = layout.field_map.get(member.property.name.as_str()) {
-                                    return Ok(ty);
-                                }
+                        && let Some(layout) = self.module_ctx.class_registry.get(class_name)
+                        && let Some(&(_, ty)) = layout.field_map.get(member.property.name.as_str())
+                    {
+                        return Ok(ty);
+                    }
                 }
                 Ok(WasmType::I32) // fallback for pointers
             }
@@ -1324,19 +1456,21 @@ impl<'a> FuncContext<'a> {
                 let left = self.infer_expr_type(&bin.left, arrow_params, elem_ty, elem_class)?;
                 // Comparison operators always return i32
                 match bin.operator {
-                    BinaryOperator::LessThan | BinaryOperator::LessEqualThan |
-                    BinaryOperator::GreaterThan | BinaryOperator::GreaterEqualThan |
-                    BinaryOperator::StrictEquality | BinaryOperator::Equality |
-                    BinaryOperator::StrictInequality | BinaryOperator::Inequality => Ok(WasmType::I32),
+                    BinaryOperator::LessThan
+                    | BinaryOperator::LessEqualThan
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterEqualThan
+                    | BinaryOperator::StrictEquality
+                    | BinaryOperator::Equality
+                    | BinaryOperator::StrictInequality
+                    | BinaryOperator::Inequality => Ok(WasmType::I32),
                     _ => Ok(left), // arithmetic preserves type
                 }
             }
-            Expression::UnaryExpression(un) => {
-                match un.operator {
-                    UnaryOperator::LogicalNot => Ok(WasmType::I32),
-                    _ => self.infer_expr_type(&un.argument, arrow_params, elem_ty, elem_class),
-                }
-            }
+            Expression::UnaryExpression(un) => match un.operator {
+                UnaryOperator::LogicalNot => Ok(WasmType::I32),
+                _ => self.infer_expr_type(&un.argument, arrow_params, elem_ty, elem_class),
+            },
             Expression::ParenthesizedExpression(paren) => {
                 self.infer_expr_type(&paren.expression, arrow_params, elem_ty, elem_class)
             }
@@ -1344,14 +1478,16 @@ impl<'a> FuncContext<'a> {
                 // Check for method calls that have known return types
                 if let Expression::StaticMemberExpression(member) = &call.callee
                     && let Expression::Identifier(ident) = &member.object
-                        && ident.name.as_str() == "Math" {
-                            return Ok(WasmType::F64);
-                        }
+                    && ident.name.as_str() == "Math"
+                {
+                    return Ok(WasmType::F64);
+                }
                 // Check function return type
                 if let Expression::Identifier(ident) = &call.callee
-                    && let Some((_, ret_ty)) = self.module_ctx.get_func(ident.name.as_str()) {
-                        return Ok(ret_ty);
-                    }
+                    && let Some((_, ret_ty)) = self.module_ctx.get_func(ident.name.as_str())
+                {
+                    return Ok(ret_ty);
+                }
                 Ok(WasmType::I32) // fallback
             }
             _ => Ok(elem_ty), // fallback

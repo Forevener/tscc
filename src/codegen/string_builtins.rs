@@ -46,53 +46,173 @@ type HelperSig = (&'static str, Vec<(String, WasmType)>, WasmType);
 pub fn register_string_helpers(ctx: &mut ModuleContext, used: &HashSet<String>) {
     let helpers: Vec<HelperSig> = vec![
         // __str_eq(a: i32, b: i32) -> i32
-        ("__str_eq", vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_eq",
+            vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_cmp(a: i32, b: i32) -> i32
-        ("__str_cmp", vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_cmp",
+            vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_indexOf(haystack: i32, needle: i32) -> i32
-        ("__str_indexOf", vec![("haystack".into(), WasmType::I32), ("needle".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_indexOf",
+            vec![
+                ("haystack".into(), WasmType::I32),
+                ("needle".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_slice(s: i32, start: i32, end: i32) -> i32
-        ("__str_slice", vec![("s".into(), WasmType::I32), ("start".into(), WasmType::I32), ("end".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_slice",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("start".into(), WasmType::I32),
+                ("end".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_startsWith(s: i32, prefix: i32) -> i32
-        ("__str_startsWith", vec![("s".into(), WasmType::I32), ("prefix".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_startsWith",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("prefix".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_endsWith(s: i32, suffix: i32) -> i32
-        ("__str_endsWith", vec![("s".into(), WasmType::I32), ("suffix".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_endsWith",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("suffix".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_includes(s: i32, search: i32) -> i32
-        ("__str_includes", vec![("s".into(), WasmType::I32), ("search".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_includes",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("search".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_toLower(s: i32) -> i32
-        ("__str_toLower", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_toLower",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_toUpper(s: i32) -> i32
-        ("__str_toUpper", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_toUpper",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_trim(s: i32) -> i32
-        ("__str_trim", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_trim",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_trimStart(s: i32) -> i32
-        ("__str_trimStart", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_trimStart",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_trimEnd(s: i32) -> i32
-        ("__str_trimEnd", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_trimEnd",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_from_i32(n: i32) -> i32
-        ("__str_from_i32", vec![("n".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_from_i32",
+            vec![("n".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_from_f64(n: f64) -> i32
-        ("__str_from_f64", vec![("n".into(), WasmType::F64)], WasmType::I32),
+        (
+            "__str_from_f64",
+            vec![("n".into(), WasmType::F64)],
+            WasmType::I32,
+        ),
         // __str_split(s: i32, delim: i32) -> i32 (returns Array<string> pointer)
-        ("__str_split", vec![("s".into(), WasmType::I32), ("delim".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_split",
+            vec![("s".into(), WasmType::I32), ("delim".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_replace(s: i32, search: i32, replacement: i32) -> i32
-        ("__str_replace", vec![("s".into(), WasmType::I32), ("search".into(), WasmType::I32), ("replacement".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_replace",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("search".into(), WasmType::I32),
+                ("replacement".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_parseInt(s: i32) -> i32
-        ("__str_parseInt", vec![("s".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_parseInt",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_parseFloat(s: i32) -> f64
-        ("__str_parseFloat", vec![("s".into(), WasmType::I32)], WasmType::F64),
+        (
+            "__str_parseFloat",
+            vec![("s".into(), WasmType::I32)],
+            WasmType::F64,
+        ),
         // __str_fromCharCode(code: i32) -> i32
-        ("__str_fromCharCode", vec![("code".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_fromCharCode",
+            vec![("code".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_repeat(s: i32, count: i32) -> i32
-        ("__str_repeat", vec![("s".into(), WasmType::I32), ("count".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_repeat",
+            vec![("s".into(), WasmType::I32), ("count".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_padStart(s: i32, targetLen: i32, fill: i32) -> i32
-        ("__str_padStart", vec![("s".into(), WasmType::I32), ("targetLen".into(), WasmType::I32), ("fill".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_padStart",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("targetLen".into(), WasmType::I32),
+                ("fill".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_padEnd(s: i32, targetLen: i32, fill: i32) -> i32
-        ("__str_padEnd", vec![("s".into(), WasmType::I32), ("targetLen".into(), WasmType::I32), ("fill".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_padEnd",
+            vec![
+                ("s".into(), WasmType::I32),
+                ("targetLen".into(), WasmType::I32),
+                ("fill".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
         // __str_concat(a: i32, b: i32) -> i32 — runtime 2-string concat for
         // Array.join. String `+` goes through emit_fused_string_chain and does
         // NOT use this helper.
-        ("__str_concat", vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)], WasmType::I32),
+        (
+            "__str_concat",
+            vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
     ];
 
     for (name, params, ret) in helpers {
@@ -145,7 +265,9 @@ struct Scanner {
 impl Scanner {
     fn into_set(self) -> HashSet<String> {
         let mut used = HashSet::new();
-        let add = |n: &str, set: &mut HashSet<String>| { set.insert(n.to_string()); };
+        let add = |n: &str, set: &mut HashSet<String>| {
+            set.insert(n.to_string());
+        };
 
         // Template literals with interpolated expressions coerce each expression to a
         // string via __str_from_i32 / __str_from_f64. The concat itself is fused inline
@@ -159,13 +281,24 @@ impl Scanner {
         // methods (slice, toLowerCase, etc.). If any such source exists, treat the program
         // as "has strings" for operator-based helper inclusion.
         let string_returning_methods = [
-            "slice", "substring", "toLowerCase", "toUpperCase",
-            "trim", "trimStart", "trimEnd", "replace", "repeat", "padStart", "padEnd",
+            "slice",
+            "substring",
+            "toLowerCase",
+            "toUpperCase",
+            "trim",
+            "trimStart",
+            "trimEnd",
+            "replace",
+            "repeat",
+            "padStart",
+            "padEnd",
             "concat",
         ];
         let has_string_source = self.has_string_literal
             || self.has_string_from_char_code
-            || string_returning_methods.iter().any(|m| self.method_names.contains(*m));
+            || string_returning_methods
+                .iter()
+                .any(|m| self.method_names.contains(*m));
 
         // `+` with strings present: enable the coercion helpers so numeric operands
         // can be formatted. The concat is fused inline — no __str_concat call.
@@ -215,7 +348,8 @@ impl Scanner {
         if self.identifier_calls.contains("parseInt") || self.method_names.contains("parseInt") {
             add("__str_parseInt", &mut used);
         }
-        if self.identifier_calls.contains("parseFloat") || self.method_names.contains("parseFloat") {
+        if self.identifier_calls.contains("parseFloat") || self.method_names.contains("parseFloat")
+        {
             add("__str_parseFloat", &mut used);
         }
 
@@ -241,12 +375,16 @@ impl Scanner {
         match stmt {
             Statement::ExpressionStatement(s) => self.walk_expr(&s.expression),
             Statement::BlockStatement(b) => {
-                for s in &b.body { self.walk_stmt(s); }
+                for s in &b.body {
+                    self.walk_stmt(s);
+                }
             }
             Statement::IfStatement(s) => {
                 self.walk_expr(&s.test);
                 self.walk_stmt(&s.consequent);
-                if let Some(alt) = &s.alternate { self.walk_stmt(alt); }
+                if let Some(alt) = &s.alternate {
+                    self.walk_stmt(alt);
+                }
             }
             Statement::WhileStatement(s) => {
                 self.walk_expr(&s.test);
@@ -263,8 +401,12 @@ impl Scanner {
                         _ => self.walk_expr(init.to_expression()),
                     }
                 }
-                if let Some(test) = &s.test { self.walk_expr(test); }
-                if let Some(update) = &s.update { self.walk_expr(update); }
+                if let Some(test) = &s.test {
+                    self.walk_expr(test);
+                }
+                if let Some(update) = &s.update {
+                    self.walk_expr(update);
+                }
                 self.walk_stmt(&s.body);
             }
             Statement::ForOfStatement(s) => {
@@ -281,49 +423,72 @@ impl Scanner {
             Statement::SwitchStatement(s) => {
                 self.walk_expr(&s.discriminant);
                 for case in &s.cases {
-                    if let Some(t) = &case.test { self.walk_expr(t); }
-                    for s in &case.consequent { self.walk_stmt(s); }
+                    if let Some(t) = &case.test {
+                        self.walk_expr(t);
+                    }
+                    for s in &case.consequent {
+                        self.walk_stmt(s);
+                    }
                 }
             }
             Statement::ReturnStatement(s) => {
-                if let Some(arg) = &s.argument { self.walk_expr(arg); }
+                if let Some(arg) = &s.argument {
+                    self.walk_expr(arg);
+                }
             }
             Statement::ThrowStatement(s) => self.walk_expr(&s.argument),
             Statement::TryStatement(s) => {
-                for st in &s.block.body { self.walk_stmt(st); }
+                for st in &s.block.body {
+                    self.walk_stmt(st);
+                }
                 if let Some(h) = &s.handler {
-                    for st in &h.body.body { self.walk_stmt(st); }
+                    for st in &h.body.body {
+                        self.walk_stmt(st);
+                    }
                 }
                 if let Some(f) = &s.finalizer {
-                    for st in &f.body { self.walk_stmt(st); }
+                    for st in &f.body {
+                        self.walk_stmt(st);
+                    }
                 }
             }
             Statement::LabeledStatement(s) => self.walk_stmt(&s.body),
             Statement::VariableDeclaration(d) => self.walk_var_decl(d),
             Statement::FunctionDeclaration(f) => {
                 if let Some(body) = &f.body {
-                    for st in &body.statements { self.walk_stmt(st); }
+                    for st in &body.statements {
+                        self.walk_stmt(st);
+                    }
                 }
             }
             Statement::ClassDeclaration(c) => {
                 for element in &c.body.body {
                     if let ClassElement::MethodDefinition(m) = element
-                        && let Some(body) = &m.value.body {
-                            for st in &body.statements { self.walk_stmt(st); }
+                        && let Some(body) = &m.value.body
+                    {
+                        for st in &body.statements {
+                            self.walk_stmt(st);
                         }
+                    }
                 }
             }
             Statement::ExportDefaultDeclaration(e) => {
                 if let ExportDefaultDeclarationKind::FunctionDeclaration(f) = &e.declaration
-                    && let Some(body) = &f.body {
-                        for st in &body.statements { self.walk_stmt(st); }
+                    && let Some(body) = &f.body
+                {
+                    for st in &body.statements {
+                        self.walk_stmt(st);
                     }
+                }
             }
             Statement::ExportNamedDeclaration(e) => {
                 if let Some(Declaration::FunctionDeclaration(f)) = &e.declaration
-                    && let Some(body) = &f.body {
-                        for st in &body.statements { self.walk_stmt(st); }
+                    && let Some(body) = &f.body
+                {
+                    for st in &body.statements {
+                        self.walk_stmt(st);
                     }
+                }
                 if let Some(Declaration::VariableDeclaration(d)) = &e.declaration {
                     self.walk_var_decl(d);
                 }
@@ -334,28 +499,36 @@ impl Scanner {
 
     fn walk_var_decl(&mut self, d: &VariableDeclaration<'_>) {
         for decl in &d.declarations {
-            if let Some(init) = &decl.init { self.walk_expr(init); }
+            if let Some(init) = &decl.init {
+                self.walk_expr(init);
+            }
         }
     }
 
     fn walk_expr(&mut self, expr: &Expression<'_>) {
         match expr {
-            Expression::StringLiteral(_) => { self.has_string_literal = true; }
+            Expression::StringLiteral(_) => {
+                self.has_string_literal = true;
+            }
             Expression::TemplateLiteral(t) => {
                 self.has_string_literal = true;
                 if !t.expressions.is_empty() {
                     self.has_template_with_expr = true;
                 }
-                for e in &t.expressions { self.walk_expr(e); }
+                for e in &t.expressions {
+                    self.walk_expr(e);
+                }
             }
             Expression::BinaryExpression(b) => {
                 use oxc_ast::ast::BinaryOperator as Op;
                 match b.operator {
                     Op::Addition => self.has_plus = true,
-                    Op::Equality | Op::Inequality
-                    | Op::StrictEquality | Op::StrictInequality => self.has_eq_op = true,
-                    Op::LessThan | Op::LessEqualThan
-                    | Op::GreaterThan | Op::GreaterEqualThan => self.has_cmp_op = true,
+                    Op::Equality | Op::Inequality | Op::StrictEquality | Op::StrictInequality => {
+                        self.has_eq_op = true
+                    }
+                    Op::LessThan | Op::LessEqualThan | Op::GreaterThan | Op::GreaterEqualThan => {
+                        self.has_cmp_op = true
+                    }
                     _ => {}
                 }
                 self.walk_expr(&b.left);
@@ -398,28 +571,30 @@ impl Scanner {
                 }
             }
             Expression::ParenthesizedExpression(p) => self.walk_expr(&p.expression),
-            Expression::ChainExpression(c) => {
-                match &c.expression {
-                    ChainElement::CallExpression(call) => self.walk_call(call),
-                    ChainElement::StaticMemberExpression(m) => self.walk_expr(&m.object),
-                    ChainElement::ComputedMemberExpression(m) => {
-                        self.walk_expr(&m.object);
-                        self.walk_expr(&m.expression);
-                    }
-                    _ => {}
+            Expression::ChainExpression(c) => match &c.expression {
+                ChainElement::CallExpression(call) => self.walk_call(call),
+                ChainElement::StaticMemberExpression(m) => self.walk_expr(&m.object),
+                ChainElement::ComputedMemberExpression(m) => {
+                    self.walk_expr(&m.object);
+                    self.walk_expr(&m.expression);
                 }
-            }
+                _ => {}
+            },
             Expression::StaticMemberExpression(m) => self.walk_expr(&m.object),
             Expression::ComputedMemberExpression(m) => {
                 self.walk_expr(&m.object);
                 self.walk_expr(&m.expression);
             }
             Expression::ArrowFunctionExpression(a) => {
-                for st in &a.body.statements { self.walk_stmt(st); }
+                for st in &a.body.statements {
+                    self.walk_stmt(st);
+                }
             }
             Expression::TSAsExpression(a) => self.walk_expr(&a.expression),
             Expression::SequenceExpression(s) => {
-                for e in &s.expressions { self.walk_expr(e); }
+                for e in &s.expressions {
+                    self.walk_expr(e);
+                }
             }
             _ => {}
         }
@@ -432,13 +607,15 @@ impl Scanner {
                 self.method_names.insert(method.to_string());
                 if let Expression::Identifier(obj) = &m.object
                     && obj.name.as_str() == "String"
-                    && method == "fromCharCode" {
-                        self.has_string_from_char_code = true;
-                    }
+                    && method == "fromCharCode"
+                {
+                    self.has_string_from_char_code = true;
+                }
                 self.walk_expr(&m.object);
             }
             Expression::Identifier(ident) => {
-                self.identifier_calls.insert(ident.name.as_str().to_string());
+                self.identifier_calls
+                    .insert(ident.name.as_str().to_string());
             }
             other => self.walk_expr(other),
         }
@@ -478,19 +655,35 @@ fn compile_helper(name: &str, arena_idx: u32) -> Function {
 }
 
 fn mem_load_i32(offset: u64) -> Instruction<'static> {
-    Instruction::I32Load(MemArg { offset, align: 2, memory_index: 0 })
+    Instruction::I32Load(MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    })
 }
 
 fn mem_store_i32(offset: u64) -> Instruction<'static> {
-    Instruction::I32Store(MemArg { offset, align: 2, memory_index: 0 })
+    Instruction::I32Store(MemArg {
+        offset,
+        align: 2,
+        memory_index: 0,
+    })
 }
 
 fn mem_load8_u(offset: u64) -> Instruction<'static> {
-    Instruction::I32Load8U(MemArg { offset, align: 0, memory_index: 0 })
+    Instruction::I32Load8U(MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    })
 }
 
 fn mem_store8(offset: u64) -> Instruction<'static> {
-    Instruction::I32Store8(MemArg { offset, align: 0, memory_index: 0 })
+    Instruction::I32Store8(MemArg {
+        offset,
+        align: 0,
+        memory_index: 0,
+    })
 }
 
 // ============================================================
@@ -531,7 +724,7 @@ fn build_str_eq() -> Function {
 
     // loop
     func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // block (break target)
-    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));  // loop
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // loop
 
     // if i >= len_a: break → return 1
     func.instruction(&Instruction::LocalGet(i));
@@ -752,7 +945,7 @@ fn build_str_index_of() -> Function {
 
     // outer loop
     func.instruction(&Instruction::Block(wasm_encoder::BlockType::Empty)); // outer block
-    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty));  // outer loop
+    func.instruction(&Instruction::Loop(wasm_encoder::BlockType::Empty)); // outer loop
 
     // if i > limit: break → return -1
     func.instruction(&Instruction::LocalGet(i));
@@ -953,7 +1146,10 @@ fn build_str_slice(arena_idx: u32) -> Function {
     func.instruction(&Instruction::LocalGet(start));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
@@ -1494,7 +1690,10 @@ fn build_str_trim_impl(arena_idx: u32, trim_left: bool, trim_right: bool) -> Fun
     func.instruction(&Instruction::LocalGet(start));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(new_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
@@ -1684,7 +1883,10 @@ fn build_str_from_i32(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(1));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
@@ -1708,23 +1910,23 @@ fn build_str_from_f64(arena_idx: u32) -> Function {
     // Locals: is_neg=1, int_part=2, frac_val=3, buf=4, pos=5, digit=6, ptr=7,
     //         abs_val=8, temp=9, frac_digits=10, len=11
     let locals = vec![
-        (1, ValType::I32),   // is_neg
-        (1, ValType::I32),   // int_part
-        (1, ValType::I32),   // frac_val (fractional part * 1000000 as i32)
-        (1, ValType::I32),   // buf
-        (1, ValType::I32),   // pos (write position from start)
-        (1, ValType::I32),   // digit
-        (1, ValType::I32),   // ptr (result string)
-        (1, ValType::I32),   // abs_int
-        (1, ValType::I32),   // temp (for reversing digits)
-        (1, ValType::I32),   // digit_start
-        (1, ValType::I32),   // len
-        (1, ValType::F64),   // abs_f
+        (1, ValType::I32), // is_neg
+        (1, ValType::I32), // int_part
+        (1, ValType::I32), // frac_val (fractional part * 1000000 as i32)
+        (1, ValType::I32), // buf
+        (1, ValType::I32), // pos (write position from start)
+        (1, ValType::I32), // digit
+        (1, ValType::I32), // ptr (result string)
+        (1, ValType::I32), // abs_int
+        (1, ValType::I32), // temp (for reversing digits)
+        (1, ValType::I32), // digit_start
+        (1, ValType::I32), // len
+        (1, ValType::F64), // abs_f
     ];
     let mut func = Function::new(locals);
     let n = 0u32;
-    let (is_neg, int_part, frac_val, buf, pos, digit, ptr, abs_int, temp, digit_start, len, abs_f)
-        = (1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    let (is_neg, int_part, frac_val, buf, pos, digit, ptr, abs_int, temp, digit_start, len, abs_f) =
+        (1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 
     // Allocate 32-byte scratch buffer
     func.instruction(&Instruction::GlobalGet(arena_idx));
@@ -2024,7 +2226,10 @@ fn build_str_from_f64(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(buf));
     func.instruction(&Instruction::LocalGet(len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
@@ -2055,8 +2260,8 @@ fn build_str_split(arena_idx: u32) -> Function {
     ];
     let mut func = Function::new(locals);
     let (s, delim) = (0u32, 1);
-    let (s_len, d_len, arr, count, start, i, j, matched, seg_len, seg_ptr, cap)
-        = (2u32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    let (s_len, d_len, arr, count, start, i, j, matched, seg_len, seg_ptr, cap) =
+        (2u32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 
     func.instruction(&Instruction::LocalGet(s));
     func.instruction(&mem_load_i32(0));
@@ -2085,7 +2290,11 @@ fn build_str_split(arena_idx: u32) -> Function {
     func.instruction(&mem_store_i32(0));
     func.instruction(&Instruction::LocalGet(arr));
     func.instruction(&Instruction::LocalGet(cap));
-    func.instruction(&Instruction::I32Store(MemArg { offset: 4, align: 2, memory_index: 0 }));
+    func.instruction(&Instruction::I32Store(MemArg {
+        offset: 4,
+        align: 2,
+        memory_index: 0,
+    }));
 
     // count = 0, start = 0, i = 0
     func.instruction(&Instruction::I32Const(0));
@@ -2194,7 +2403,10 @@ fn build_str_split(arena_idx: u32) -> Function {
     func.instruction(&Instruction::LocalGet(start));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(seg_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     // Store seg_ptr in arr[count]
     func.instruction(&Instruction::LocalGet(arr));
@@ -2260,7 +2472,10 @@ fn build_str_split(arena_idx: u32) -> Function {
     func.instruction(&Instruction::LocalGet(start));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(seg_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(arr));
     func.instruction(&Instruction::I32Const(8));
@@ -2311,8 +2526,8 @@ fn build_str_replace(arena_idx: u32) -> Function {
     ];
     let mut func = Function::new(locals);
     let (s, search, replacement) = (0u32, 1, 2);
-    let (s_len, search_len, repl_len, idx, i, j, matched, new_len, ptr, limit)
-        = (3u32, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+    let (s_len, search_len, repl_len, idx, i, j, matched, new_len, ptr, limit) =
+        (3u32, 4, 5, 6, 7, 8, 9, 10, 11, 12);
 
     func.instruction(&Instruction::LocalGet(s));
     func.instruction(&mem_load_i32(0));
@@ -2442,7 +2657,10 @@ fn build_str_replace(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(idx));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     // Copy part 2: replacement
     func.instruction(&Instruction::LocalGet(ptr));
@@ -2454,7 +2672,10 @@ fn build_str_replace(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(repl_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     // Copy part 3: s[idx+search_len..]
     func.instruction(&Instruction::LocalGet(ptr));
@@ -2476,7 +2697,10 @@ fn build_str_replace(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Sub);
     func.instruction(&Instruction::LocalGet(search_len));
     func.instruction(&Instruction::I32Sub);
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
@@ -2928,7 +3152,10 @@ fn build_str_repeat(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(s_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(i));
     func.instruction(&Instruction::I32Const(1));
@@ -3053,7 +3280,10 @@ fn build_pad(arena_idx: u32, pad_start: bool) -> Function {
         func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
         func.instruction(&Instruction::I32Add);
         func.instruction(&Instruction::LocalGet(s_len));
-        func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        func.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
     } else {
         // Copy original string first
         func.instruction(&Instruction::LocalGet(ptr));
@@ -3063,7 +3293,10 @@ fn build_pad(arena_idx: u32, pad_start: bool) -> Function {
         func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
         func.instruction(&Instruction::I32Add);
         func.instruction(&Instruction::LocalGet(s_len));
-        func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+        func.instruction(&Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
 
         // Write padding bytes after (cycling through fill string)
         func.instruction(&Instruction::I32Const(0));
@@ -3146,7 +3379,10 @@ fn build_str_concat(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(a_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
@@ -3157,10 +3393,12 @@ fn build_str_concat(arena_idx: u32) -> Function {
     func.instruction(&Instruction::I32Const(STRING_HEADER_SIZE));
     func.instruction(&Instruction::I32Add);
     func.instruction(&Instruction::LocalGet(b_len));
-    func.instruction(&Instruction::MemoryCopy { src_mem: 0, dst_mem: 0 });
+    func.instruction(&Instruction::MemoryCopy {
+        src_mem: 0,
+        dst_mem: 0,
+    });
 
     func.instruction(&Instruction::LocalGet(ptr));
     func.instruction(&Instruction::End);
     func
 }
-

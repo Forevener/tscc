@@ -13,13 +13,16 @@ fn empty_tick_loads_and_runs() {
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 }
 
 #[test]
 fn arithmetic_in_locals() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -27,30 +30,44 @@ fn arithmetic_in_locals() {
             let y: f64 = x * 3.0;
             set_action(me, 1, 0, x, y);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32, 0i32, 0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32, i32, f64, f64)>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32, i32, f64, f64)>,
+             me: i32,
+             kind: i32,
+             target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 42).unwrap();
     let state = store.data();
-    assert_eq!(state.0, 42);    // me
-    assert_eq!(state.1, 1);     // kind
-    assert_eq!(state.2, 0);     // target
-    assert!((state.3 - 3.0).abs() < 1e-10);  // dx = 1+2 = 3
-    assert!((state.4 - 9.0).abs() < 1e-10);  // dy = 3*3 = 9
+    assert_eq!(state.0, 42); // me
+    assert_eq!(state.1, 1); // kind
+    assert_eq!(state.2, 0); // target
+    assert!((state.3 - 3.0).abs() < 1e-10); // dx = 1+2 = 3
+    assert!((state.4 - 9.0).abs() < 1e-10); // dy = 3*3 = 9
 }
 
 #[test]
 fn if_else_control_flow() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -62,18 +79,31 @@ fn if_else_control_flow() {
             }
             set_action(me, kind, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32)>, me: i32, kind: i32, _target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = (me, kind);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32)>,
+             me: i32,
+             kind: i32,
+             _target: i32,
+             _dx: f64,
+             _dy: f64| {
+                *caller.data_mut() = (me, kind);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
 
     tick.call(&mut store, 20).unwrap();
     assert_eq!(*store.data(), (20, 1));
@@ -84,7 +114,8 @@ fn if_else_control_flow() {
 
 #[test]
 fn local_function_call() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         function clamp(val: f64, lo: f64, hi: f64): f64 {
@@ -98,28 +129,42 @@ fn local_function_call() {
             let y: f64 = clamp(-2.0, 0.0, 3.0);
             set_action(me, 0, 0, x, y);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (x, y) = *store.data();
-    assert!((x - 3.0).abs() < 1e-10);   // clamped to hi
-    assert!((y - 0.0).abs() < 1e-10);   // clamped to lo
+    assert!((x - 3.0).abs() < 1e-10); // clamped to hi
+    assert!((y - 0.0).abs() < 1e-10); // clamped to lo
 }
 
 #[test]
 fn for_loop() {
     // Sum integers 0..10 using a for loop
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -129,25 +174,34 @@ fn for_loop() {
             }
             set_action(me, sum, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _target: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 45); // 0+1+2+...+9 = 45
 }
 
 #[test]
 fn while_loop() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -157,25 +211,34 @@ fn while_loop() {
             }
             set_action(me, n, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _target: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 128); // 1,2,4,8,16,32,64,128
 }
 
 #[test]
 fn type_cast_f64_from_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -184,25 +247,34 @@ fn type_cast_f64_from_i32() {
             let frac: f64 = f64(hp) / f64(maxHp);
             set_action(me, 0, 0, frac, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0.0f64);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, f64>, _me: i32, _kind: i32, _target: i32, dx: f64, _dy: f64| {
-            *caller.data_mut() = dx;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, f64>, _me: i32, _kind: i32, _target: i32, dx: f64, _dy: f64| {
+                *caller.data_mut() = dx;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert!((*store.data() - 0.75).abs() < 1e-10);
 }
 
 #[test]
 fn milestone_script() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function me_x(me: i32): f64;
         declare function me_y(me: i32): f64;
         declare function me_hp(me: i32): i32;
@@ -244,7 +316,8 @@ fn milestone_script() {
             dy = clamp(dy, -1.0, 1.0);
             set_action(me, 1, 0, dx, dy);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -254,35 +327,80 @@ fn milestone_script() {
         action: (i32, i32, i32, f64, f64),
     }
 
-    let mut store = Store::new(&engine, TestState {
-        random_counter: Cell::new(0),
-        action: (0, 0, 0, 0.0, 0.0),
-    });
+    let mut store = Store::new(
+        &engine,
+        TestState {
+            random_counter: Cell::new(0),
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
 
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "me_x", |_caller: Caller<'_, TestState>, _me: i32| -> f64 { 10.0 }).unwrap();
-    linker.func_wrap("host", "me_y", |_caller: Caller<'_, TestState>, _me: i32| -> f64 { 20.0 }).unwrap();
-    linker.func_wrap("host", "me_hp", |_caller: Caller<'_, TestState>, _me: i32| -> i32 { 80 }).unwrap();
-    linker.func_wrap("host", "me_max_hp", |_caller: Caller<'_, TestState>, _me: i32| -> i32 { 100 }).unwrap();
-    linker.func_wrap("host", "random", |caller: Caller<'_, TestState>, _me: i32| -> f64 {
-        let counter = caller.data().random_counter.get();
-        caller.data().random_counter.set(counter + 1);
-        // Return deterministic "random" values
-        [0.7, 0.3, 0.8, 0.2][counter as usize % 4]
-    }).unwrap();
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, TestState>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "me_x",
+            |_caller: Caller<'_, TestState>, _me: i32| -> f64 { 10.0 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "me_y",
+            |_caller: Caller<'_, TestState>, _me: i32| -> f64 { 20.0 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "me_hp",
+            |_caller: Caller<'_, TestState>, _me: i32| -> i32 { 80 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "me_max_hp",
+            |_caller: Caller<'_, TestState>, _me: i32| -> i32 { 100 },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "random",
+            |caller: Caller<'_, TestState>, _me: i32| -> f64 {
+                let counter = caller.data().random_counter.get();
+                caller.data().random_counter.set(counter + 1);
+                // Return deterministic "random" values
+                [0.7, 0.3, 0.8, 0.2][counter as usize % 4]
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, TestState>,
+             me: i32,
+             kind: i32,
+             target: i32,
+             dx: f64,
+             dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 42).unwrap();
 
     let action = store.data().action;
-    assert_eq!(action.0, 42);  // me
-    assert_eq!(action.1, 1);   // kind = Move
-    assert_eq!(action.2, 0);   // target
+    assert_eq!(action.0, 42); // me
+    assert_eq!(action.1, 1); // kind = Move
+    assert_eq!(action.2, 0); // target
     // dx and dy should be finite, clamped values
     assert!(action.3.is_finite());
     assert!(action.4.is_finite());
@@ -294,7 +412,8 @@ fn milestone_script() {
 
 #[test]
 fn memory_load_store_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -304,18 +423,31 @@ fn memory_load_store_f64() {
             const b: f64 = load_f64(8);
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
     assert!((a - 3.14).abs() < 1e-10);
@@ -324,7 +456,8 @@ fn memory_load_store_f64() {
 
 #[test]
 fn memory_load_store_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -334,18 +467,31 @@ fn memory_load_store_i32() {
             const b: i32 = load_i32(4);
             set_action(me, a, b, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32)>, _me: i32, kind: i32, target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = (kind, target);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32)>,
+             _me: i32,
+             kind: i32,
+             target: i32,
+             _dx: f64,
+             _dy: f64| {
+                *caller.data_mut() = (kind, target);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), (42, 99));
 }
@@ -353,7 +499,8 @@ fn memory_load_store_i32() {
 #[test]
 fn static_alloc() {
     // __static_alloc reserves bytes at compile time and returns the offset
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         const BUF: i32 = __static_alloc(40);
@@ -365,18 +512,31 @@ fn static_alloc() {
             const b: f64 = load_f64(BUF + 8);
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
     assert!((a - 1.5).abs() < 1e-10);
@@ -385,7 +545,8 @@ fn static_alloc() {
 
 #[test]
 fn math_builtins() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -393,27 +554,41 @@ fn math_builtins() {
             const b: f64 = Math.abs(-5.0);
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
-    assert!((a - 4.0).abs() < 1e-10);  // sqrt(16) = 4
-    assert!((b - 5.0).abs() < 1e-10);  // abs(-5) = 5
+    assert!((a - 4.0).abs() < 1e-10); // sqrt(16) = 4
+    assert!((b - 5.0).abs() < 1e-10); // abs(-5) = 5
 }
 
 #[test]
 fn math_min_max() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -421,27 +596,41 @@ fn math_min_max() {
             const b: f64 = Math.max(3.0, 7.0);
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
-    assert!((a - 3.0).abs() < 1e-10);  // min(3, 7) = 3
-    assert!((b - 7.0).abs() < 1e-10);  // max(3, 7) = 7
+    assert!((a - 3.0).abs() < 1e-10); // min(3, 7) = 3
+    assert!((b - 7.0).abs() < 1e-10); // max(3, 7) = 7
 }
 
 #[test]
 fn math_floor_ceil() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -449,27 +638,41 @@ fn math_floor_ceil() {
             const b: f64 = Math.ceil(3.2);
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
-    assert!((a - 3.0).abs() < 1e-10);  // floor(3.7) = 3
-    assert!((b - 4.0).abs() < 1e-10);  // ceil(3.2) = 4
+    assert!((a - 3.0).abs() < 1e-10); // floor(3.7) = 3
+    assert!((b - 4.0).abs() < 1e-10); // ceil(3.2) = 4
 }
 
 #[test]
 fn math_random_is_deterministic_given_seed() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -477,7 +680,8 @@ fn math_random_is_deterministic_given_seed() {
             const b: f64 = Math.random();
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     use std::sync::{Arc, Mutex};
     let collected: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -489,16 +693,28 @@ fn math_random_is_deterministic_given_seed() {
     let run_with_seed = |seed: i64| -> (f64, f64) {
         let mut store = Store::new(&engine, collected.clone());
         let mut linker = Linker::new(&engine);
-        linker.func_wrap("host", "set_action",
-            |mut caller: Caller<'_, Arc<Mutex<Vec<(f64, f64)>>>>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-                caller.data_mut().lock().unwrap().push((dx, dy));
-            }).unwrap();
+        linker
+            .func_wrap(
+                "host",
+                "set_action",
+                |mut caller: Caller<'_, Arc<Mutex<Vec<(f64, f64)>>>>,
+                 _me: i32,
+                 _kind: i32,
+                 _target: i32,
+                 dx: f64,
+                 dy: f64| {
+                    caller.data_mut().lock().unwrap().push((dx, dy));
+                },
+            )
+            .unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
         // Seed via the exported __rng_state global before any Math.random call.
         let state = instance.get_global(&mut store, "__rng_state").unwrap();
         state.set(&mut store, wasmtime::Val::I64(seed)).unwrap();
         collected.lock().unwrap().clear();
-        let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+        let tick = instance
+            .get_typed_func::<i32, ()>(&mut store, "tick")
+            .unwrap();
         tick.call(&mut store, 0).unwrap();
         let v = collected.lock().unwrap();
         (v[0].0, v[0].1)
@@ -506,16 +722,36 @@ fn math_random_is_deterministic_given_seed() {
 
     let r1 = run_with_seed(0xCAFEBABE);
     let r2 = run_with_seed(0xCAFEBABE);
-    assert_eq!(r1.0.to_bits(), r2.0.to_bits(), "same seed must give same first value");
-    assert_eq!(r1.1.to_bits(), r2.1.to_bits(), "same seed must give same second value");
+    assert_eq!(
+        r1.0.to_bits(),
+        r2.0.to_bits(),
+        "same seed must give same first value"
+    );
+    assert_eq!(
+        r1.1.to_bits(),
+        r2.1.to_bits(),
+        "same seed must give same second value"
+    );
 
     // Outputs must be in [0, 1).
-    assert!(r1.0 >= 0.0 && r1.0 < 1.0, "first value out of range: {}", r1.0);
-    assert!(r1.1 >= 0.0 && r1.1 < 1.0, "second value out of range: {}", r1.1);
+    assert!(
+        r1.0 >= 0.0 && r1.0 < 1.0,
+        "first value out of range: {}",
+        r1.0
+    );
+    assert!(
+        r1.1 >= 0.0 && r1.1 < 1.0,
+        "second value out of range: {}",
+        r1.1
+    );
 
     // Different seed must give different sequence.
     let r3 = run_with_seed(0xDEADBEEF);
-    assert_ne!(r1.0.to_bits(), r3.0.to_bits(), "different seeds must give different output");
+    assert_ne!(
+        r1.0.to_bits(),
+        r3.0.to_bits(),
+        "different seeds must give different output"
+    );
 }
 
 #[test]
@@ -536,7 +772,8 @@ fn math_random_matches_pcg32_reference() {
         (out as f64) * (1.0 / 4294967296.0)
     }
 
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -544,7 +781,8 @@ fn math_random_matches_pcg32_reference() {
             const b: f64 = Math.random();
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     use std::sync::{Arc, Mutex};
     let collected: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -552,16 +790,30 @@ fn math_random_matches_pcg32_reference() {
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, collected.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, Arc<Mutex<Vec<(f64, f64)>>>>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            caller.data_mut().lock().unwrap().push((dx, dy));
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, Arc<Mutex<Vec<(f64, f64)>>>>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                caller.data_mut().lock().unwrap().push((dx, dy));
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
 
     let seed: u64 = 0x123456789ABCDEF0;
     let state = instance.get_global(&mut store, "__rng_state").unwrap();
-    state.set(&mut store, wasmtime::Val::I64(seed as i64)).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    state
+        .set(&mut store, wasmtime::Val::I64(seed as i64))
+        .unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 
     let (wasm_a, wasm_b) = collected.lock().unwrap()[0];
@@ -570,22 +822,30 @@ fn math_random_matches_pcg32_reference() {
     let ref_a = pcg32_rust(&mut ref_state);
     let ref_b = pcg32_rust(&mut ref_state);
 
-    assert_eq!(wasm_a.to_bits(), ref_a.to_bits(),
-        "PCG32 wasm output diverged from Rust reference at step 1");
-    assert_eq!(wasm_b.to_bits(), ref_b.to_bits(),
-        "PCG32 wasm output diverged from Rust reference at step 2");
+    assert_eq!(
+        wasm_a.to_bits(),
+        ref_a.to_bits(),
+        "PCG32 wasm output diverged from Rust reference at step 1"
+    );
+    assert_eq!(
+        wasm_b.to_bits(),
+        ref_b.to_bits(),
+        "PCG32 wasm output diverged from Rust reference at step 2"
+    );
 }
 
 #[test]
 fn math_random_not_emitted_when_unused() {
     // A module that doesn't call Math.random must not export __rng_state.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
             set_action(me, 0, 0, 1.0, 2.0);
         }
-    "#);
+    "#,
+    );
 
     let parser = wasmparser::Parser::new(0);
     let mut export_names: Vec<String> = Vec::new();
@@ -597,13 +857,16 @@ fn math_random_not_emitted_when_unused() {
             }
         }
     }
-    assert!(!export_names.contains(&"__rng_state".to_string()),
-        "expected no __rng_state export when Math.random is unused, got: {export_names:?}");
+    assert!(
+        !export_names.contains(&"__rng_state".to_string()),
+        "expected no __rng_state export when Math.random is unused, got: {export_names:?}"
+    );
 }
 
 #[test]
 fn math_transcendentals_via_host_imports() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -616,7 +879,8 @@ fn math_transcendentals_via_host_imports() {
             set_action(me, 0, 0, s, c);
             set_action(me, 1, 0, l, p);
         }
-    "#);
+    "#,
+    );
 
     use std::sync::{Arc, Mutex};
     let collected: Arc<Mutex<Vec<(i32, f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -625,40 +889,62 @@ fn math_transcendentals_via_host_imports() {
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, collected.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, Arc<Mutex<Vec<(i32, f64, f64)>>>>, _me: i32, kind: i32, _target: i32, dx: f64, dy: f64| {
-            caller.data_mut().lock().unwrap().push((kind, dx, dy));
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, Arc<Mutex<Vec<(i32, f64, f64)>>>>,
+             _me: i32,
+             kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                caller.data_mut().lock().unwrap().push((kind, dx, dy));
+            },
+        )
+        .unwrap();
     // Wire transcendentals — this is what the README JS shim / tscc-host-libm
     // companion crate would do for users.
-    linker.func_wrap("host", "__tscc_sin", |x: f64| x.sin()).unwrap();
-    linker.func_wrap("host", "__tscc_cos", |x: f64| x.cos()).unwrap();
-    linker.func_wrap("host", "__tscc_log", |x: f64| x.ln()).unwrap();
-    linker.func_wrap("host", "__tscc_pow", |x: f64, y: f64| x.powf(y)).unwrap();
+    linker
+        .func_wrap("host", "__tscc_sin", |x: f64| x.sin())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_cos", |x: f64| x.cos())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_log", |x: f64| x.ln())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_pow", |x: f64, y: f64| x.powf(y))
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 
     let v = collected.lock().unwrap();
     assert_eq!(v.len(), 2);
-    assert!((v[0].1 - 0.0).abs() < 1e-12);   // sin(0) = 0
-    assert!((v[0].2 - 1.0).abs() < 1e-12);   // cos(0) = 1
-    assert!((v[1].1 - 1.0).abs() < 1e-12);   // ln(e) = 1
+    assert!((v[0].1 - 0.0).abs() < 1e-12); // sin(0) = 0
+    assert!((v[0].2 - 1.0).abs() < 1e-12); // cos(0) = 1
+    assert!((v[1].1 - 1.0).abs() < 1e-12); // ln(e) = 1
     assert!((v[1].2 - 1024.0).abs() < 1e-9); // 2^10 = 1024
 }
 
 #[test]
 fn math_transcendentals_tree_shaken() {
     // Module that uses ONLY Math.sin should not declare imports for cos/log/etc.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
             const s: f64 = Math.sin(0.5);
             set_action(me, 0, 0, s, 0.0);
         }
-    "#);
+    "#,
+    );
 
     // Decode imports from the wasm module and assert tree-shaking behavior.
     let parser = wasmparser::Parser::new(0);
@@ -671,16 +957,22 @@ fn math_transcendentals_tree_shaken() {
             }
         }
     }
-    let math_imports: Vec<&String> = import_names.iter()
+    let math_imports: Vec<&String> = import_names
+        .iter()
         .filter(|n| n.starts_with("__tscc_"))
         .collect();
-    assert_eq!(math_imports.len(), 1, "expected only __tscc_sin, got: {math_imports:?}");
+    assert_eq!(
+        math_imports.len(),
+        1,
+        "expected only __tscc_sin, got: {math_imports:?}"
+    );
     assert_eq!(math_imports[0], "__tscc_sin");
 }
 
 #[test]
 fn math_sign_and_hypot() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -688,18 +980,31 @@ fn math_sign_and_hypot() {
             const h: f64 = Math.hypot(3.0, 4.0);
             set_action(me, 0, 0, s, h);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (s, h) = *store.data();
     assert_eq!(s, -1.0);
@@ -708,7 +1013,8 @@ fn math_sign_and_hypot() {
 
 #[test]
 fn math_sign_preserves_zero_and_nan() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick_zero(me: i32): void {
@@ -722,7 +1028,8 @@ fn math_sign_preserves_zero_and_nan() {
             const r: f64 = Math.sign(nan_in);
             set_action(me, 0, 0, r, r);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -730,19 +1037,33 @@ fn math_sign_preserves_zero_and_nan() {
     // Zero preservation
     let mut store = Store::new(&engine, (1.0f64, 1.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick_zero = instance.get_typed_func::<i32, ()>(&mut store, "tick_zero").unwrap();
+    let tick_zero = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick_zero")
+        .unwrap();
     tick_zero.call(&mut store, 0).unwrap();
     let (pz, nz) = *store.data();
     assert_eq!(pz.to_bits(), 0.0f64.to_bits());
     assert_eq!(nz.to_bits(), (-0.0f64).to_bits());
 
     // NaN propagation
-    let tick_nan = instance.get_typed_func::<i32, ()>(&mut store, "tick_nan").unwrap();
+    let tick_nan = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick_nan")
+        .unwrap();
     tick_nan.call(&mut store, 0).unwrap();
     let (r, _) = *store.data();
     assert!(r.is_nan());
@@ -750,7 +1071,8 @@ fn math_sign_preserves_zero_and_nan() {
 
 #[test]
 fn math_constants() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         export function tick(me: i32): void {
@@ -758,18 +1080,31 @@ fn math_constants() {
             const b: f64 = Math.E;
             set_action(me, 0, 0, a, b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
     // Bit-exact: constants are emitted as f64 literals, not computed.
@@ -784,7 +1119,8 @@ fn math_constants_all_eight() {
     use std::sync::{Arc, Mutex};
     let got: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
 
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function sink(x: f64): void;
 
         export function tick(me: i32): void {
@@ -797,18 +1133,26 @@ fn math_constants_all_eight() {
             sink(Math.SQRT2);
             sink(Math.SQRT1_2);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, got.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "sink",
-        |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
-            caller.data().lock().unwrap().push(x);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "sink",
+            |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
+                caller.data().lock().unwrap().push(x);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 
     let vals = got.lock().unwrap().clone();
@@ -838,12 +1182,19 @@ fn run_sink_tick(source: &str) -> Vec<f64> {
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, got.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "sink",
-        |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
-            caller.data().lock().unwrap().push(x);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "sink",
+            |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
+                caller.data().lock().unwrap().push(x);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let v = got.lock().unwrap().clone();
     v
@@ -851,7 +1202,8 @@ fn run_sink_tick(source: &str) -> Vec<f64> {
 
 #[test]
 fn global_is_nan_and_is_finite() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             sink(isNaN(NaN) ? 1.0 : 0.0);
@@ -862,13 +1214,15 @@ fn global_is_nan_and_is_finite() {
             sink(isFinite(NaN) ? 1.0 : 0.0);
             sink(isFinite(-Infinity) ? 1.0 : 0.0);
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals, vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
 }
 
 #[test]
 fn number_statics_and_constants() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             sink(Number.MAX_SAFE_INTEGER);
@@ -886,7 +1240,8 @@ fn number_statics_and_constants() {
             sink(Number.isSafeInteger(3.0) ? 1.0 : 0.0);
             sink(Number.isSafeInteger(9007199254740992.0) ? 1.0 : 0.0);
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals[0], 9_007_199_254_740_991.0);
     assert_eq!(vals[1], -9_007_199_254_740_991.0);
     assert_eq!(vals[2], f64::EPSILON);
@@ -897,7 +1252,8 @@ fn number_statics_and_constants() {
 
 #[test]
 fn math_round_half_toward_positive_infinity() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             sink(Math.round(0.5));   //  1 (not 0 per half-to-even)
@@ -908,45 +1264,56 @@ fn math_round_half_toward_positive_infinity() {
             sink(Math.round(3.4));   //  3
             sink(Math.round(3.6));   //  4
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals, vec![1.0, 2.0, 3.0, 0.0, -1.0, 3.0, 4.0]);
 }
 
 #[test]
 fn number_parse_int_and_parse_float_aliases() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function via_number_i(): i32 {
             return Number.parseInt("42");
         }
         export function via_number_f(): f64 {
             return Number.parseFloat("3.14");
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
 
-    let f1 = instance.get_typed_func::<(), i32>(&mut store, "via_number_i").unwrap();
+    let f1 = instance
+        .get_typed_func::<(), i32>(&mut store, "via_number_i")
+        .unwrap();
     assert_eq!(f1.call(&mut store, ()).unwrap(), 42);
-    let f2 = instance.get_typed_func::<(), f64>(&mut store, "via_number_f").unwrap();
+    let f2 = instance
+        .get_typed_func::<(), f64>(&mut store, "via_number_f")
+        .unwrap();
     assert!((f2.call(&mut store, ()).unwrap() - 3.14).abs() < 1e-9);
 }
 
 #[test]
 fn string_concat_method() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = "foo";
             let b: string = "bar";
             return a.concat(b);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "foobar");
@@ -954,7 +1321,8 @@ fn string_concat_method() {
 
 #[test]
 fn array_is_array_static() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function arr_local(): i32 {
             const xs: Array<i32> = new Array<i32>(0);
             xs.push(10);
@@ -968,21 +1336,25 @@ fn array_is_array_static() {
             const n: i32 = 42;
             return Array.isArray(n) ? 1 : 0;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
     for (name, expected) in [("arr_local", 1), ("arr_new", 1), ("arr_scalar", 0)] {
-        let f = instance.get_typed_func::<(), i32>(&mut store, name).unwrap();
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
         assert_eq!(f.call(&mut store, ()).unwrap(), expected, "{name}");
     }
 }
 
 #[test]
 fn math_fround_clz32_imul() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             // fround bit-exact: 1.1 rounded to f32 then back to f64
@@ -994,7 +1366,8 @@ fn math_fround_clz32_imul() {
             sink(Math.imul(-1, 5) as f64);
             sink(Math.imul(7, 3) as f64);
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals[0], 1.1_f32 as f64);
     assert_eq!(vals[1], 31.0);
     assert_eq!(vals[2], 32.0);
@@ -1006,7 +1379,8 @@ fn math_fround_clz32_imul() {
 fn math_hyperbolic_inverse_and_log1p_expm1() {
     // asinh, acosh, atanh, log1p, expm1 — all declared as host imports.
     // Compile with default options (host_module="host"), wire to libm.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             sink(Math.asinh(1.0));
@@ -1015,25 +1389,43 @@ fn math_hyperbolic_inverse_and_log1p_expm1() {
             sink(Math.log1p(1.0));
             sink(Math.expm1(1.0));
         }
-    "#);
+    "#,
+    );
     use std::sync::{Arc, Mutex};
     let got: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, got.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "sink",
-        |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
-            caller.data().lock().unwrap().push(x);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "sink",
+            |caller: Caller<'_, Arc<Mutex<Vec<f64>>>>, x: f64| {
+                caller.data().lock().unwrap().push(x);
+            },
+        )
+        .unwrap();
     // Wire transcendentals to f64 intrinsics
-    linker.func_wrap("host", "__tscc_asinh", |x: f64| x.asinh()).unwrap();
-    linker.func_wrap("host", "__tscc_acosh", |x: f64| x.acosh()).unwrap();
-    linker.func_wrap("host", "__tscc_atanh", |x: f64| x.atanh()).unwrap();
-    linker.func_wrap("host", "__tscc_log1p", |x: f64| x.ln_1p()).unwrap();
-    linker.func_wrap("host", "__tscc_expm1", |x: f64| x.exp_m1()).unwrap();
+    linker
+        .func_wrap("host", "__tscc_asinh", |x: f64| x.asinh())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_acosh", |x: f64| x.acosh())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_atanh", |x: f64| x.atanh())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_log1p", |x: f64| x.ln_1p())
+        .unwrap();
+    linker
+        .func_wrap("host", "__tscc_expm1", |x: f64| x.exp_m1())
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let vals = got.lock().unwrap().clone();
     assert!((vals[0] - 1.0_f64.asinh()).abs() < 1e-12);
@@ -1045,7 +1437,8 @@ fn math_hyperbolic_inverse_and_log1p_expm1() {
 
 #[test]
 fn array_pop_and_indexof_and_includes() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             const a: Array<i32> = new Array<i32>(8);
@@ -1061,13 +1454,15 @@ fn array_pop_and_indexof_and_includes() {
             const e: Array<i32> = new Array<i32>(0);
             sink(e.pop() as f64);     // 0
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals, vec![30.0, 2.0, 0.0, -1.0, 1.0, 1.0, 0.0, 0.0]);
 }
 
 #[test]
 fn array_reverse_and_at() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             const a: Array<i32> = new Array<i32>(8);
@@ -1079,13 +1474,15 @@ fn array_reverse_and_at() {
             sink(a.at(-1) as f64); // 1
             sink(a.at(-2) as f64); // 2
         }
-    "#);
+    "#,
+    );
     assert_eq!(vals, vec![4.0, 1.0, 4.0, 1.0, 2.0]);
 }
 
 #[test]
 fn array_fill_slice_concat() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             const a: Array<i32> = new Array<i32>(8);
@@ -1114,8 +1511,14 @@ fn array_fill_slice_concat() {
             sink(d[0] as f64); // 9
             sink(d[4] as f64); // 5
         }
-    "#);
-    assert_eq!(vals, vec![1.0, 9.0, 9.0, 9.0, 5.0, 3.0, 9.0, 9.0, 2.0, 9.0, 5.0, 5.0, 9.0, 5.0]);
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![
+            1.0, 9.0, 9.0, 9.0, 5.0, 3.0, 9.0, 9.0, 2.0, 9.0, 5.0, 5.0, 9.0, 5.0
+        ]
+    );
 }
 
 #[test]
@@ -1124,7 +1527,8 @@ fn array_join_numeric_and_string() {
     let got: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     // sink_str takes a string pointer; the host reads the 4-byte length header
     // and the UTF-8 bytes that follow it.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function sink_str(s: string): void;
 
         export function tick(me: i32): void {
@@ -1136,24 +1540,32 @@ fn array_join_numeric_and_string() {
             const e: Array<i32> = new Array<i32>(0);
             sink_str(e.join(","));
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, got.clone());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "sink_str",
-        |mut caller: Caller<'_, Arc<Mutex<Vec<String>>>>, s_ptr: i32| {
-            let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
-            let mut hdr = [0u8; 4];
-            mem.read(&mut caller, s_ptr as usize, &mut hdr).unwrap();
-            let len = i32::from_le_bytes(hdr) as usize;
-            let mut buf = vec![0u8; len];
-            mem.read(&mut caller, s_ptr as usize + 4, &mut buf).unwrap();
-            let s = String::from_utf8(buf).unwrap();
-            caller.data().lock().unwrap().push(s);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "sink_str",
+            |mut caller: Caller<'_, Arc<Mutex<Vec<String>>>>, s_ptr: i32| {
+                let mem = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let mut hdr = [0u8; 4];
+                mem.read(&mut caller, s_ptr as usize, &mut hdr).unwrap();
+                let len = i32::from_le_bytes(hdr) as usize;
+                let mut buf = vec![0u8; len];
+                mem.read(&mut caller, s_ptr as usize + 4, &mut buf).unwrap();
+                let s = String::from_utf8(buf).unwrap();
+                caller.data().lock().unwrap().push(s);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let vals = got.lock().unwrap().clone();
     assert_eq!(vals, vec!["1,2,3", "1 - 2 - 3", "1,2,3", ""]);
@@ -1161,7 +1573,8 @@ fn array_join_numeric_and_string() {
 
 #[test]
 fn array_find_and_some_every() {
-    let vals = run_sink_tick(r#"
+    let vals = run_sink_tick(
+        r#"
         declare function sink(x: f64): void;
         export function tick(me: i32): void {
             const a: Array<i32> = new Array<i32>(8);
@@ -1181,15 +1594,20 @@ fn array_find_and_some_every() {
             sink(a.every((x: i32) => x > 0) ? 1.0 : 0.0); // 1
             sink(a.every((x: i32) => x > 3) ? 1.0 : 0.0); // 0
         }
-    "#);
-    assert_eq!(vals, vec![4.0, 3.0, 5.0, 4.0, 0.0, -1.0, 1.0, 0.0, 1.0, 0.0]);
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![4.0, 3.0, 5.0, 4.0, 0.0, -1.0, 1.0, 0.0, 1.0, 0.0]
+    );
 }
 
 #[test]
 fn realistic_lowlevel_perceive_parsing() {
     // Simulates the core pattern from realistic_lowlevel.ts:
     // perceive fills a buffer, we parse it with load_f64/load_i32, find nearest enemy
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function me_x(me: i32): f64;
         declare function me_y(me: i32): f64;
         declare function me_team(me: i32): i32;
@@ -1240,7 +1658,8 @@ fn realistic_lowlevel_perceive_parsing() {
                 set_action(me, 0, 0, 0.0, 0.0);
             }
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -1249,51 +1668,78 @@ fn realistic_lowlevel_perceive_parsing() {
         action: (i32, i32, i32, f64, f64),
     }
 
-    let mut store = Store::new(&engine, State {
-        action: (0, 0, 0, 0.0, 0.0),
-    });
+    let mut store = Store::new(
+        &engine,
+        State {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
 
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "me_x", |_: Caller<'_, State>, _: i32| -> f64 { 0.0 }).unwrap();
-    linker.func_wrap("host", "me_y", |_: Caller<'_, State>, _: i32| -> f64 { 0.0 }).unwrap();
-    linker.func_wrap("host", "me_team", |_: Caller<'_, State>, _: i32| -> i32 { 1 }).unwrap();
-    linker.func_wrap("host", "perceive",
-        |mut caller: Caller<'_, State>, _me: i32, out_ptr: i32, _max: i32| -> i32 {
-            // Write 2 entities into the perception buffer
-            let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
-            let data = memory.data_mut(&mut caller);
-            let ptr = out_ptr as usize;
+    linker
+        .func_wrap("host", "me_x", |_: Caller<'_, State>, _: i32| -> f64 {
+            0.0
+        })
+        .unwrap();
+    linker
+        .func_wrap("host", "me_y", |_: Caller<'_, State>, _: i32| -> f64 {
+            0.0
+        })
+        .unwrap();
+    linker
+        .func_wrap("host", "me_team", |_: Caller<'_, State>, _: i32| -> i32 {
+            1
+        })
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "perceive",
+            |mut caller: Caller<'_, State>, _me: i32, out_ptr: i32, _max: i32| -> i32 {
+                // Write 2 entities into the perception buffer
+                let memory = caller.get_export("memory").unwrap().into_memory().unwrap();
+                let data = memory.data_mut(&mut caller);
+                let ptr = out_ptr as usize;
 
-            // Entity 0: friendly (team=1), at (5,0), distSq=25
-            data[ptr..ptr+8].copy_from_slice(&5.0f64.to_le_bytes());      // x
-            data[ptr+8..ptr+16].copy_from_slice(&0.0f64.to_le_bytes());   // y
-            data[ptr+16..ptr+24].copy_from_slice(&25.0f64.to_le_bytes()); // distSq
-            data[ptr+24..ptr+28].copy_from_slice(&100i32.to_le_bytes());  // id
-            data[ptr+36..ptr+40].copy_from_slice(&1i32.to_le_bytes());    // team=1 (same)
+                // Entity 0: friendly (team=1), at (5,0), distSq=25
+                data[ptr..ptr + 8].copy_from_slice(&5.0f64.to_le_bytes()); // x
+                data[ptr + 8..ptr + 16].copy_from_slice(&0.0f64.to_le_bytes()); // y
+                data[ptr + 16..ptr + 24].copy_from_slice(&25.0f64.to_le_bytes()); // distSq
+                data[ptr + 24..ptr + 28].copy_from_slice(&100i32.to_le_bytes()); // id
+                data[ptr + 36..ptr + 40].copy_from_slice(&1i32.to_le_bytes()); // team=1 (same)
 
-            // Entity 1: enemy (team=2), at (3,4), distSq=25
-            let ptr2 = ptr + 40;
-            data[ptr2..ptr2+8].copy_from_slice(&3.0f64.to_le_bytes());      // x
-            data[ptr2+8..ptr2+16].copy_from_slice(&4.0f64.to_le_bytes());   // y
-            data[ptr2+16..ptr2+24].copy_from_slice(&25.0f64.to_le_bytes()); // distSq
-            data[ptr2+24..ptr2+28].copy_from_slice(&200i32.to_le_bytes());  // id
-            data[ptr2+36..ptr2+40].copy_from_slice(&2i32.to_le_bytes());    // team=2 (enemy)
+                // Entity 1: enemy (team=2), at (3,4), distSq=25
+                let ptr2 = ptr + 40;
+                data[ptr2..ptr2 + 8].copy_from_slice(&3.0f64.to_le_bytes()); // x
+                data[ptr2 + 8..ptr2 + 16].copy_from_slice(&4.0f64.to_le_bytes()); // y
+                data[ptr2 + 16..ptr2 + 24].copy_from_slice(&25.0f64.to_le_bytes()); // distSq
+                data[ptr2 + 24..ptr2 + 28].copy_from_slice(&200i32.to_le_bytes()); // id
+                data[ptr2 + 36..ptr2 + 40].copy_from_slice(&2i32.to_le_bytes()); // team=2 (enemy)
 
-            2 // count
-        }).unwrap();
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, State>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+                2 // count
+            },
+        )
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, State>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 7).unwrap();
 
     let action = store.data().action;
-    assert_eq!(action.0, 7);     // me
-    assert_eq!(action.1, 1);     // kind = Move
-    assert_eq!(action.2, 200);   // target = enemy id
+    assert_eq!(action.0, 7); // me
+    assert_eq!(action.1, 1); // kind = Move
+    assert_eq!(action.2, 200); // target = enemy id
     // Direction should be normalized (3,4)/5 = (0.6, 0.8)
     assert!((action.3 - 0.6).abs() < 1e-10, "dx={}", action.3);
     assert!((action.4 - 0.8).abs() < 1e-10, "dy={}", action.4);
@@ -1303,7 +1749,8 @@ fn realistic_lowlevel_perceive_parsing() {
 
 #[test]
 fn class_basic_fields_and_constructor() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         class Vec2 {
@@ -1318,18 +1765,31 @@ fn class_basic_fields_and_constructor() {
             const v: Vec2 = new Vec2(3.0, 4.0);
             set_action(me, 0, 0, v.x, v.y);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (x, y) = *store.data();
     assert!((x - 3.0).abs() < 1e-10, "x={x}");
@@ -1338,7 +1798,8 @@ fn class_basic_fields_and_constructor() {
 
 #[test]
 fn class_methods() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         class Vec2 {
@@ -1358,25 +1819,34 @@ fn class_methods() {
             const len2: f64 = v.lengthSq();
             set_action(me, 0, 0, len2, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0.0f64);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, f64>, _me: i32, _kind: i32, _target: i32, dx: f64, _dy: f64| {
-            *caller.data_mut() = dx;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, f64>, _me: i32, _kind: i32, _target: i32, dx: f64, _dy: f64| {
+                *caller.data_mut() = dx;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert!((*store.data() - 25.0).abs() < 1e-10); // 3^2 + 4^2 = 25
 }
 
 #[test]
 fn arena_reset_by_host() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         class Point {
@@ -1390,18 +1860,31 @@ fn arena_reset_by_host() {
             const p: Point = new Point(1.0, 2.0);
             set_action(me, 0, 0, p.x, p.y);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
 
     // Get the arena pointer global
     let arena_ptr = instance.get_global(&mut store, "__arena_ptr").unwrap();
@@ -1424,7 +1907,8 @@ fn arena_reset_by_host() {
 
 #[test]
 fn class_method_with_params() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         class Entity {
@@ -1454,34 +1938,50 @@ fn class_method_with_params() {
             const dist2: f64 = e.distSqFrom(0.0, 0.0);
             set_action(me, alive, e.team, dist2, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
 
-    struct S { action: (i32, i32, i32, f64, f64) }
-    let mut store = Store::new(&engine, S { action: (0,0,0,0.0,0.0) });
+    struct S {
+        action: (i32, i32, i32, f64, f64),
+    }
+    let mut store = Store::new(
+        &engine,
+        S {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 7).unwrap();
 
     let a = store.data().action;
-    assert_eq!(a.0, 7);       // me
-    assert_eq!(a.1, 1);       // alive = true
-    assert_eq!(a.2, 1);       // team
+    assert_eq!(a.0, 7); // me
+    assert_eq!(a.1, 1); // alive = true
+    assert_eq!(a.2, 1); // team
     assert!((a.3 - 25.0).abs() < 1e-10, "dist2={}", a.3); // 3^2 + 4^2 = 25
 }
 
 #[test]
 fn this_field_assignment_in_constructor() {
     // Test that constructor with this.field = expr works
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         class Pair {
@@ -1498,47 +1998,65 @@ fn this_field_assignment_in_constructor() {
             const p: Pair = new Pair(3.0, 4.0);
             set_action(me, 0, 0, p.a, p.b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _kind: i32, _target: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>,
+             _me: i32,
+             _kind: i32,
+             _target: i32,
+             dx: f64,
+             dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (a, b) = *store.data();
-    assert!((a - 6.0).abs() < 1e-10, "a={a}");   // 3*2 = 6
-    assert!((b - 5.0).abs() < 1e-10, "b={b}");   // 4+1 = 5
+    assert!((a - 6.0).abs() < 1e-10, "a={a}"); // 3*2 = 6
+    assert!((b - 5.0).abs() < 1e-10, "b={b}"); // 4+1 = 5
 }
 
 // ---- Phase 4 tests: arrays ----
 
 #[test]
 fn array_new_and_length() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<f64> = new Array<f64>(8);
             return arr.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert_eq!(result, 0); // new array starts with length 0
 }
 
 #[test]
 fn array_push_and_length() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<f64> = new Array<f64>(8);
             arr.push(1.0);
@@ -1546,20 +2064,24 @@ fn array_push_and_length() {
             arr.push(3.0);
             return arr.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert_eq!(result, 3);
 }
 
 #[test]
 fn array_push_and_index_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(10.0);
@@ -1567,20 +2089,24 @@ fn array_push_and_index_f64() {
             arr.push(30.0);
             return arr[1];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 20.0).abs() < 1e-10);
 }
 
 #[test]
 fn array_push_and_index_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(4);
             arr.push(100);
@@ -1588,20 +2114,24 @@ fn array_push_and_index_i32() {
             arr.push(300);
             return arr[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert_eq!(result, 300);
 }
 
 #[test]
 fn array_index_assignment() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(10.0);
@@ -1609,20 +2139,24 @@ fn array_index_assignment() {
             arr[1] = 99.0;
             return arr[1];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 99.0).abs() < 1e-10);
 }
 
 #[test]
 fn array_compound_assignment() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(10.0);
@@ -1630,13 +2164,16 @@ fn array_compound_assignment() {
             arr[0] += 5.0;
             return arr[0];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 15.0).abs() < 1e-10);
 }
@@ -1644,7 +2181,8 @@ fn array_compound_assignment() {
 #[test]
 fn array_for_loop_iteration() {
     // Sum all elements using a for loop
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(1.0);
@@ -1657,39 +2195,47 @@ fn array_for_loop_iteration() {
             }
             return sum;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 10.0).abs() < 1e-10);
 }
 
 #[test]
 fn array_bounds_check_traps() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(1.0);
             return arr[5];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ());
     assert!(result.is_err(), "out-of-bounds access should trap");
 }
 
 #[test]
 fn array_push_grows_beyond_capacity() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(2);
             arr.push(10);
@@ -1697,20 +2243,24 @@ fn array_push_grows_beyond_capacity() {
             arr.push(30);
             return arr[0] * 100 + arr[1] * 10 + arr[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert_eq!(result, 1230); // 10*100 + 20*10 + 30
 }
 
 #[test]
 fn array_grow_from_zero_capacity() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(0);
             arr.push(11);
@@ -1718,20 +2268,24 @@ fn array_grow_from_zero_capacity() {
             arr.push(33);
             return arr.length * 1000 + arr[0] * 100 + arr[1] * 10 + arr[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert_eq!(result, 3_000 + 1100 + 220 + 33); // length=3, vals 11,22,33
 }
 
 #[test]
 fn array_grow_preserves_elements() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(2);
             arr.push(1.5);
@@ -1741,20 +2295,24 @@ fn array_grow_preserves_elements() {
             arr.push(5.5);
             return arr[0] + arr[1] + arr[2] + arr[3] + arr[4];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 17.5).abs() < 1e-10); // 1.5+2.5+3.5+4.5+5.5 = 17.5
 }
 
 #[test]
 fn array_grow_multiple_doublings() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(1);
             arr.push(0);
@@ -1773,13 +2331,16 @@ fn array_grow_multiple_doublings() {
             }
             return sum * 10 + arr.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     // sum = 0+1+2+3+4+5+6+7+8+9 = 45, length = 10
     assert_eq!(result, 45 * 10 + 10); // 460
@@ -1787,7 +2348,8 @@ fn array_grow_multiple_doublings() {
 
 #[test]
 fn array_grow_class_elements() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Point {
             x: f64;
             y: f64;
@@ -1807,20 +2369,24 @@ fn array_grow_class_elements() {
             let c: Point = pts[2];
             return a.x + b.x + c.y;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 33.0).abs() < 1e-10); // 1.0 + 2.0 + 30.0 = 33.0
 }
 
 #[test]
 fn array_grow_then_filter() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(2);
             arr.push(1);
@@ -1832,13 +2398,16 @@ fn array_grow_then_filter() {
             let evens: Array<i32> = arr.filter(x => x % 2 == 0);
             return evens.length * 100 + evens[0] * 10 + evens[1];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     // evens = [2, 4, 6], length=3, 3*100 + 2*10 + 4 = 324
     assert_eq!(result, 324);
@@ -1849,7 +2418,8 @@ fn array_grow_inplace_arena_efficiency() {
     // In-place grow: sequential pushes with no intervening allocations should
     // use arena space ~= final array size, not the sum of all intermediate copies.
     // We verify by reading __arena_ptr global from the host before/after.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function push_ten(): void {
             let arr: Array<i32> = new Array<i32>(0);
             arr.push(0);
@@ -1863,22 +2433,31 @@ fn array_grow_inplace_arena_efficiency() {
             arr.push(8);
             arr.push(9);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let arena_ptr = instance.get_global(&mut store, "__arena_ptr").expect("__arena_ptr global");
+    let arena_ptr = instance
+        .get_global(&mut store, "__arena_ptr")
+        .expect("__arena_ptr global");
     let before = arena_ptr.get(&mut store).i32().unwrap();
-    let push_ten = instance.get_typed_func::<(), ()>(&mut store, "push_ten").unwrap();
+    let push_ten = instance
+        .get_typed_func::<(), ()>(&mut store, "push_ten")
+        .unwrap();
     push_ten.call(&mut store, ()).unwrap();
     let after = arena_ptr.get(&mut store).i32().unwrap();
     let arena_delta = after - before;
     // With in-place grow from cap 0: 0->1->2->4->8->16
     // Final array: header(8) + 16 * 4 = 72 bytes
     // Without in-place grow, total would be: 8+4 + 8+8 + 8+16 + 8+32 + 8+64 = 164 bytes
-    assert_eq!(arena_delta, 8 + 16 * 4, "in-place grow should only use space for the final array, got {arena_delta}");
+    assert_eq!(
+        arena_delta,
+        8 + 16 * 4,
+        "in-place grow should only use space for the final array, got {arena_delta}"
+    );
 }
 
 #[test]
@@ -1886,7 +2465,8 @@ fn array_grow_copyabandon_with_intervening_alloc() {
     // When another allocation happens between array creation and push,
     // in-place grow can't be used — falls back to copy-and-abandon.
     // Array should still work correctly.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Box {
             val: i32;
             constructor(val: i32) {}
@@ -1899,13 +2479,16 @@ fn array_grow_copyabandon_with_intervening_alloc() {
             arr.push(30);
             return arr[0] * 100 + arr[1] * 10 + arr[2] + b.val;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     // 10*100 + 20*10 + 30 + 999 = 1000 + 200 + 30 + 999 = 2229
     assert_eq!(result, 2229);
@@ -1914,7 +2497,8 @@ fn array_grow_copyabandon_with_intervening_alloc() {
 #[test]
 fn array_with_host_imports() {
     // Realistic pattern: fill an array from host data, find max
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function get_count(): i32;
         declare function get_value(idx: i32): f64;
 
@@ -1932,23 +2516,30 @@ fn array_with_host_imports() {
             }
             return max;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let values: Vec<f64> = vec![3.0, 7.0, 1.0, 9.0, 2.0];
     let mut store = Store::new(&engine, values);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "get_count",
-        |caller: Caller<'_, Vec<f64>>| -> i32 {
+    linker
+        .func_wrap("host", "get_count", |caller: Caller<'_, Vec<f64>>| -> i32 {
             caller.data().len() as i32
-        }).unwrap();
-    linker.func_wrap("host", "get_value",
-        |caller: Caller<'_, Vec<f64>>, idx: i32| -> f64 {
-            caller.data()[idx as usize]
-        }).unwrap();
+        })
+        .unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "get_value",
+            |caller: Caller<'_, Vec<f64>>, idx: i32| -> f64 { caller.data()[idx as usize] },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let find_max = instance.get_typed_func::<(), f64>(&mut store, "find_max").unwrap();
+    let find_max = instance
+        .get_typed_func::<(), f64>(&mut store, "find_max")
+        .unwrap();
     let result = find_max.call(&mut store, ()).unwrap();
     assert!((result - 9.0).abs() < 1e-10);
 }
@@ -1956,7 +2547,8 @@ fn array_with_host_imports() {
 #[test]
 fn array_of_class_instances() {
     // Array<Entity> — store pointers to class instances
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -1980,13 +2572,16 @@ fn array_of_class_instances() {
             }
             return sum;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 9.0).abs() < 1e-10); // 1 + 3 + 5 = 9
 }
@@ -1995,7 +2590,8 @@ fn array_of_class_instances() {
 
 #[test]
 fn array_filter_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(8);
             arr.push(1);
@@ -2006,20 +2602,24 @@ fn array_filter_basic() {
             let evens: Array<i32> = arr.filter(x => x % 2 == 0);
             return evens.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 2); // 2, 4
 }
 
 #[test]
 fn array_filter_with_capture() {
     // Filter with a captured variable from the enclosing scope
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(8);
             arr.push(10);
@@ -2031,20 +2631,24 @@ fn array_filter_with_capture() {
             let big: Array<i32> = arr.filter(x => x > threshold);
             return big.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 3); // 30, 40, 50
 }
 
 #[test]
 fn array_filter_class_instances() {
     // Filter entities by a field — the key game scripting pattern
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2062,20 +2666,24 @@ fn array_filter_class_instances() {
             let alive: Array<Entity> = entities.filter(e => e.hp > 0);
             return alive.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 3); // hp > 0: 100, 50, 75
 }
 
 #[test]
 fn array_filter_with_class_capture() {
     // Filter enemies by team, capturing myTeam — the canonical game AI pattern
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2092,13 +2700,16 @@ fn array_filter_with_class_capture() {
             let enemies: Array<Entity> = entities.filter(e => e.team != my_team && e.hp > 0);
             return enemies.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<i32, i32>(&mut store, "count_enemies").unwrap();
+    let test = instance
+        .get_typed_func::<i32, i32>(&mut store, "count_enemies")
+        .unwrap();
     assert_eq!(test.call(&mut store, 1).unwrap(), 2); // team 2: hp 80, 60
     assert_eq!(test.call(&mut store, 2).unwrap(), 2); // team 1: hp 100, 50
 }
@@ -2106,7 +2717,8 @@ fn array_filter_with_class_capture() {
 #[test]
 fn array_map_basic() {
     // Map f64 array to doubled values
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(1.0);
@@ -2115,13 +2727,16 @@ fn array_map_basic() {
             let doubled: Array<f64> = arr.map(x => x * 2.0);
             return doubled[0] + doubled[1] + doubled[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 12.0).abs() < 1e-10); // 2 + 4 + 6
 }
@@ -2129,7 +2744,8 @@ fn array_map_basic() {
 #[test]
 fn array_map_extract_field() {
     // Map Entity -> f64 (extract hp values) — common game pattern
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2144,20 +2760,24 @@ fn array_map_extract_field() {
             let hps: Array<i32> = entities.map(e => e.hp);
             return hps[0] + hps[1] + hps[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 225); // 100 + 50 + 75
 }
 
 #[test]
 fn array_foreach() {
     // forEach to accumulate a sum via captured mutable variable
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function report(val: f64): void;
 
         export function test(): void {
@@ -2169,25 +2789,34 @@ fn array_foreach() {
             arr.forEach(x => { sum += x; });
             report(sum);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, Cell::new(0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "report",
-        |mut caller: Caller<'_, Cell<f64>>, val: f64| {
-            caller.data_mut().set(val);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "report",
+            |mut caller: Caller<'_, Cell<f64>>, val: f64| {
+                caller.data_mut().set(val);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let test = instance.get_typed_func::<(), ()>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), ()>(&mut store, "test")
+        .unwrap();
     test.call(&mut store, ()).unwrap();
     assert!((store.data().get() - 6.0).abs() < 1e-10); // 1 + 2 + 3
 }
 
 #[test]
 fn array_reduce_sum() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(1.0);
@@ -2197,13 +2826,16 @@ fn array_reduce_sum() {
             let total: f64 = arr.reduce((sum, x) => sum + x, 0.0);
             return total;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 10.0).abs() < 1e-10);
 }
@@ -2211,7 +2843,8 @@ fn array_reduce_sum() {
 #[test]
 fn array_reduce_entity_hp_sum() {
     // reduce over class instances — sum all HP values
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2226,19 +2859,23 @@ fn array_reduce_entity_hp_sum() {
             let total_hp: i32 = entities.reduce((sum, e) => sum + e.hp, 0);
             return total_hp;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 225);
 }
 
 #[test]
 fn array_sort_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(3.0);
@@ -2249,20 +2886,24 @@ fn array_sort_f64() {
             // After sort: [1, 2, 3, 4]
             return arr[0] * 1000.0 + arr[1] * 100.0 + arr[2] * 10.0 + arr[3];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 1234.0).abs() < 1e-10);
 }
 
 #[test]
 fn array_sort_descending() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(3.0);
@@ -2273,13 +2914,16 @@ fn array_sort_descending() {
             // After sort descending: [4, 3, 2, 1]
             return arr[0] * 1000.0 + arr[1] * 100.0 + arr[2] * 10.0 + arr[3];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 4321.0).abs() < 1e-10);
 }
@@ -2287,7 +2931,8 @@ fn array_sort_descending() {
 #[test]
 fn array_filter_then_reduce() {
     // Chain: filter enemies then sum their HP — realistic game AI
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2306,13 +2951,16 @@ fn array_filter_then_reduce() {
             let total: i32 = enemies.reduce((sum, e) => sum + e.hp, 0);
             return total;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<i32, i32>(&mut store, "enemy_total_hp").unwrap();
+    let test = instance
+        .get_typed_func::<i32, i32>(&mut store, "enemy_total_hp")
+        .unwrap();
     // my_team=1: enemies are team 2 with hp>0: 80, 40 = 120
     assert_eq!(test.call(&mut store, 1).unwrap(), 120);
 }
@@ -2320,7 +2968,8 @@ fn array_filter_then_reduce() {
 #[test]
 fn realistic_game_ai_filter_sort() {
     // The "money shot": filter enemies, sort by distance, act on closest
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -2365,42 +3014,58 @@ fn realistic_game_ai_filter_sort() {
             let dy: f64 = closest.y - my;
             set_action(me, 1, closest.hp, dx, dy);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
 
-    struct S { action: (i32, i32, i32, f64, f64) }
-    let mut store = Store::new(&engine, S { action: (0,0,0,0.0,0.0) });
+    struct S {
+        action: (i32, i32, i32, f64, f64),
+    }
+    let mut store = Store::new(
+        &engine,
+        S {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
 
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 42).unwrap();
 
     let a = store.data().action;
-    assert_eq!(a.0, 42);  // me
-    assert_eq!(a.1, 1);   // kind = attack
+    assert_eq!(a.0, 42); // me
+    assert_eq!(a.1, 1); // kind = attack
 
     // Alive enemies (team != 1, hp > 0):
     //   (1,1) hp=100 team=2, distSq = (1-5)^2 + (1-5)^2 = 32
     //   (9,9) hp=50 team=2,  distSq = (9-5)^2 + (9-5)^2 = 32
     //   (3,5) hp=60 team=2,  distSq = (3-5)^2 + (5-5)^2 = 4
     // Closest is (3,5) with distSq=4, hp=60
-    assert_eq!(a.2, 60);  // target = closest enemy hp
-    assert!((a.3 - (-2.0)).abs() < 1e-10, "dx={}", a.3);  // dx = 3-5 = -2
-    assert!((a.4 - 0.0).abs() < 1e-10, "dy={}", a.4);     // dy = 5-5 = 0
+    assert_eq!(a.2, 60); // target = closest enemy hp
+    assert!((a.3 - (-2.0)).abs() < 1e-10, "dx={}", a.3); // dx = 3-5 = -2
+    assert!((a.4 - 0.0).abs() < 1e-10, "dy={}", a.4); // dy = 5-5 = 0
 }
 
 // ---- Phase 6 tests: TS sugar ----
 
 #[test]
 fn object_destructuring_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Vec2 {
             x: f64;
             y: f64;
@@ -2412,13 +3077,16 @@ fn object_destructuring_basic() {
             const { x, y } = v;
             return x + y;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 7.0).abs() < 1e-10); // 3 + 4
 }
@@ -2426,7 +3094,8 @@ fn object_destructuring_basic() {
 #[test]
 fn object_destructuring_partial() {
     // Destructure only some fields
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -2440,19 +3109,23 @@ fn object_destructuring_partial() {
             const { hp, team } = e;
             return hp + team;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 103); // 100 + 3
 }
 
 #[test]
 fn array_destructuring_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let arr: Array<f64> = new Array<f64>(4);
             arr.push(10.0);
@@ -2461,13 +3134,16 @@ fn array_destructuring_basic() {
             const [first, second, third] = arr;
             return first + second + third;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 60.0).abs() < 1e-10);
 }
@@ -2475,7 +3151,8 @@ fn array_destructuring_basic() {
 #[test]
 fn array_destructuring_class_elements() {
     // Destructure Array<Entity> — elements get class type tracking
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -2489,13 +3166,16 @@ fn array_destructuring_class_elements() {
             const [first, second] = entities;
             return first.x + second.y;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 5.0).abs() < 1e-10); // 1.0 + 4.0
 }
@@ -2503,7 +3183,8 @@ fn array_destructuring_class_elements() {
 #[test]
 fn optional_chaining_non_null() {
     // Access field on a non-null object
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2515,20 +3196,24 @@ fn optional_chaining_non_null() {
             let hp: i32 = e?.hp;
             return hp;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 100);
 }
 
 #[test]
 fn optional_chaining_null() {
     // Access field on a null (0) pointer — should return 0
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2542,22 +3227,28 @@ fn optional_chaining_null() {
             let hp: i32 = target?.hp;
             return hp;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
     // Return null (0) pointer
-    linker.func_wrap("host", "find_target", || -> i32 { 0 }).unwrap();
+    linker
+        .func_wrap("host", "find_target", || -> i32 { 0 })
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 0);
 }
 
 #[test]
 fn nullish_coalescing() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             team: i32;
@@ -2571,7 +3262,8 @@ fn nullish_coalescing() {
             let hp: i32 = target?.hp ?? 42;
             return hp;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -2580,45 +3272,57 @@ fn nullish_coalescing() {
     {
         let mut store = Store::new(&engine, ());
         let mut linker = Linker::new(&engine);
-        linker.func_wrap("host", "find_target", || -> i32 { 0 }).unwrap();
+        linker
+            .func_wrap("host", "find_target", || -> i32 { 0 })
+            .unwrap();
         let instance = linker.instantiate(&mut store, &module).unwrap();
-        let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+        let test = instance
+            .get_typed_func::<(), i32>(&mut store, "test")
+            .unwrap();
         assert_eq!(test.call(&mut store, ()).unwrap(), 42);
     }
 }
 
 #[test]
 fn ternary_expression() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(x: i32): i32 {
             let result: i32 = x > 5 ? 100 : 200;
             return result;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<i32, i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<i32, i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, 10).unwrap(), 100);
     assert_eq!(test.call(&mut store, 3).unwrap(), 200);
 }
 
 #[test]
 fn ternary_expression_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(x: f64): f64 {
             let result: f64 = x > 0.0 ? x * 2.0 : 0.0 - x;
             return result;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<f64, f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<f64, f64>(&mut store, "test")
+        .unwrap();
     assert!((test.call(&mut store, 5.0).unwrap() - 10.0).abs() < 1e-10);
     assert!((test.call(&mut store, -3.0).unwrap() - 3.0).abs() < 1e-10);
 }
@@ -2626,7 +3330,8 @@ fn ternary_expression_f64() {
 #[test]
 fn combined_sugar_game_pattern() {
     // Combine destructuring + optional chaining + filter in a realistic pattern
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -2658,15 +3363,20 @@ fn combined_sugar_game_pattern() {
 
             return x + y + f64(total_hp) + f64(target_hp);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "find_target", || -> i32 { 0 }).unwrap();
+    linker
+        .func_wrap("host", "find_target", || -> i32 { 0 })
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     // x=1 + y=2 + total_hp(100+75=175) + target_hp(0) = 178
     assert!((result - 178.0).abs() < 1e-10, "result={result}");
@@ -2684,18 +3394,24 @@ fn error_undefined_variable_has_location() {
     assert!(err.loc.is_some(), "error should have location");
     let loc = err.loc.unwrap();
     assert_eq!(loc.line, 1);
-    assert!(err.message.contains("undefined variable 'foo'"), "msg={}", err.message);
+    assert!(
+        err.message.contains("undefined variable 'foo'"),
+        "msg={}",
+        err.message
+    );
 }
 
 #[test]
 fn error_type_mismatch_has_location() {
-    let err = compile_err(r#"
+    let err = compile_err(
+        r#"
         export function test(): i32 {
             let a: i32 = 1;
             let b: f64 = 2.0;
             return a + b;
         }
-    "#);
+    "#,
+    );
     assert!(err.loc.is_some(), "error should have location");
     assert!(err.message.contains("type mismatch"), "msg={}", err.message);
 }
@@ -2712,7 +3428,11 @@ fn error_missing_type_annotation_has_location() {
 fn error_undefined_function_has_location() {
     let err = compile_err("export function tick(me: i32): void { let x: i32 = bogus(1); }");
     assert!(err.loc.is_some(), "error should have location");
-    assert!(err.message.contains("undefined function 'bogus'"), "msg={}", err.message);
+    assert!(
+        err.message.contains("undefined function 'bogus'"),
+        "msg={}",
+        err.message
+    );
 }
 
 #[test]
@@ -2737,7 +3457,10 @@ fn error_context_snippet() {
     let err = compile_err(source);
     let formatted = tscc::error::format_error_with_context(&err, source);
     // Should contain the source line and a caret
-    assert!(formatted.contains("let x: i32 = foo;"), "formatted={formatted}");
+    assert!(
+        formatted.contains("let x: i32 = foo;"),
+        "formatted={formatted}"
+    );
     assert!(formatted.contains("^"), "formatted={formatted}");
 }
 
@@ -2745,55 +3468,74 @@ fn error_context_snippet() {
 
 #[test]
 fn type_inference_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let x = 5;
             let y = x + 3;
             set_action(me, y, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 8);
 }
 
 #[test]
 fn type_inference_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let x = 3.14;
             let y = x * 2.0;
             set_action(me, 0, 0, y, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0.0f64);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, f64>, _me: i32, _k: i32, _t: i32, dx: f64, _dy: f64| {
-            *caller.data_mut() = dx;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, f64>, _me: i32, _k: i32, _t: i32, dx: f64, _dy: f64| {
+                *caller.data_mut() = dx;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert!((*store.data() - 6.28).abs() < 1e-10);
 }
 
 #[test]
 fn type_inference_bool() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let flag = true;
@@ -2803,24 +3545,33 @@ fn type_inference_bool() {
                 set_action(me, 0, 0, 0.0, 0.0);
             }
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 1);
 }
 
 #[test]
 fn type_inference_from_new() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         class Vec2 {
             x: f64;
@@ -2831,17 +3582,25 @@ fn type_inference_from_new() {
             let v = new Vec2(7.0, 8.0);
             set_action(me, 0, 0, v.x, v.y);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0.0f64, 0.0f64));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (f64, f64)>, _me: i32, _k: i32, _t: i32, dx: f64, dy: f64| {
-            *caller.data_mut() = (dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (f64, f64)>, _me: i32, _k: i32, _t: i32, dx: f64, dy: f64| {
+                *caller.data_mut() = (dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert!((*store.data()).0 - 7.0 < 1e-10);
     assert!((*store.data()).1 - 8.0 < 1e-10);
@@ -2851,7 +3610,8 @@ fn type_inference_from_new() {
 
 #[test]
 fn null_literal() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         class Entity {
             hp: i32;
@@ -2862,17 +3622,25 @@ fn null_literal() {
             let hp: i32 = target?.hp ?? 42;
             set_action(me, hp, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 42);
 }
@@ -2895,7 +3663,8 @@ fn const_increment_error() {
 
 #[test]
 fn prefix_postfix_update() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let a: i32 = 5;
@@ -2903,28 +3672,45 @@ fn prefix_postfix_update() {
             let c: i32 = ++a;
             set_action(me, b, c, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32)>, _me: i32, kind: i32, target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = (kind, target);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32)>,
+             _me: i32,
+             kind: i32,
+             target: i32,
+             _dx: f64,
+             _dy: f64| {
+                *caller.data_mut() = (kind, target);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (b, c) = *store.data();
     assert_eq!(b, 5, "postfix a++ should return old value 5");
-    assert_eq!(c, 7, "prefix ++a should return new value 7 (was 6 after a++)");
+    assert_eq!(
+        c, 7,
+        "prefix ++a should return new value 7 (was 6 after a++)"
+    );
 }
 
 // ==================== for...of loop tests ====================
 
 #[test]
 fn for_of_loop_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let arr: Array<i32> = new Array<i32>(5);
@@ -2937,24 +3723,33 @@ fn for_of_loop_basic() {
             }
             set_action(me, sum, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 60);
 }
 
 #[test]
 fn for_of_loop_class_instances() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         class Entity {
             hp: i32;
@@ -2971,17 +3766,25 @@ fn for_of_loop_class_instances() {
             }
             set_action(me, totalHp, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 60);
 }
@@ -2990,7 +3793,8 @@ fn for_of_loop_class_instances() {
 
 #[test]
 fn switch_case_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let result: i32 = 0;
@@ -3010,17 +3814,25 @@ fn switch_case_basic() {
             }
             set_action(me, result, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
 
     tick.call(&mut store, 1).unwrap();
     assert_eq!(*store.data(), 10);
@@ -3039,7 +3851,8 @@ fn switch_case_basic() {
 
 #[test]
 fn const_enum_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         enum Action {
@@ -3053,24 +3866,33 @@ fn const_enum_basic() {
             let action: i32 = Action.Move;
             set_action(me, action, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 1); // Move = 1
 }
 
 #[test]
 fn enum_with_explicit_values() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         enum Priority {
@@ -3082,17 +3904,30 @@ fn enum_with_explicit_values() {
         export function tick(me: i32): void {
             set_action(me, Priority.High, Priority.Low, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32)>, _me: i32, kind: i32, target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = (kind, target);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32)>,
+             _me: i32,
+             kind: i32,
+             target: i32,
+             _dx: f64,
+             _dy: f64| {
+                *caller.data_mut() = (kind, target);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), (30, 10));
 }
@@ -3102,7 +3937,8 @@ fn enum_with_explicit_values() {
 #[test]
 fn chained_filter_map() {
     // This tests that .filter() result can be used with .map()
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         class Entity {
             hp: i32;
@@ -3123,17 +3959,30 @@ fn chained_filter_map() {
             let total: i32 = enemyHp.reduce((sum, hp) => sum + hp, 0);
             set_action(me, total, enemyHp.length, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, (0i32, 0i32));
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, (i32, i32)>, _me: i32, kind: i32, target: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = (kind, target);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, (i32, i32)>,
+             _me: i32,
+             kind: i32,
+             target: i32,
+             _dx: f64,
+             _dy: f64| {
+                *caller.data_mut() = (kind, target);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     let (total, count) = *store.data();
     assert_eq!(total, 60, "enemy hp sum should be 20+40=60");
@@ -3144,7 +3993,8 @@ fn chained_filter_map() {
 
 #[test]
 fn nested_class_field_access() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         class Vec2 {
             x: f64;
@@ -3161,21 +4011,36 @@ fn nested_class_field_access() {
             let e = new Entity(pos, 100);
             set_action(me, e.hp, 0, e.pos.x, e.pos.y);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
-    struct S { action: (i32, i32, i32, f64, f64) }
-    let mut store = Store::new(&engine, S { action: (0,0,0,0.0,0.0) });
+    struct S {
+        action: (i32, i32, i32, f64, f64),
+    }
+    let mut store = Store::new(
+        &engine,
+        S {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 7).unwrap();
     let a = store.data().action;
-    assert_eq!(a.1, 100);  // hp
+    assert_eq!(a.1, 100); // hp
     assert!((a.3 - 3.0).abs() < 1e-10, "pos.x={}", a.3);
     assert!((a.4 - 4.0).abs() < 1e-10, "pos.y={}", a.4);
 }
@@ -3186,7 +4051,8 @@ fn nested_class_field_access() {
 fn convoluted_game_ai_full_pipeline() {
     // This is the ultimate stress test: enum, for..of, filter, sort, chaining,
     // type inference, null checks, nested access, methods, arena allocation.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         enum ActionKind {
@@ -3261,25 +4127,40 @@ fn convoluted_game_ai_full_pipeline() {
                 set_action(me, ActionKind.Idle, 0, 0.0, 0.0);
             }
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
-    struct S { action: (i32, i32, i32, f64, f64) }
-    let mut store = Store::new(&engine, S { action: (0,0,0,0.0,0.0) });
+    struct S {
+        action: (i32, i32, i32, f64, f64),
+    }
+    let mut store = Store::new(
+        &engine,
+        S {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 42).unwrap();
 
     let a = store.data().action;
-    assert_eq!(a.0, 42);  // me
-    assert_eq!(a.1, 2);   // ActionKind.Attack = 2
-    assert_eq!(a.2, 50);  // nearest enemy hp = 50 (entity at 3,4 is closest alive)
+    assert_eq!(a.0, 42); // me
+    assert_eq!(a.1, 2); // ActionKind.Attack = 2
+    assert_eq!(a.2, 50); // nearest enemy hp = 50 (entity at 3,4 is closest alive)
     // Direction to (3,4) from (0,0) = (3/5, 4/5) = (0.6, 0.8)
     assert!((a.3 - 0.6).abs() < 1e-10, "dx={}", a.3);
     assert!((a.4 - 0.8).abs() < 1e-10, "dy={}", a.4);
@@ -3295,7 +4176,8 @@ fn large_array_sort_1000_elements() {
         memory_pages: 64, // 4MB for large arrays
         ..Default::default()
     };
-    let wasm = tscc::compile(r#"
+    let wasm = tscc::compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32): void {
             let arr: Array<i32> = new Array<i32>(1024);
@@ -3305,61 +4187,90 @@ fn large_array_sort_1000_elements() {
             arr.sort((a, b) => a - b);
             set_action(me, arr[0], arr[999], f64(arr[500]), 0.0);
         }
-    "#, &options).unwrap();
+    "#,
+        &options,
+    )
+    .unwrap();
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
-    struct S { action: (i32, i32, i32, f64, f64) }
-    let mut store = Store::new(&engine, S { action: (0,0,0,0.0,0.0) });
+    struct S {
+        action: (i32, i32, i32, f64, f64),
+    }
+    let mut store = Store::new(
+        &engine,
+        S {
+            action: (0, 0, 0, 0.0, 0.0),
+        },
+    );
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
-            caller.data_mut().action = (me, kind, target, dx, dy);
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, S>, me: i32, kind: i32, target: i32, dx: f64, dy: f64| {
+                caller.data_mut().action = (me, kind, target, dx, dy);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 
     let a = store.data().action;
     assert_eq!(a.1, 0, "first element after sort should be 0");
     assert_eq!(a.2, 999, "last element after sort should be 999");
-    assert!((a.3 - 500.0).abs() < 1e-10, "middle element should be 500, got {}", a.3);
+    assert!(
+        (a.3 - 500.0).abs() < 1e-10,
+        "middle element should be 500, got {}",
+        a.3
+    );
 }
 
 // ==================== Tier 2: `int` type alias ====================
 
 #[test]
 fn int_type_alias() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): int {
             let a: int = 10;
             let b: int = 20;
             return a + b;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 30);
 }
 
 #[test]
 fn number_type_keyword() {
     // `number` is already a TS keyword (TSNumberKeyword), mapped to f64
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): number {
             let x: number = 3.5;
             let y: number = 2.0;
             return x * y;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     assert!((test.call(&mut store, ()).unwrap() - 7.0).abs() < 1e-10);
 }
 
@@ -3367,49 +4278,61 @@ fn number_type_keyword() {
 
 #[test]
 fn as_cast_i32_to_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let x: i32 = 42;
             return x as f64;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     assert!((test.call(&mut store, ()).unwrap() - 42.0).abs() < 1e-10);
 }
 
 #[test]
 fn as_cast_f64_to_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let x: f64 = 3.99;
             return x as i32;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 3); // truncation
 }
 
 #[test]
 fn as_cast_noop() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             let x: f64 = 7.5;
             return x as f64;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     assert!((test.call(&mut store, ()).unwrap() - 7.5).abs() < 1e-10);
 }
 
@@ -3417,7 +4340,8 @@ fn as_cast_noop() {
 
 #[test]
 fn do_while_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let sum: i32 = 0;
             let i: i32 = 1;
@@ -3427,18 +4351,22 @@ fn do_while_basic() {
             } while (i <= 5);
             return sum;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 15); // 1+2+3+4+5
 }
 
 #[test]
 fn do_while_executes_at_least_once() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let count: i32 = 0;
             do {
@@ -3446,18 +4374,22 @@ fn do_while_executes_at_least_once() {
             } while (false);
             return count;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 1);
 }
 
 #[test]
 fn do_while_with_break() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let sum: i32 = 0;
             let i: i32 = 0;
@@ -3468,12 +4400,15 @@ fn do_while_with_break() {
             } while (i < 100);
             return sum;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 6); // 1+2+3
 }
 
@@ -3482,22 +4417,31 @@ fn do_while_with_break() {
 #[test]
 fn implicit_void_return() {
     // Function with no return type annotation should default to void
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
         export function tick(me: i32) {
             set_action(me, 1, 0, 0.0, 0.0);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0i32);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
-            *caller.data_mut() = kind;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, i32>, _me: i32, kind: i32, _t: i32, _dx: f64, _dy: f64| {
+                *caller.data_mut() = kind;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
     assert_eq!(*store.data(), 1);
 }
@@ -3506,7 +4450,8 @@ fn implicit_void_return() {
 
 #[test]
 fn enum_switch_combined() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
         enum State {
@@ -3541,81 +4486,106 @@ fn enum_switch_combined() {
             let m3 = getMultiplier(State.Attack);
             set_action(me, 0, 0, m1 + m2 + m3, 0.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, 0.0f64);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "set_action",
-        |mut caller: Caller<'_, f64>, _me: i32, _k: i32, _t: i32, dx: f64, _dy: f64| {
-            *caller.data_mut() = dx;
-        }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "set_action",
+            |mut caller: Caller<'_, f64>, _me: i32, _k: i32, _t: i32, dx: f64, _dy: f64| {
+                *caller.data_mut() = dx;
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
-    assert!((*store.data() - 3.0).abs() < 1e-10, "0.0 + 1.0 + 2.0 = 3.0, got {}", *store.data());
+    assert!(
+        (*store.data() - 3.0).abs() < 1e-10,
+        "0.0 + 1.0 + 2.0 = 3.0, got {}",
+        *store.data()
+    );
 }
 
 // ── First-class closure tests ───────────────────────────────────────
 
 #[test]
 fn closure_basic_no_capture() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             const add = (a: i32, b: i32): i32 => a + b;
             return add(3, 4);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 7);
 }
 
 #[test]
 fn closure_with_capture() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let offset: i32 = 10;
             const addOffset = (x: i32): i32 => x + offset;
             return addOffset(5);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn closure_capture_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): f64 {
             let scale: f64 = 2.5;
             const multiply = (x: f64): f64 => x * scale;
             return multiply(4.0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), f64>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), f64>(&mut store, "run")
+        .unwrap();
     let result = run.call(&mut store, ()).unwrap();
     assert!((result - 10.0).abs() < 1e-10);
 }
 
 #[test]
 fn closure_multiple_captures() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let a: i32 = 100;
             let b: i32 = 20;
@@ -3623,37 +4593,45 @@ fn closure_multiple_captures() {
             const sum = (x: i32): i32 => x + a + b + c;
             return sum(0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 123);
 }
 
 #[test]
 fn closure_multiple_closures() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             const double = (x: i32): i32 => x * 2;
             const triple = (x: i32): i32 => x * 3;
             return double(5) + triple(5);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 25);
 }
 
 #[test]
 fn closure_capture_class_instance() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Vec2 {
             x: f64;
             y: f64;
@@ -3665,20 +4643,24 @@ fn closure_capture_class_instance() {
             const getX = (): f64 => v.x;
             return getX();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), f64>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), f64>(&mut store, "run")
+        .unwrap();
     let result = run.call(&mut store, ()).unwrap();
     assert!((result - 3.0).abs() < 1e-10);
 }
 
 #[test]
 fn closure_as_function_parameter() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function apply(x: i32, fn: (a: i32) => i32): i32 {
             return fn(x);
         }
@@ -3687,19 +4669,23 @@ fn closure_as_function_parameter() {
             const double = (a: i32): i32 => a * 2;
             return apply(7, double);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 14);
 }
 
 #[test]
 fn closure_as_param_with_capture() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function applyToFive(fn: (a: i32) => i32): i32 {
             return fn(5);
         }
@@ -3709,20 +4695,24 @@ fn closure_as_param_with_capture() {
             const addBonus = (x: i32): i32 => x + bonus;
             return applyToFive(addBonus);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 105);
 }
 
 #[test]
 fn closure_inline_builtins_still_work() {
     // Regression: inline closures in array builtins should still work
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let arr: Array<i32> = new Array<i32>(4);
             arr.push(1);
@@ -3732,13 +4722,16 @@ fn closure_inline_builtins_still_work() {
             let evens: Array<i32> = arr.filter((x: i32): bool => x % 2 == 0);
             return evens.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 2);
 }
 
@@ -3747,7 +4740,8 @@ fn closure_inline_builtins_still_work() {
 #[test]
 fn closure_return_from_function() {
     // Factory pattern: function returns a closure
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function makeAdder(n: i32): (x: i32) => i32 {
             return (x: i32): i32 => x + n;
         }
@@ -3756,19 +4750,23 @@ fn closure_return_from_function() {
             const add5 = makeAdder(5);
             return add5(10);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn closure_return_multiple_factories() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function makeMultiplier(factor: i32): (x: i32) => i32 {
             return (x: i32): i32 => x * factor;
         }
@@ -3778,20 +4776,24 @@ fn closure_return_multiple_factories() {
             const triple = makeMultiplier(3);
             return double(10) + triple(10);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 50); // 20 + 30
 }
 
 #[test]
 fn closure_nested_closure_in_block_body() {
     // Closure inside a block-body closure
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             const outer = (x: i32): i32 => {
                 const inner = (y: i32): i32 => y + x;
@@ -3799,20 +4801,24 @@ fn closure_nested_closure_in_block_body() {
             };
             return outer(5);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn closure_block_body_with_logic() {
     // Block-body closure with if/else
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             const clamp = (x: i32, lo: i32, hi: i32): i32 => {
                 if (x < lo) { return lo; }
@@ -3821,39 +4827,47 @@ fn closure_block_body_with_logic() {
             };
             return clamp(-5, 0, 100) + clamp(50, 0, 100) + clamp(200, 0, 100);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 150); // 0 + 50 + 100
 }
 
 #[test]
 fn closure_capture_another_closure() {
     // Closure captures a variable holding another closure
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             const add1 = (x: i32): i32 => x + 1;
             const applyTwice = (x: i32): i32 => add1(add1(x));
             return applyTwice(5);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 7);
 }
 
 #[test]
 fn closure_inline_arrow_as_argument() {
     // Pass an anonymous arrow directly to a function expecting a closure parameter
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function apply(x: i32, fn: (a: i32) => i32): i32 {
             return fn(x);
         }
@@ -3861,13 +4875,16 @@ fn closure_inline_arrow_as_argument() {
         export function run(): i32 {
             return apply(6, (a: i32): i32 => a * 7);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 42);
 }
 
@@ -3876,27 +4893,32 @@ fn closure_inline_arrow_as_argument() {
 #[test]
 fn closure_mutation_after_capture_visible() {
     // Core test: mutation after closure creation is visible to the closure
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let x: i32 = 1;
             const getX = (): i32 => x;
             x = 42;
             return getX();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 42); // NOT 1 — TS reference semantics
 }
 
 #[test]
 fn closure_mutation_inside_closure_visible_outside() {
     // Mutation inside closure is visible in outer scope
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let counter: i32 = 0;
             const increment = (): void => { counter = counter + 1; };
@@ -3905,20 +4927,24 @@ fn closure_mutation_inside_closure_visible_outside() {
             increment();
             return counter;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 3);
 }
 
 #[test]
 fn closure_boxed_f64_mutation() {
     // f64 boxing works correctly
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): f64 {
             let total: f64 = 0.0;
             const addTo = (x: f64): void => { total = total + x; };
@@ -3926,13 +4952,16 @@ fn closure_boxed_f64_mutation() {
             addTo(2.5);
             return total;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), f64>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), f64>(&mut store, "run")
+        .unwrap();
     let result = run.call(&mut store, ()).unwrap();
     assert!((result - 4.0).abs() < 1e-10);
 }
@@ -3940,7 +4969,8 @@ fn closure_boxed_f64_mutation() {
 #[test]
 fn closure_boxed_compound_assignment() {
     // Compound assignment (+=) works with boxed vars
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let x: i32 = 10;
             const addToX = (n: i32): void => { x += n; };
@@ -3948,20 +4978,24 @@ fn closure_boxed_compound_assignment() {
             addToX(3);
             return x;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 18);
 }
 
 #[test]
 fn closure_boxed_increment() {
     // ++/-- works with boxed vars
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let n: i32 = 0;
             const inc = (): i32 => { n++; return n; };
@@ -3970,39 +5004,47 @@ fn closure_boxed_increment() {
             let result = inc();
             return result;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 3);
 }
 
 #[test]
 fn closure_non_mutated_capture_stays_unboxed() {
     // Sanity: variable captured but never mutated should still work (no boxing needed)
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let x: i32 = 99;
             const getX = (): i32 => x;
             return getX();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 99);
 }
 
 #[test]
 fn closure_two_closures_share_boxed_var() {
     // Two closures sharing the same mutable variable
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let shared: i32 = 0;
             const inc = (): void => { shared += 1; };
@@ -4012,20 +5054,24 @@ fn closure_two_closures_share_boxed_var() {
             inc();
             return get();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 3);
 }
 
 #[test]
 fn closure_shadow_variable_not_captured() {
     // Inner `local` shadows outer `local` — outer should NOT be captured
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let local: i32 = 42;
             const fn1 = (): i32 => {
@@ -4034,20 +5080,24 @@ fn closure_shadow_variable_not_captured() {
             };
             return fn1() + local;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 141); // 99 + 42
 }
 
 #[test]
 fn closure_uninitialized_boxed_var() {
     // Boxed variable without initializer should default to zero
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let x: i32;
             const set = (val: i32): void => { x = val; };
@@ -4056,20 +5106,24 @@ fn closure_uninitialized_boxed_var() {
             set(77);
             return before + get();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 77); // 0 + 77
 }
 
 #[test]
 fn closure_arrow_internal_mutation_no_false_boxing() {
     // Variable mutated only INSIDE an arrow body should not cause outer boxing
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function run(): i32 {
             let x: i32 = 10;
             const fn1 = (): i32 => {
@@ -4079,13 +5133,16 @@ fn closure_arrow_internal_mutation_no_false_boxing() {
             };
             return fn1() + x;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 25); // 15 + 10
 }
 
@@ -4106,18 +5163,22 @@ fn read_wasm_string(store: &Store<()>, memory: &Memory, ptr: i32) -> String {
 
 #[test]
 fn string_literal_returns_pointer() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello";
             return s;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello");
@@ -4125,25 +5186,30 @@ fn string_literal_returns_pointer() {
 
 #[test]
 fn string_length_property() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "world!";
             return s.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 6);
 }
 
 #[test]
 fn string_literal_deduplication() {
     // Same string literal used twice should return the same pointer
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = "same";
             let b: string = "same";
@@ -4152,13 +5218,16 @@ fn string_literal_deduplication() {
             }
             return 0;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // Same pointer means i32.eq returns 1
     assert_eq!(test.call(&mut store, ()).unwrap(), 1);
 }
@@ -4166,24 +5235,29 @@ fn string_literal_deduplication() {
 #[test]
 fn string_inferred_type() {
     // Type inference from string literal
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s = "inferred";
             return s.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 8); // "inferred".length == 8
 }
 
 #[test]
 fn string_as_function_parameter() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function getLength(s: string): i32 {
             return s.length;
         }
@@ -4191,47 +5265,58 @@ fn string_as_function_parameter() {
         export function test(): i32 {
             return getLength("hello world");
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 11);
 }
 
 #[test]
 fn string_empty_literal() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "";
             return s.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 0);
 }
 
 #[test]
 fn string_index_char_code() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "ABC";
             return s[0] + s[1] + s[2];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // 'A'=65, 'B'=66, 'C'=67 → 198
     assert_eq!(test.call(&mut store, ()).unwrap(), 198);
 }
@@ -4239,37 +5324,45 @@ fn string_index_char_code() {
 #[test]
 #[should_panic]
 fn string_index_out_of_bounds() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hi";
             return s[5];
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     test.call(&mut store, ()).unwrap(); // should trap
 }
 
 #[test]
 fn string_concat() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = "hello";
             let b: string = " world";
             let c: string = a + b;
             return c;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello world");
@@ -4277,18 +5370,22 @@ fn string_concat() {
 
 #[test]
 fn string_concat_chain() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let result: string = "a" + "b" + "c";
             return result;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "abc");
@@ -4296,7 +5393,8 @@ fn string_concat_chain() {
 
 #[test]
 fn string_equality() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = "hello";
             let b: string = "hello";
@@ -4309,20 +5407,24 @@ fn string_equality() {
             if (a != c) { neq = 1; }
             return eq1 * 100 + eq2 * 10 + neq;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // eq1=1, eq2=0, neq=1 → 101
     assert_eq!(test.call(&mut store, ()).unwrap(), 101);
 }
 
 #[test]
 fn string_comparison() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = "apple";
             let b: string = "banana";
@@ -4333,71 +5435,87 @@ fn string_comparison() {
             if (a >= a) { r = r + 1000; }
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 1111);
 }
 
 #[test]
 fn string_char_code_at() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "Hello";
             return s.charCodeAt(0) + s.charCodeAt(4);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // 'H'=72, 'o'=111 → 183
     assert_eq!(test.call(&mut store, ()).unwrap(), 183);
 }
 
 #[test]
 fn string_index_of_found() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             return s.indexOf("world");
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 6);
 }
 
 #[test]
 fn string_index_of_not_found() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             return s.indexOf("xyz");
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), -1);
 }
 
 #[test]
 fn string_includes() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "broadcast:attack";
             let r: i32 = 0;
@@ -4406,19 +5524,23 @@ fn string_includes() {
             if (s.includes("broadcast")) { r = r + 100; }
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 101);
 }
 
 #[test]
 fn string_starts_ends_with() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "cmd:attack:north";
             let r: i32 = 0;
@@ -4428,31 +5550,38 @@ fn string_starts_ends_with() {
             if (msg.endsWith("south")) { r = r + 1000; }
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 101);
 }
 
 #[test]
 fn string_slice_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             let sub: string = s.slice(0, 5);
             return sub;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello");
@@ -4460,19 +5589,23 @@ fn string_slice_basic() {
 
 #[test]
 fn string_slice_no_end() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             let sub: string = s.slice(6);
             return sub;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "world");
@@ -4480,19 +5613,23 @@ fn string_slice_no_end() {
 
 #[test]
 fn string_slice_negative() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             let sub: string = s.slice(-5);
             return sub;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "world");
@@ -4500,7 +5637,8 @@ fn string_slice_negative() {
 
 #[test]
 fn string_to_lower_upper() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function testLower(): i32 {
             let s: string = "Hello WORLD";
             return s.toLowerCase();
@@ -4509,37 +5647,46 @@ fn string_to_lower_upper() {
             let s: string = "Hello world";
             return s.toUpperCase();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
 
-    let test_lower = instance.get_typed_func::<(), i32>(&mut store, "testLower").unwrap();
+    let test_lower = instance
+        .get_typed_func::<(), i32>(&mut store, "testLower")
+        .unwrap();
     let ptr = test_lower.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello world");
 
-    let test_upper = instance.get_typed_func::<(), i32>(&mut store, "testUpper").unwrap();
+    let test_upper = instance
+        .get_typed_func::<(), i32>(&mut store, "testUpper")
+        .unwrap();
     let ptr = test_upper.call(&mut store, ()).unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "HELLO WORLD");
 }
 
 #[test]
 fn string_trim() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "  hello  ";
             return s.trim();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello");
@@ -4547,7 +5694,8 @@ fn string_trim() {
 
 #[test]
 fn string_trim_start_and_end() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test_start(): i32 {
             let s: string = "  hello  ";
             return s.trimStart();
@@ -4556,7 +5704,8 @@ fn string_trim_start_and_end() {
             let s: string = "  hello  ";
             return s.trimEnd();
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -4564,18 +5713,23 @@ fn string_trim_start_and_end() {
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
 
-    let ts = instance.get_typed_func::<(), i32>(&mut store, "test_start").unwrap();
+    let ts = instance
+        .get_typed_func::<(), i32>(&mut store, "test_start")
+        .unwrap();
     let p1 = ts.call(&mut store, ()).unwrap();
     assert_eq!(read_wasm_string(&store, &memory, p1), "hello  ");
 
-    let te = instance.get_typed_func::<(), i32>(&mut store, "test_end").unwrap();
+    let te = instance
+        .get_typed_func::<(), i32>(&mut store, "test_end")
+        .unwrap();
     let p2 = te.call(&mut store, ()).unwrap();
     assert_eq!(read_wasm_string(&store, &memory, p2), "  hello");
 }
 
 #[test]
 fn string_at_negative_index() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function last(): i32 {
             let s: string = "hello";
             return s.at(-1);
@@ -4588,53 +5742,68 @@ fn string_at_negative_index() {
             let s: string = "hello";
             return s.at(-2);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
 
-    let last = instance.get_typed_func::<(), i32>(&mut store, "last").unwrap();
+    let last = instance
+        .get_typed_func::<(), i32>(&mut store, "last")
+        .unwrap();
     assert_eq!(last.call(&mut store, ()).unwrap(), b'o' as i32);
-    let second = instance.get_typed_func::<(), i32>(&mut store, "second").unwrap();
+    let second = instance
+        .get_typed_func::<(), i32>(&mut store, "second")
+        .unwrap();
     assert_eq!(second.call(&mut store, ()).unwrap(), b'e' as i32);
-    let from_end = instance.get_typed_func::<(), i32>(&mut store, "from_end").unwrap();
+    let from_end = instance
+        .get_typed_func::<(), i32>(&mut store, "from_end")
+        .unwrap();
     assert_eq!(from_end.call(&mut store, ()).unwrap(), b'l' as i32);
 }
 
 #[test]
 fn string_code_point_at_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "ABC";
             return s.codePointAt(0);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), b'A' as i32);
 }
 
 #[test]
 fn string_chained_methods() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "  CMD:ATTACK  ";
             let cleaned: string = msg.trim().toLowerCase();
             return cleaned;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "cmd:attack");
@@ -4643,7 +5812,8 @@ fn string_chained_methods() {
 #[test]
 fn string_broadcast_pattern() {
     // Realistic game entity broadcast pattern
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function parseCommand(msg: string): i32 {
             if (msg.startsWith("attack:")) {
                 return 1;
@@ -4665,13 +5835,16 @@ fn string_broadcast_pattern() {
             r = r + parseCommand("unknown") * 1000;
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // attack=1, defend=20, move=300, unknown=0 → 321
     assert_eq!(test.call(&mut store, ()).unwrap(), 321);
 }
@@ -4679,7 +5852,8 @@ fn string_broadcast_pattern() {
 #[test]
 fn string_function_return_type() {
     // Function returning string — caller should be able to call .length on result
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function greet(name: string): string {
             return "hello " + name;
         }
@@ -4688,19 +5862,23 @@ fn string_function_return_type() {
             let msg: string = greet("world");
             return msg.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 11); // "hello world".length
 }
 
 #[test]
 fn string_class_field() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             name: string;
             hp: i32;
@@ -4711,20 +5889,24 @@ fn string_class_field() {
             let e: Entity = new Entity("warrior", 100);
             return e.name.length + e.hp;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // "warrior".length=7 + 100 = 107
     assert_eq!(test.call(&mut store, ()).unwrap(), 107);
 }
 
 #[test]
 fn string_class_field_operations() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             name: string;
             message: string;
@@ -4742,20 +5924,24 @@ fn string_class_field_operations() {
             }
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 11);
 }
 
 #[test]
 fn string_function_return_chain() {
     // Call .toUpperCase() directly on a function return value
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function getMessage(): string {
             return "hello";
         }
@@ -4764,13 +5950,16 @@ fn string_function_return_chain() {
             let upper: string = getMessage().toUpperCase();
             return upper;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "HELLO");
@@ -4782,18 +5971,22 @@ fn string_function_return_chain() {
 
 #[test]
 fn string_concat_with_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "score: " + 42;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "score: 42");
@@ -4801,18 +5994,22 @@ fn string_concat_with_i32() {
 
 #[test]
 fn string_concat_with_f64() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "value: " + 3.14;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "value: 3.14");
@@ -4820,18 +6017,22 @@ fn string_concat_with_f64() {
 
 #[test]
 fn string_concat_negative_i32() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "hp: " + -5;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hp: -5");
@@ -4840,19 +6041,23 @@ fn string_concat_negative_i32() {
 #[test]
 fn string_concat_i32_prefix() {
     // Number on the left
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let hp: i32 = 100;
             let msg: string = hp + " hp remaining";
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "100 hp remaining");
@@ -4864,19 +6069,23 @@ fn string_concat_i32_prefix() {
 
 #[test]
 fn template_literal_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let name: string = "world";
             let msg: string = `hello ${name}!`;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello world!");
@@ -4884,19 +6093,23 @@ fn template_literal_basic() {
 
 #[test]
 fn template_literal_with_number() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let hp: i32 = 42;
             let msg: string = `HP: ${hp}`;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "HP: 42");
@@ -4904,20 +6117,24 @@ fn template_literal_with_number() {
 
 #[test]
 fn template_literal_multiple_expressions() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let x: i32 = 10;
             let y: i32 = 20;
             let msg: string = `pos(${x}, ${y})`;
             return msg;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "pos(10, 20)");
@@ -4929,25 +6146,30 @@ fn template_literal_multiple_expressions() {
 
 #[test]
 fn string_split_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "attack:north";
             let parts: Array<i32> = msg.split(":");
             return parts.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 2);
 }
 
 #[test]
 fn string_split_content() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let msg: string = "attack:north";
             let parts: Array<i32> = msg.split(":");
@@ -4955,32 +6177,39 @@ fn string_split_content() {
             let dir: string = parts[1];
             return cmd.length * 100 + dir.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // "attack".length=6, "north".length=5 → 605
     assert_eq!(test.call(&mut store, ()).unwrap(), 605);
 }
 
 #[test]
 fn string_split_multiple() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let csv: string = "a,b,c,d";
             let parts: Array<i32> = csv.split(",");
             return parts.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 4);
 }
 
@@ -4990,19 +6219,23 @@ fn string_split_multiple() {
 
 #[test]
 fn string_replace_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             let r: string = s.replace("world", "there");
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hello there");
@@ -5010,19 +6243,23 @@ fn string_replace_basic() {
 
 #[test]
 fn string_replace_not_found() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello";
             let r: string = s.replace("xyz", "abc");
             return r.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 5); // unchanged
 }
 
@@ -5032,33 +6269,41 @@ fn string_replace_not_found() {
 
 #[test]
 fn string_parse_int() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             return parseInt("42") + parseInt("-7") + parseInt("  100  ");
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 135); // 42 + (-7) + 100
 }
 
 #[test]
 fn string_parse_float() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             return parseFloat("3.14") + parseFloat("-0.5");
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     let result = test.call(&mut store, ()).unwrap();
     assert!((result - 2.64).abs() < 1e-10);
 }
@@ -5069,19 +6314,23 @@ fn string_parse_float() {
 
 #[test]
 fn string_from_char_code() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let a: string = String.fromCharCode(65);
             let b: string = String.fromCharCode(66);
             return (a + b);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "AB");
@@ -5089,18 +6338,22 @@ fn string_from_char_code() {
 
 #[test]
 fn string_repeat() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "ab".repeat(3);
             return s;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "ababab");
@@ -5108,18 +6361,22 @@ fn string_repeat() {
 
 #[test]
 fn string_pad_start() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "42".padStart(5, "0");
             return s;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "00042");
@@ -5127,18 +6384,22 @@ fn string_pad_start() {
 
 #[test]
 fn string_pad_end() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hi".padEnd(5, "!");
             return s;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "hi!!!");
@@ -5150,7 +6411,8 @@ fn string_pad_end() {
 
 #[test]
 fn string_broadcast_parse_with_split() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         function handleBroadcast(msg: string): i32 {
             let parts: Array<i32> = msg.split(":");
             let cmd: string = parts[0];
@@ -5172,13 +6434,16 @@ fn string_broadcast_parse_with_split() {
             r = r + handleBroadcast("unknown:0");
             return r;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // damage:50 → 50, heal:20 → -20, unknown → 0 → total = 30
     assert_eq!(test.call(&mut store, ()).unwrap(), 30);
 }
@@ -5243,16 +6508,27 @@ fn debug_name_section_present() {
 
 #[test]
 fn debug_dwarf_sections_present() {
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function tick(me: i32): void {
             let x: i32 = 42;
         }
-    "#);
+    "#,
+    );
     let sections = find_custom_sections(&wasm);
     let section_names: Vec<&str> = sections.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(section_names.contains(&".debug_abbrev"), "missing .debug_abbrev, found: {section_names:?}");
-    assert!(section_names.contains(&".debug_info"), "missing .debug_info, found: {section_names:?}");
-    assert!(section_names.contains(&".debug_line"), "missing .debug_line, found: {section_names:?}");
+    assert!(
+        section_names.contains(&".debug_abbrev"),
+        "missing .debug_abbrev, found: {section_names:?}"
+    );
+    assert!(
+        section_names.contains(&".debug_info"),
+        "missing .debug_info, found: {section_names:?}"
+    );
+    assert!(
+        section_names.contains(&".debug_line"),
+        "missing .debug_line, found: {section_names:?}"
+    );
 }
 
 #[test]
@@ -5261,29 +6537,37 @@ fn debug_dwarf_not_present_without_flag() {
     let wasm = compile("export function tick(me: i32): void {}");
     let sections = find_custom_sections(&wasm);
     let section_names: Vec<&str> = sections.iter().map(|(n, _)| n.as_str()).collect();
-    assert!(!section_names.contains(&".debug_line"), "DWARF should not be present without debug flag");
+    assert!(
+        !section_names.contains(&".debug_line"),
+        "DWARF should not be present without debug flag"
+    );
 }
 
 #[test]
 fn debug_name_section_contains_function_names() {
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function tick(me: i32): void {}
         function helper(x: i32): i32 { return x; }
-    "#);
+    "#,
+    );
     // The name section should contain our function names
     // Just verify the binary is valid and loadable
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 0).unwrap();
 }
 
 #[test]
 fn debug_wasm_valid_with_dwarf() {
     // Compile a non-trivial script with debug info and verify wasmtime accepts it
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         declare function get_hp(id: i32): i32;
         declare function set_action(me: i32, kind: i32, target: i32, dx: f64, dy: f64): void;
 
@@ -5297,7 +6581,8 @@ fn debug_wasm_valid_with_dwarf() {
                 set_action(me, 0, 0, dx, dy);
             }
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -5307,7 +6592,9 @@ fn debug_wasm_valid_with_dwarf() {
     let set_action = Func::wrap(&mut store, |_: i32, _: i32, _: i32, _: f64, _: f64| {});
 
     let instance = Instance::new(&mut store, &module, &[get_hp.into(), set_action.into()]).unwrap();
-    let tick = instance.get_typed_func::<i32, ()>(&mut store, "tick").unwrap();
+    let tick = instance
+        .get_typed_func::<i32, ()>(&mut store, "tick")
+        .unwrap();
     tick.call(&mut store, 1).unwrap();
 }
 
@@ -5333,7 +6620,9 @@ fn debug_trap_contains_source_location() {
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
 
     let err = test.call(&mut store, ()).unwrap_err();
     let msg = format!("{err:?}");
@@ -5348,7 +6637,8 @@ fn debug_trap_contains_source_location() {
 #[test]
 fn debug_multifunction_source_mapping() {
     // Multiple functions with debug info — verify the module loads and runs correctly
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         function add(a: i32, b: i32): i32 {
             return a + b;
         }
@@ -5362,69 +6652,97 @@ fn debug_multifunction_source_mapping() {
             let product: i32 = multiply(sum, 2);
             return product;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 14); // (3+4)*2
 }
 
 #[test]
 fn debug_debug_line_has_filename() {
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function tick(me: i32): void {
             let x: i32 = 42;
         }
-    "#);
+    "#,
+    );
     let sections = find_custom_sections(&wasm);
-    let debug_line = sections.iter().find(|(name, _)| name == ".debug_line").unwrap();
+    let debug_line = sections
+        .iter()
+        .find(|(name, _)| name == ".debug_line")
+        .unwrap();
     // The .debug_line section should contain our filename as bytes
     let filename_bytes = b"test.ts";
-    let contains_filename = debug_line.1.windows(filename_bytes.len())
+    let contains_filename = debug_line
+        .1
+        .windows(filename_bytes.len())
         .any(|window| window == filename_bytes);
-    assert!(contains_filename, ".debug_line should contain the filename 'test.ts'");
+    assert!(
+        contains_filename,
+        ".debug_line should contain the filename 'test.ts'"
+    );
 }
 
 #[test]
 fn debug_info_has_filename() {
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function tick(me: i32): void {}
-    "#);
+    "#,
+    );
     let sections = find_custom_sections(&wasm);
-    let debug_info = sections.iter().find(|(name, _)| name == ".debug_info").unwrap();
+    let debug_info = sections
+        .iter()
+        .find(|(name, _)| name == ".debug_info")
+        .unwrap();
     // The .debug_info section should contain our filename
     let filename_bytes = b"test.ts";
-    let contains_filename = debug_info.1.windows(filename_bytes.len())
+    let contains_filename = debug_info
+        .1
+        .windows(filename_bytes.len())
         .any(|window| window == filename_bytes);
-    assert!(contains_filename, ".debug_info should contain the filename 'test.ts'");
+    assert!(
+        contains_filename,
+        ".debug_info should contain the filename 'test.ts'"
+    );
 }
 
 #[test]
 fn debug_closure_has_source_mapping() {
     // Closures (lifted arrow functions) should have debug info
     // Verify the module with closures + debug compiles and runs correctly
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function test(): i32 {
             let add: (a: i32) => i32 = (a: i32): i32 => a + 10;
             return add(5);
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn debug_array_filter_has_source_mapping() {
     // Inlined array builtins should have source mapping
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function test(): i32 {
             let arr: Array<i32> = new Array<i32>(0);
             arr.push(1);
@@ -5434,33 +6752,43 @@ fn debug_array_filter_has_source_mapping() {
             let evens: Array<i32> = arr.filter((x: i32): bool => x > 2);
             return evens.length;
         }
-    "#);
+    "#,
+    );
 
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 2);
 }
 
 #[test]
 fn debug_closure_named_in_name_section() {
     // Closures should appear as closure$N in the name section
-    let wasm = compile_debug(r#"
+    let wasm = compile_debug(
+        r#"
         export function test(): i32 {
             let inc: (a: i32) => i32 = (a: i32): i32 => a + 1;
             return inc(41);
         }
-    "#);
+    "#,
+    );
 
     // The name section should contain "closure$0"
     let sections = find_custom_sections(&wasm);
     let name_section = sections.iter().find(|(name, _)| name == "name").unwrap();
     let closure_name = b"closure$0";
-    let contains_closure_name = name_section.1.windows(closure_name.len())
+    let contains_closure_name = name_section
+        .1
+        .windows(closure_name.len())
         .any(|window| window == closure_name);
-    assert!(contains_closure_name, "name section should contain 'closure$0'");
+    assert!(
+        contains_closure_name,
+        "name section should contain 'closure$0'"
+    );
 }
 
 #[test]
@@ -5469,7 +6797,10 @@ fn debug_name_section_present_without_debug_flag() {
     let wasm = compile("export function tick(me: i32): void {}");
     let sections = find_custom_sections(&wasm);
     let name_section = sections.iter().find(|(name, _)| name == "name");
-    assert!(name_section.is_some(), "name section should always be present");
+    assert!(
+        name_section.is_some(),
+        "name section should always be present"
+    );
 }
 
 // ─── Inheritance tests ───────────────────────────────────────────────────────
@@ -5477,7 +6808,8 @@ fn debug_name_section_present_without_debug_flag() {
 #[test]
 fn inherit_basic_field_access() {
     // Child inherits parent fields, accessible on child instance
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -5492,19 +6824,23 @@ fn inherit_basic_field_access() {
             const w: Warrior = new Warrior(100, 50);
             return w.hp;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 100);
 }
 
 #[test]
 fn inherit_child_own_field() {
     // Child's own field is accessible and correctly offset
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -5519,19 +6855,23 @@ fn inherit_child_own_field() {
             const w: Warrior = new Warrior(100, 50);
             return w.rage;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 50);
 }
 
 #[test]
 fn inherit_method_from_parent() {
     // Child calls a method inherited from parent without overriding
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -5544,19 +6884,23 @@ fn inherit_method_from_parent() {
             const w: Warrior = new Warrior(42);
             return w.getHp();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 42);
 }
 
 #[test]
 fn inherit_method_override() {
     // Child overrides parent method; child instance calls child's version
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 1; }
@@ -5569,19 +6913,23 @@ fn inherit_method_override() {
             const w: Warrior = new Warrior();
             return w.id();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 2);
 }
 
 #[test]
 fn inherit_polymorphic_dispatch() {
     // Variable typed as parent holds child instance; method call dispatches to child's override
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 1; }
@@ -5594,19 +6942,23 @@ fn inherit_polymorphic_dispatch() {
             const e: Entity = new Warrior();
             return e.id();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 2);
 }
 
 #[test]
 fn inherit_super_constructor() {
     // super(args) correctly initializes parent fields
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             mp: i32;
@@ -5622,19 +6974,23 @@ fn inherit_super_constructor() {
             const w: Warrior = new Warrior(100, 50, 30);
             return w.hp + w.mp + w.rage;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 180);
 }
 
 #[test]
 fn inherit_super_method_call() {
     // super.method() calls parent's version, not child's
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             value(): i32 { return 10; }
@@ -5647,19 +7003,23 @@ fn inherit_super_method_call() {
             const w: Warrior = new Warrior();
             return w.value();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn inherit_multi_level() {
     // Three-level hierarchy: A -> B -> C
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class A {
             x: i32;
             constructor(x: i32) {}
@@ -5677,19 +7037,23 @@ fn inherit_multi_level() {
             const c: C = new C(1, 2, 3);
             return c.x + c.y + c.z + c.getX();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 7); // 1+2+3+1
 }
 
 #[test]
 fn inherit_multiple_subclasses() {
     // Multiple subclasses with polymorphic dispatch
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 0; }
@@ -5708,19 +7072,23 @@ fn inherit_multiple_subclasses() {
             const e3: Entity = new Entity();
             return e1.id() * 100 + e2.id() * 10 + e3.id();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 120); // 1*100 + 2*10 + 0
 }
 
 #[test]
 fn inherit_mixed_with_non_inherited_class() {
     // Non-inherited class in same module keeps static dispatch; inherited class uses vtable
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Vec2 {
             x: f64;
             y: f64;
@@ -5741,19 +7109,23 @@ fn inherit_mixed_with_non_inherited_class() {
             const e: Entity = new Warrior(50);
             return i32(v.len()) + e.getHp();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 67); // 7 + 60
 }
 
 #[test]
 fn inherit_f64_field_alignment() {
     // f64 field after vtable pointer (4 bytes) needs 8-byte alignment padding
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             x: f64;
             y: f64;
@@ -5767,19 +7139,23 @@ fn inherit_f64_field_alignment() {
             const p: Projectile = new Projectile(1.5, 2.5, 10.0);
             return p.x + p.y + p.speed;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), f64>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), f64>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 14.0);
 }
 
 #[test]
 fn inherit_polymorphic_in_foreach() {
     // Polymorphic dispatch through array forEach
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 0; }
@@ -5805,17 +7181,26 @@ fn inherit_polymorphic_in_foreach() {
             });
             report(total);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let result = Cell::new(0i32);
     let mut store = Store::new(&engine, &result);
     let mut linker = Linker::new(&engine);
-    linker.func_wrap("host", "report", |caller: Caller<'_, &Cell<i32>>, v: i32| {
-        caller.data().set(v);
-    }).unwrap();
+    linker
+        .func_wrap(
+            "host",
+            "report",
+            |caller: Caller<'_, &Cell<i32>>, v: i32| {
+                caller.data().set(v);
+            },
+        )
+        .unwrap();
     let instance = linker.instantiate(&mut store, &module).unwrap();
-    let run = instance.get_typed_func::<(), ()>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), ()>(&mut store, "run")
+        .unwrap();
     run.call(&mut store, ()).unwrap();
     assert_eq!(result.get(), 3); // 0 + 1 + 2
 }
@@ -5823,7 +7208,8 @@ fn inherit_polymorphic_in_foreach() {
 #[test]
 fn inherit_class_as_function_param() {
     // Inherited class passed as parent-typed function parameter, polymorphic dispatch works
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 0; }
@@ -5839,19 +7225,23 @@ fn inherit_class_as_function_param() {
             const w: Warrior = new Warrior();
             return getId(w);
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 42);
 }
 
 #[test]
 fn inherit_downcast_field_access() {
     // Downcast via `as` to access child-specific fields
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -5864,19 +7254,23 @@ fn inherit_downcast_field_access() {
             const e: Entity = new Warrior(100, 77);
             return (e as Warrior).rage;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 77);
 }
 
 #[test]
 fn inherit_downcast_method_call() {
     // Downcast via `as` to call child-specific method
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 0; }
@@ -5890,19 +7284,23 @@ fn inherit_downcast_method_call() {
             const e: Entity = new Warrior();
             return (e as Warrior).battleCry();
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 999);
 }
 
 #[test]
 fn inherit_missing_super_error() {
     // Child constructor without super() should be a compile error
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -5911,16 +7309,22 @@ fn inherit_missing_super_error() {
             constructor(hp: i32) {}
         }
         export function run(): i32 { return 0; }
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("does not call super()"), "error: {err}");
+    assert!(
+        err.to_string().contains("does not call super()"),
+        "error: {err}"
+    );
 }
 
 #[test]
 fn inherit_override_signature_mismatch_error() {
     // Override with different param types should be a compile error
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         class Entity {
             constructor() {}
             update(dt: f64): void {}
@@ -5930,16 +7334,22 @@ fn inherit_override_signature_mismatch_error() {
             update(dt: i32): void {}
         }
         export function run(): void {}
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("different parameter types"), "error: {err}");
+    assert!(
+        err.to_string().contains("different parameter types"),
+        "error: {err}"
+    );
 }
 
 #[test]
 fn inherit_override_return_type_mismatch_error() {
     // Override with different return type should be a compile error
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         class Entity {
             constructor() {}
             id(): i32 { return 0; }
@@ -5949,16 +7359,22 @@ fn inherit_override_return_type_mismatch_error() {
             id(): f64 { return 0.0; }
         }
         export function run(): void {}
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("different return type"), "error: {err}");
+    assert!(
+        err.to_string().contains("different return type"),
+        "error: {err}"
+    );
 }
 
 #[test]
 fn inherit_parent_no_constructor() {
     // Parent without constructor, child calls super() as no-op
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
         }
@@ -5970,19 +7386,23 @@ fn inherit_parent_no_constructor() {
             const w: Warrior = new Warrior(50);
             return w.rage;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 50);
 }
 
 #[test]
 fn inherit_invalid_cast_error() {
     // Cast between unrelated classes should be a compile error
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         class Foo {
             x: i32;
             constructor(x: i32) {}
@@ -5995,15 +7415,22 @@ fn inherit_invalid_cast_error() {
             const f: Foo = new Foo(1);
             return (f as Bar).y;
         }
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("not in the same inheritance hierarchy"), "error: {err}");
+    assert!(
+        err.to_string()
+            .contains("not in the same inheritance hierarchy"),
+        "error: {err}"
+    );
 }
 
 #[test]
 fn global_let_i32_read_write() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         let counter: i32 = 10;
 
         export function bump(): i32 {
@@ -6014,13 +7441,18 @@ fn global_let_i32_read_write() {
         export function get(): i32 {
             return counter;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let bump = instance.get_typed_func::<(), i32>(&mut store, "bump").unwrap();
-    let get = instance.get_typed_func::<(), i32>(&mut store, "get").unwrap();
+    let bump = instance
+        .get_typed_func::<(), i32>(&mut store, "bump")
+        .unwrap();
+    let get = instance
+        .get_typed_func::<(), i32>(&mut store, "get")
+        .unwrap();
     assert_eq!(get.call(&mut store, ()).unwrap(), 10);
     assert_eq!(bump.call(&mut store, ()).unwrap(), 11);
     assert_eq!(bump.call(&mut store, ()).unwrap(), 12);
@@ -6029,7 +7461,8 @@ fn global_let_i32_read_write() {
 
 #[test]
 fn global_let_f64_compound_and_prefix_update() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         let score: f64 = 0.0;
         let hits: i32 = 0;
 
@@ -6042,13 +7475,18 @@ fn global_let_f64_compound_and_prefix_update() {
         export function get_hits(): i32 {
             return hits;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let score_hit = instance.get_typed_func::<f64, f64>(&mut store, "score_hit").unwrap();
-    let get_hits = instance.get_typed_func::<(), i32>(&mut store, "get_hits").unwrap();
+    let score_hit = instance
+        .get_typed_func::<f64, f64>(&mut store, "score_hit")
+        .unwrap();
+    let get_hits = instance
+        .get_typed_func::<(), i32>(&mut store, "get_hits")
+        .unwrap();
     assert!((score_hit.call(&mut store, 1.5).unwrap() - 1.5).abs() < 1e-10);
     assert!((score_hit.call(&mut store, 2.5).unwrap() - 4.0).abs() < 1e-10);
     assert_eq!(get_hits.call(&mut store, ()).unwrap(), 2);
@@ -6057,17 +7495,23 @@ fn global_let_f64_compound_and_prefix_update() {
 #[test]
 fn global_let_default_initialized_to_zero() {
     // `let` without an initializer defaults to 0 / 0.0 (same as const behavior).
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         let n: i32;
         export function set_n(x: i32): void { n = x; }
         export function get_n(): i32 { return n; }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let get_n = instance.get_typed_func::<(), i32>(&mut store, "get_n").unwrap();
-    let set_n = instance.get_typed_func::<i32, ()>(&mut store, "set_n").unwrap();
+    let get_n = instance
+        .get_typed_func::<(), i32>(&mut store, "get_n")
+        .unwrap();
+    let set_n = instance
+        .get_typed_func::<i32, ()>(&mut store, "set_n")
+        .unwrap();
     assert_eq!(get_n.call(&mut store, ()).unwrap(), 0);
     set_n.call(&mut store, 99).unwrap();
     assert_eq!(get_n.call(&mut store, ()).unwrap(), 99);
@@ -6075,10 +7519,13 @@ fn global_let_default_initialized_to_zero() {
 
 #[test]
 fn global_const_assignment_is_rejected() {
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         const fixed: i32 = 7;
         export function go(): void { fixed = 8; }
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("const global"), "error: {err}");
@@ -6086,18 +7533,22 @@ fn global_const_assignment_is_rejected() {
 
 #[test]
 fn undefined_keyword_compiles_like_null() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity { hp: i32; constructor(hp: i32) {} }
         export function pick(which: i32): i32 {
             const e: Entity = which > 0 ? new Entity(7) : undefined;
             return e === undefined ? -1 : e.hp;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let pick = instance.get_typed_func::<i32, i32>(&mut store, "pick").unwrap();
+    let pick = instance
+        .get_typed_func::<i32, i32>(&mut store, "pick")
+        .unwrap();
     assert_eq!(pick.call(&mut store, 1).unwrap(), 7);
     assert_eq!(pick.call(&mut store, 0).unwrap(), -1);
 }
@@ -6105,7 +7556,8 @@ fn undefined_keyword_compiles_like_null() {
 #[test]
 fn array_shorthand_type_syntax() {
     // T[] should be equivalent to Array<T>
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function sum(): i32 {
             const xs: i32[] = new Array<i32>(4);
             xs.push(1);
@@ -6115,42 +7567,62 @@ fn array_shorthand_type_syntax() {
             for (const x of xs) { s += x; }
             return s;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let sum = instance.get_typed_func::<(), i32>(&mut store, "sum").unwrap();
+    let sum = instance
+        .get_typed_func::<(), i32>(&mut store, "sum")
+        .unwrap();
     assert_eq!(sum.call(&mut store, ()).unwrap(), 6);
 }
 
 #[test]
 fn strict_equality_compiles_identically_to_loose() {
     // In our typed subset, === and == are the same: strict, typed equality.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function loose(a: i32, b: i32): i32 { return a == b ? 1 : 0; }
         export function strict(a: i32, b: i32): i32 { return a === b ? 1 : 0; }
         export function loose_neq(a: i32, b: i32): i32 { return a != b ? 1 : 0; }
         export function strict_neq(a: i32, b: i32): i32 { return a !== b ? 1 : 0; }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let loose = instance.get_typed_func::<(i32, i32), i32>(&mut store, "loose").unwrap();
-    let strict = instance.get_typed_func::<(i32, i32), i32>(&mut store, "strict").unwrap();
-    let loose_neq = instance.get_typed_func::<(i32, i32), i32>(&mut store, "loose_neq").unwrap();
-    let strict_neq = instance.get_typed_func::<(i32, i32), i32>(&mut store, "strict_neq").unwrap();
+    let loose = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "loose")
+        .unwrap();
+    let strict = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "strict")
+        .unwrap();
+    let loose_neq = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "loose_neq")
+        .unwrap();
+    let strict_neq = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "strict_neq")
+        .unwrap();
     for (a, b) in &[(1, 1), (1, 2), (5, 5), (0, 0)] {
-        assert_eq!(loose.call(&mut store, (*a, *b)).unwrap(), strict.call(&mut store, (*a, *b)).unwrap());
-        assert_eq!(loose_neq.call(&mut store, (*a, *b)).unwrap(), strict_neq.call(&mut store, (*a, *b)).unwrap());
+        assert_eq!(
+            loose.call(&mut store, (*a, *b)).unwrap(),
+            strict.call(&mut store, (*a, *b)).unwrap()
+        );
+        assert_eq!(
+            loose_neq.call(&mut store, (*a, *b)).unwrap(),
+            strict_neq.call(&mut store, (*a, *b)).unwrap()
+        );
     }
 }
 
 #[test]
 fn string_equality_uses_content_not_pointer() {
     // Two strings constructed via concat should compare equal by content.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function same(): i32 {
             const a: string = "hel" + "lo";
             const b: string = "hello";
@@ -6161,20 +7633,26 @@ fn string_equality_uses_content_not_pointer() {
             const b: string = "bar";
             return a === b ? 1 : 0;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let same = instance.get_typed_func::<(), i32>(&mut store, "same").unwrap();
-    let diff = instance.get_typed_func::<(), i32>(&mut store, "diff").unwrap();
+    let same = instance
+        .get_typed_func::<(), i32>(&mut store, "same")
+        .unwrap();
+    let diff = instance
+        .get_typed_func::<(), i32>(&mut store, "diff")
+        .unwrap();
     assert_eq!(same.call(&mut store, ()).unwrap(), 1);
     assert_eq!(diff.call(&mut store, ()).unwrap(), 0);
 }
 
 #[test]
 fn ternary_with_class_result() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Foo { x: i32; constructor(x: i32) {} }
         export function pick(which: i32): i32 {
             const a: Foo = new Foo(10);
@@ -6182,19 +7660,23 @@ fn ternary_with_class_result() {
             const chosen: Foo = which > 0 ? a : b;
             return chosen.x;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let pick = instance.get_typed_func::<i32, i32>(&mut store, "pick").unwrap();
+    let pick = instance
+        .get_typed_func::<i32, i32>(&mut store, "pick")
+        .unwrap();
     assert_eq!(pick.call(&mut store, 1).unwrap(), 10);
     assert_eq!(pick.call(&mut store, 0).unwrap(), 20);
 }
 
 #[test]
 fn optional_method_call_non_null_dispatches() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Entity {
             hp: i32;
             constructor(hp: i32) {}
@@ -6204,12 +7686,15 @@ fn optional_method_call_non_null_dispatches() {
             const e: Entity = which > 0 ? new Entity(42) : (null as Entity);
             return e?.getHp() ?? -1;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let get = instance.get_typed_func::<i32, i32>(&mut store, "get").unwrap();
+    let get = instance
+        .get_typed_func::<i32, i32>(&mut store, "get")
+        .unwrap();
     assert_eq!(get.call(&mut store, 1).unwrap(), 42);
     assert_eq!(get.call(&mut store, 0).unwrap(), -1);
 }
@@ -6217,7 +7702,8 @@ fn optional_method_call_non_null_dispatches() {
 #[test]
 fn optional_method_call_polymorphic() {
     // Optional call should work through vtable dispatch too.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Shape {
             kind: i32;
             constructor(k: i32) { this.kind = k; }
@@ -6236,13 +7722,18 @@ fn optional_method_call_polymorphic() {
             const s: Shape = null as Shape;
             return s?.area() ?? -1;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let with_square = instance.get_typed_func::<(), i32>(&mut store, "with_square").unwrap();
-    let with_null = instance.get_typed_func::<(), i32>(&mut store, "with_null").unwrap();
+    let with_square = instance
+        .get_typed_func::<(), i32>(&mut store, "with_square")
+        .unwrap();
+    let with_null = instance
+        .get_typed_func::<(), i32>(&mut store, "with_null")
+        .unwrap();
     assert_eq!(with_square.call(&mut store, ()).unwrap(), 16);
     assert_eq!(with_null.call(&mut store, ()).unwrap(), -1);
 }
@@ -6250,7 +7741,8 @@ fn optional_method_call_polymorphic() {
 #[test]
 fn super_method_call_inside_arrow_closure() {
     // Use super.method() from within an arrow body inside a method.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class A {
             constructor() {}
             base(): i32 { return 10; }
@@ -6267,19 +7759,23 @@ fn super_method_call_inside_arrow_closure() {
             const b: B = new B();
             return b.combined();
         }
-    "#, );
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     // Expected: (1 + 10) + (2 + 10) + (3 + 10) = 36
     assert_eq!(run.call(&mut store, ()).unwrap(), 36);
 }
 
 #[test]
 fn nested_object_destructuring() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         class Pos { x: i32; y: i32; constructor(x: i32, y: i32) { this.x = x; this.y = y; } }
         class Ent { pos: Pos; hp: i32; constructor(p: Pos, h: i32) { this.pos = p; this.hp = h; } }
         export function run(): i32 {
@@ -6288,12 +7784,15 @@ fn nested_object_destructuring() {
             const { x, y } = pos;
             return x + y + hp;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let run = instance.get_typed_func::<(), i32>(&mut store, "run").unwrap();
+    let run = instance
+        .get_typed_func::<(), i32>(&mut store, "run")
+        .unwrap();
     assert_eq!(run.call(&mut store, ()).unwrap(), 14);
 }
 
@@ -6306,18 +7805,24 @@ fn arena_grow_handles_large_allocation() {
         memory_pages: 1,
         ..Default::default()
     };
-    let wasm = tscc::compile(r#"
+    let wasm = tscc::compile(
+        r#"
         export function go(): i32 {
             const arr: Array<i32> = new Array<i32>(50000);
             arr.push(42);
             return arr.length;
         }
-    "#, &opts).unwrap();
+    "#,
+        &opts,
+    )
+    .unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let go = instance.get_typed_func::<(), i32>(&mut store, "go").unwrap();
+    let go = instance
+        .get_typed_func::<(), i32>(&mut store, "go")
+        .unwrap();
     assert_eq!(go.call(&mut store, ()).unwrap(), 1);
 }
 
@@ -6330,25 +7835,37 @@ fn arena_grow_traps_when_host_refuses_growth() {
         memory_pages: 1,
         ..Default::default()
     };
-    let wasm = tscc::compile(r#"
+    let wasm = tscc::compile(
+        r#"
         export function go(): i32 {
             const arr: Array<i32> = new Array<i32>(50000);
             arr.push(1);
             return arr.length;
         }
-    "#, &opts).unwrap();
+    "#,
+        &opts,
+    )
+    .unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
-    let mut store = Store::new(&engine, wasmtime::StoreLimitsBuilder::new()
-        .memory_size(64 * 1024) // exactly 1 page — script needs more
-        .build());
+    let mut store = Store::new(
+        &engine,
+        wasmtime::StoreLimitsBuilder::new()
+            .memory_size(64 * 1024) // exactly 1 page — script needs more
+            .build(),
+    );
     store.limiter(|lim| lim);
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let go = instance.get_typed_func::<(), i32>(&mut store, "go").unwrap();
+    let go = instance
+        .get_typed_func::<(), i32>(&mut store, "go")
+        .unwrap();
     let err = go.call(&mut store, ()).unwrap_err();
     let trap = err.downcast_ref::<wasmtime::Trap>().copied();
-    assert_eq!(trap, Some(wasmtime::Trap::UnreachableCodeReached),
-        "expected UnreachableCodeReached trap, got: {err:?}");
+    assert_eq!(
+        trap,
+        Some(wasmtime::Trap::UnreachableCodeReached),
+        "expected UnreachableCodeReached trap, got: {err:?}"
+    );
 }
 
 #[test]
@@ -6359,65 +7876,83 @@ fn arena_trap_mode_traps_when_memory_exceeded() {
         memory_pages: 1,
         ..Default::default()
     };
-    let wasm = tscc::compile(r#"
+    let wasm = tscc::compile(
+        r#"
         export function go(): i32 {
             const arr: Array<i32> = new Array<i32>(50000);
             arr.push(1);
             return arr.length;
         }
-    "#, &opts).unwrap();
+    "#,
+        &opts,
+    )
+    .unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let go = instance.get_typed_func::<(), i32>(&mut store, "go").unwrap();
+    let go = instance
+        .get_typed_func::<(), i32>(&mut store, "go")
+        .unwrap();
     let err = go.call(&mut store, ()).unwrap_err();
     let trap = err.downcast_ref::<wasmtime::Trap>().copied();
-    assert_eq!(trap, Some(wasmtime::Trap::UnreachableCodeReached),
-        "expected UnreachableCodeReached trap, got: {err:?}");
+    assert_eq!(
+        trap,
+        Some(wasmtime::Trap::UnreachableCodeReached),
+        "expected UnreachableCodeReached trap, got: {err:?}"
+    );
 }
 
 #[test]
 fn array_destructuring_rest_basic() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             const src: Array<i32> = new Array<i32>(5);
             src.push(10); src.push(20); src.push(30); src.push(40); src.push(50);
             const [first, second, ...rest] = src;
             return first + second + rest.length + rest[0] + rest[2];
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // 10 + 20 + 3 (rest length) + 30 (rest[0]) + 50 (rest[2]) = 113
     assert_eq!(test.call(&mut store, ()).unwrap(), 113);
 }
 
 #[test]
 fn array_destructuring_rest_empty_when_source_short() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             const src: Array<i32> = new Array<i32>(2);
             src.push(7); src.push(8);
             const [a, b, ...rest] = src;
             return a + b + rest.length;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // rest is empty — length 0
     assert_eq!(test.call(&mut store, ()).unwrap(), 15);
 }
 
 #[test]
 fn array_destructuring_rest_f64_elements() {
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): f64 {
             const src: Array<f64> = new Array<f64>(4);
             src.push(1.5); src.push(2.5); src.push(3.5); src.push(4.5);
@@ -6428,12 +7963,15 @@ fn array_destructuring_rest_f64_elements() {
             }
             return sum;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), f64>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), f64>(&mut store, "test")
+        .unwrap();
     // 1.5 + 2.5 + 3.5 + 4.5 = 12.0
     assert_eq!(test.call(&mut store, ()).unwrap(), 12.0);
 }
@@ -6441,26 +7979,31 @@ fn array_destructuring_rest_f64_elements() {
 #[test]
 fn array_destructuring_rest_only() {
     // `const [...all] = src` — rest with no prefix; should copy entire source.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             const src: Array<i32> = new Array<i32>(3);
             src.push(100); src.push(200); src.push(300);
             const [...all] = src;
             return all.length + all[0] + all[1] + all[2];
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 3 + 100 + 200 + 300);
 }
 
 #[test]
 fn array_destructuring_rest_does_not_alias_source() {
     // Mutating rest must not affect the original array.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             const src: Array<i32> = new Array<i32>(4);
             src.push(1); src.push(2); src.push(3); src.push(4);
@@ -6468,12 +8011,15 @@ fn array_destructuring_rest_does_not_alias_source() {
             rest[0] = 999;
             return src[1] + rest[0] + head;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // src[1] still 2, rest[0] now 999, head is 1
     assert_eq!(test.call(&mut store, ()).unwrap(), 2 + 999 + 1);
 }
@@ -6484,7 +8030,8 @@ fn template_concat_fusion_produces_correct_result() {
     // fused path (one arena-alloc + memcpy per piece, rather than N-1 __str_concat
     // calls). This exercises the multi-piece fusion with static quasis and
     // i32/f64 interpolated expressions.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let x: i32 = 42;
             let y: f64 = 3.5;
@@ -6492,12 +8039,15 @@ fn template_concat_fusion_produces_correct_result() {
             let s: string = `hi ${name}, x=${x}, y=${y}!`;
             return s.length;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     // "hi world, x=42, y=3.5!" = 22 chars
     let len = test.call(&mut store, ()).unwrap();
     assert_eq!(len, 22, "fused template length mismatch");
@@ -6507,41 +8057,51 @@ fn template_concat_fusion_produces_correct_result() {
 fn plus_chain_fusion_omits_str_concat_helper() {
     // After fusion, `+`-chained string concatenation should NOT emit any call to
     // the __str_concat helper — the helper body shouldn't even be registered.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = "a" + "b" + "c" + "d" + "e";
             return s.length;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let len = test.call(&mut store, ()).unwrap();
     assert_eq!(len, 5);
 
     // And the helper name shouldn't appear in the emitted module at all.
     let s = String::from_utf8_lossy(&wasm);
-    assert!(!s.contains("__str_concat"),
-        "__str_concat should not be present after fusion");
+    assert!(
+        !s.contains("__str_concat"),
+        "__str_concat should not be present after fusion"
+    );
 }
 
 #[test]
 fn mixed_numeric_inside_plus_chain_still_numeric() {
     // (1 + 2) + "x" must treat (1+2) as a numeric addition — the fusion flattener
     // only recurses into `+` nodes whose own result is string-typed.
-    let wasm = compile(r#"
+    let wasm = compile(
+        r#"
         export function test(): i32 {
             let s: string = (1 + 2) + "x";
             return s.length;
         }
-    "#);
+    "#,
+    );
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[]).unwrap();
-    let test = instance.get_typed_func::<(), i32>(&mut store, "test").unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
     let len = test.call(&mut store, ()).unwrap();
     assert_eq!(len, 2, r#"(1+2) + "x" should be "3x" (length 2)"#);
 }
@@ -6552,42 +8112,62 @@ fn string_helper_tree_shaking_shrinks_module() {
     // bodies. Compare against a program that uses string concat — the latter must
     // be larger, and the former must be free of string-helper function names.
     let bare = compile("export function tick(me: i32): void {}");
-    let with_strings = compile(r#"
+    let with_strings = compile(
+        r#"
         export function tick(me: i32): void {
             let s: string = "hi" + "!";
         }
-    "#);
-    assert!(with_strings.len() > bare.len(),
+    "#,
+    );
+    assert!(
+        with_strings.len() > bare.len(),
         "expected string-using module to be larger: bare={} with_strings={}",
-        bare.len(), with_strings.len());
+        bare.len(),
+        with_strings.len()
+    );
 
     // name section should not mention string helpers in the bare module
     let bare_str = String::from_utf8_lossy(&bare);
-    assert!(!bare_str.contains("__str_concat"),
-        "bare module should not carry __str_concat");
-    assert!(!bare_str.contains("__str_eq"),
-        "bare module should not carry __str_eq");
+    assert!(
+        !bare_str.contains("__str_concat"),
+        "bare module should not carry __str_concat"
+    );
+    assert!(
+        !bare_str.contains("__str_eq"),
+        "bare module should not carry __str_eq"
+    );
 
     // Using only indexOf should pull in __str_indexOf but not __str_slice/__str_repeat.
-    let only_index_of = compile(r#"
+    let only_index_of = compile(
+        r#"
         export function test(): i32 {
             let s: string = "hello world";
             return s.indexOf("world");
         }
-    "#);
+    "#,
+    );
     let s = String::from_utf8_lossy(&only_index_of);
     assert!(s.contains("__str_indexOf"), "should include __str_indexOf");
-    assert!(!s.contains("__str_repeat"), "should not include __str_repeat");
-    assert!(!s.contains("__str_padStart"), "should not include __str_padStart");
+    assert!(
+        !s.contains("__str_repeat"),
+        "should not include __str_repeat"
+    );
+    assert!(
+        !s.contains("__str_padStart"),
+        "should not include __str_padStart"
+    );
     assert!(!s.contains("__str_split"), "should not include __str_split");
 }
 
 #[test]
 fn global_const_increment_is_rejected() {
-    let result = tscc::compile(r#"
+    let result = tscc::compile(
+        r#"
         const c: i32 = 1;
         export function go(): void { ++c; }
-    "#, &tscc::CompileOptions::default());
+    "#,
+        &tscc::CompileOptions::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(err.contains("const global"), "error: {err}");

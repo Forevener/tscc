@@ -25,19 +25,35 @@ pub enum ErrorKind {
 
 impl CompileError {
     pub fn parse(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Parse, message: msg.into(), loc: None }
+        Self {
+            kind: ErrorKind::Parse,
+            message: msg.into(),
+            loc: None,
+        }
     }
 
     pub fn type_err(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Type, message: msg.into(), loc: None }
+        Self {
+            kind: ErrorKind::Type,
+            message: msg.into(),
+            loc: None,
+        }
     }
 
     pub fn codegen(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Codegen, message: msg.into(), loc: None }
+        Self {
+            kind: ErrorKind::Codegen,
+            message: msg.into(),
+            loc: None,
+        }
     }
 
     pub fn unsupported(msg: impl Into<String>) -> Self {
-        Self { kind: ErrorKind::Unsupported, message: msg.into(), loc: None }
+        Self {
+            kind: ErrorKind::Unsupported,
+            message: msg.into(),
+            loc: None,
+        }
     }
 
     /// Attach a source location to this error.
@@ -66,7 +82,14 @@ impl CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(loc) = self.loc {
-            write!(f, "{}:{}:{}: {}", loc.line, loc.col, self.kind_label(), self.message)
+            write!(
+                f,
+                "{}:{}:{}: {}",
+                loc.line,
+                loc.col,
+                self.kind_label(),
+                self.message
+            )
         } else {
             write!(f, "{}: {}", self.kind_label(), self.message)
         }

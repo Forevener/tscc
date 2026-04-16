@@ -8,10 +8,10 @@ use wasm_encoder::{
     NameSection, TableSection, TableType, TypeSection, ValType,
 };
 
+use crate::ArenaOverflow;
 use crate::classes::ClassRegistry;
 use crate::error::CompileError;
 use crate::types::{self, ClosureSig, WasmType};
-use crate::ArenaOverflow;
 
 use super::func::FuncContext;
 use super::wasm_types;
@@ -156,7 +156,8 @@ impl ModuleContext {
         }
         // Arena starts after static data (will be resolved at assembly time)
         let idx = self.next_global_index;
-        self.globals.insert("__arena_ptr".to_string(), (idx, WasmType::I32));
+        self.globals
+            .insert("__arena_ptr".to_string(), (idx, WasmType::I32));
         // Use a placeholder — we'll set the real value at assembly time
         self.global_inits.push(GlobalInit::I32(0)); // placeholder
         self.arena_ptr_global = Some(idx);
@@ -188,7 +189,9 @@ impl ModuleContext {
         data.extend_from_slice(&(bytes_len as i32).to_le_bytes());
         data.extend_from_slice(s.as_bytes());
         self.static_data_entries.borrow_mut().push((offset, data));
-        self.string_literal_offsets.borrow_mut().insert(s.to_string(), offset);
+        self.string_literal_offsets
+            .borrow_mut()
+            .insert(s.to_string(), offset);
         offset
     }
 
@@ -204,19 +207,34 @@ impl ModuleContext {
         idx
     }
 
-    pub fn add_import(&mut self, name: &str, params: &[WasmType], ret: WasmType) -> Result<u32, CompileError> {
+    pub fn add_import(
+        &mut self,
+        name: &str,
+        params: &[WasmType],
+        ret: WasmType,
+    ) -> Result<u32, CompileError> {
         let wasm_params = wasm_types::wasm_params(params);
         let wasm_results = wasm_types::wasm_results(ret);
         let type_idx = self.add_type_sig(wasm_params, wasm_results);
         let func_idx = self.next_func_index;
-        self.imports.push((self.host_module.clone(), name.to_string(), type_idx));
+        self.imports
+            .push((self.host_module.clone(), name.to_string(), type_idx));
         self.func_map.insert(name.to_string(), (func_idx, ret));
         self.next_func_index += 1;
         Ok(func_idx)
     }
 
-    pub fn register_func(&mut self, name: &str, params: &[(String, WasmType)], ret: WasmType, is_export: bool) -> Result<u32, CompileError> {
-        let wasm_params: Vec<ValType> = params.iter().filter_map(|(_, ty)| ty.to_val_type()).collect();
+    pub fn register_func(
+        &mut self,
+        name: &str,
+        params: &[(String, WasmType)],
+        ret: WasmType,
+        is_export: bool,
+    ) -> Result<u32, CompileError> {
+        let wasm_params: Vec<ValType> = params
+            .iter()
+            .filter_map(|(_, ty)| ty.to_val_type())
+            .collect();
         let wasm_results = wasm_types::wasm_results(ret);
         let type_idx = self.add_type_sig(wasm_params, wasm_results);
         let func_idx = self.next_func_index;
@@ -255,7 +273,13 @@ impl ModuleContext {
 
     /// Register a lifted closure function. Returns the table index.
     /// Safe to call during codegen pass (&self) thanks to interior mutability.
-    pub fn register_closure_func(&self, param_types: Vec<ValType>, result_types: Vec<ValType>, body: wasm_encoder::Function, source_map: Vec<(u32, u32)>) -> u32 {
+    pub fn register_closure_func(
+        &self,
+        param_types: Vec<ValType>,
+        result_types: Vec<ValType>,
+        body: wasm_encoder::Function,
+        source_map: Vec<(u32, u32)>,
+    ) -> u32 {
         let table_idx = self.next_table_index.get();
         self.next_table_index.set(table_idx + 1);
         self.closure_funcs.borrow_mut().push(ClosureFunc {
@@ -299,15 +323,23 @@ pub fn compile_module<'a>(
     let mut class_ast_map: HashMap<String, &Class> = HashMap::new();
     for stmt in &program.body {
         if let Statement::ClassDeclaration(class) = stmt {
-            let name = class.id.as_ref()
+            let name = class
+                .id
+                .as_ref()
                 .ok_or_else(|| CompileError::parse("class without name"))?
-                .name.as_str().to_string();
-            let parent = class.super_class.as_ref().map(|expr| {
-                match expr {
+                .name
+                .as_str()
+                .to_string();
+            let parent = class
+                .super_class
+                .as_ref()
+                .map(|expr| match expr {
                     Expression::Identifier(id) => Ok(id.name.as_str().to_string()),
-                    _ => Err(CompileError::unsupported("non-identifier in extends clause")),
-                }
-            }).transpose()?;
+                    _ => Err(CompileError::unsupported(
+                        "non-identifier in extends clause",
+                    )),
+                })
+                .transpose()?;
             ctx.class_names.insert(name.clone());
             class_info.push((name.clone(), parent));
             class_ast_map.insert(name, class);
@@ -322,7 +354,8 @@ pub fn compile_module<'a>(
     for (name, parent) in &sorted_classes {
         let class = class_ast_map[name.as_str()];
         let is_poly = polymorphic.contains(name);
-        ctx.class_registry.register_class(class, &ctx.class_names, parent.clone(), is_poly)?;
+        ctx.class_registry
+            .register_class(class, &ctx.class_names, parent.clone(), is_poly)?;
     }
     ctx.class_registry.mark_polymorphic(&polymorphic);
 
@@ -401,10 +434,17 @@ pub fn compile_module<'a>(
             }
             let layout = ctx.class_registry.get(class_name).unwrap().clone();
             for method_name in &layout.vtable_methods {
-                let owner = find_method_declarer(&ctx.method_map, &ctx.class_registry, class_name, method_name)
-                    .ok_or_else(|| CompileError::codegen(format!(
+                let owner = find_method_declarer(
+                    &ctx.method_map,
+                    &ctx.class_registry,
+                    class_name,
+                    method_name,
+                )
+                .ok_or_else(|| {
+                    CompileError::codegen(format!(
                         "vtable method '{method_name}' not found in hierarchy of '{class_name}'"
-                    )))?;
+                    ))
+                })?;
                 let mangled = format!("{owner}${method_name}");
                 if !ctx.method_table_indices.contains_key(&mangled) {
                     let table_idx = ctx.next_table_index.get();
@@ -430,18 +470,30 @@ pub fn compile_module<'a>(
 
             let mut vtable_data = Vec::with_capacity(num_methods * 4);
             for method_name in &layout.vtable_methods {
-                let owner = find_method_declarer(&ctx.method_map, &ctx.class_registry, class_name, method_name).unwrap();
+                let owner = find_method_declarer(
+                    &ctx.method_map,
+                    &ctx.class_registry,
+                    class_name,
+                    method_name,
+                )
+                .unwrap();
                 let mangled = format!("{owner}${method_name}");
                 let table_idx = ctx.method_table_indices[&mangled];
                 vtable_data.extend_from_slice(&(table_idx as i32).to_le_bytes());
             }
-            ctx.static_data_entries.borrow_mut().push((vtable_offset, vtable_data));
+            ctx.static_data_entries
+                .borrow_mut()
+                .push((vtable_offset, vtable_data));
             vtable_offsets.push((class_name.clone(), vtable_offset));
         }
 
         // Apply vtable offsets to class layouts
         for (class_name, vtable_offset) in vtable_offsets {
-            ctx.class_registry.classes.get_mut(&class_name).unwrap().vtable_offset = vtable_offset;
+            ctx.class_registry
+                .classes
+                .get_mut(&class_name)
+                .unwrap()
+                .vtable_offset = vtable_offset;
         }
     }
 
@@ -452,8 +504,12 @@ pub fn compile_module<'a>(
                 register_function(&mut ctx, func_decl, false)?;
             }
             Statement::ExportDefaultDeclaration(export) => {
-                if let ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) = &export.declaration {
-                    let name = func_decl.id.as_ref()
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) =
+                    &export.declaration
+                {
+                    let name = func_decl
+                        .id
+                        .as_ref()
                         .map(|id| id.name.as_str())
                         .unwrap_or("default");
                     register_func_from_decl(&mut ctx, func_decl, name, true)?;
@@ -461,9 +517,10 @@ pub fn compile_module<'a>(
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(decl) = &export.declaration
-                    && let Declaration::FunctionDeclaration(func_decl) = decl {
-                        register_function(&mut ctx, func_decl, true)?;
-                    }
+                    && let Declaration::FunctionDeclaration(func_decl) = decl
+                {
+                    register_function(&mut ctx, func_decl, true)?;
+                }
             }
             _ => {}
         }
@@ -533,15 +590,18 @@ pub fn compile_module<'a>(
                 compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
             }
             Statement::ExportDefaultDeclaration(export) => {
-                if let ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) = &export.declaration {
+                if let ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) =
+                    &export.declaration
+                {
                     compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
                 }
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(decl) = &export.declaration
-                    && let Declaration::FunctionDeclaration(func_decl) = decl {
-                        compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
-                    }
+                    && let Declaration::FunctionDeclaration(func_decl) = decl
+                {
+                    compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
+                }
             }
             _ => {}
         }
@@ -637,10 +697,16 @@ fn compile_arena_alloc(ctx: &ModuleContext) -> wasm_encoder::Function {
     func
 }
 
-fn collect_import_from_func(ctx: &mut ModuleContext, func_decl: &Function) -> Result<(), CompileError> {
-    let name = func_decl.id.as_ref()
+fn collect_import_from_func(
+    ctx: &mut ModuleContext,
+    func_decl: &Function,
+) -> Result<(), CompileError> {
+    let name = func_decl
+        .id
+        .as_ref()
         .ok_or_else(|| CompileError::parse("declare function without name"))?
-        .name.as_str();
+        .name
+        .as_str();
 
     let (params, ret) = extract_func_signature(func_decl, &ctx.class_names)?;
     let param_types: Vec<WasmType> = params.iter().map(|(_, ty)| *ty).collect();
@@ -648,18 +714,30 @@ fn collect_import_from_func(ctx: &mut ModuleContext, func_decl: &Function) -> Re
     Ok(())
 }
 
-fn register_function(ctx: &mut ModuleContext, func_decl: &Function, is_export: bool) -> Result<(), CompileError> {
+fn register_function(
+    ctx: &mut ModuleContext,
+    func_decl: &Function,
+    is_export: bool,
+) -> Result<(), CompileError> {
     if func_decl.declare {
         return Ok(());
     }
-    let name = func_decl.id.as_ref()
+    let name = func_decl
+        .id
+        .as_ref()
         .ok_or_else(|| CompileError::parse("function without name"))?
-        .name.as_str();
+        .name
+        .as_str();
 
     register_func_from_decl(ctx, func_decl, name, is_export)
 }
 
-fn register_func_from_decl(ctx: &mut ModuleContext, func_decl: &Function, name: &str, is_export: bool) -> Result<(), CompileError> {
+fn register_func_from_decl(
+    ctx: &mut ModuleContext,
+    func_decl: &Function,
+    name: &str,
+    is_export: bool,
+) -> Result<(), CompileError> {
     let (params, ret) = extract_func_signature(func_decl, &ctx.class_names)?;
     // Track if this function returns a closure
     if let Some(ann) = &func_decl.return_type {
@@ -675,7 +753,10 @@ fn register_func_from_decl(ctx: &mut ModuleContext, func_decl: &Function, name: 
     Ok(())
 }
 
-fn extract_func_signature(func_decl: &Function, class_names: &HashSet<String>) -> Result<(Vec<(String, WasmType)>, WasmType), CompileError> {
+fn extract_func_signature(
+    func_decl: &Function,
+    class_names: &HashSet<String>,
+) -> Result<(Vec<(String, WasmType)>, WasmType), CompileError> {
     let mut params = Vec::new();
     for param in &func_decl.params.items {
         let name = match &param.pattern {
@@ -701,7 +782,11 @@ fn extract_func_signature(func_decl: &Function, class_names: &HashSet<String>) -
     Ok((params, ret))
 }
 
-fn collect_global(ctx: &mut ModuleContext, decl: &VariableDeclarator, mutable: bool) -> Result<(), CompileError> {
+fn collect_global(
+    ctx: &mut ModuleContext,
+    decl: &VariableDeclarator,
+    mutable: bool,
+) -> Result<(), CompileError> {
     let name = match &decl.id {
         BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
         _ => return Err(CompileError::unsupported("destructured global")),
@@ -710,19 +795,21 @@ fn collect_global(ctx: &mut ModuleContext, decl: &VariableDeclarator, mutable: b
     let ty = if let Some(ann) = &decl.type_annotation {
         types::resolve_type_annotation(ann)?
     } else {
-        return Err(CompileError::type_err(format!("global '{name}' requires type annotation")));
+        return Err(CompileError::type_err(format!(
+            "global '{name}' requires type annotation"
+        )));
     };
 
     let init = if let Some(init_expr) = &decl.init {
         match init_expr {
-            Expression::NumericLiteral(lit) => {
-                match ty {
-                    WasmType::I32 => GlobalInit::I32(lit.value as i32),
-                    WasmType::F64 => GlobalInit::F64(lit.value),
-                    _ => return Err(CompileError::type_err("global must be i32 or f64")),
-                }
-            }
-            Expression::UnaryExpression(un) if matches!(un.operator, UnaryOperator::UnaryNegation) => {
+            Expression::NumericLiteral(lit) => match ty {
+                WasmType::I32 => GlobalInit::I32(lit.value as i32),
+                WasmType::F64 => GlobalInit::F64(lit.value),
+                _ => return Err(CompileError::type_err("global must be i32 or f64")),
+            },
+            Expression::UnaryExpression(un)
+                if matches!(un.operator, UnaryOperator::UnaryNegation) =>
+            {
                 if let Expression::NumericLiteral(lit) = &un.argument {
                     match ty {
                         WasmType::I32 => GlobalInit::I32(-(lit.value as i32)),
@@ -733,19 +820,20 @@ fn collect_global(ctx: &mut ModuleContext, decl: &VariableDeclarator, mutable: b
                     return Err(CompileError::unsupported("non-constant global initializer"));
                 }
             }
-            Expression::BooleanLiteral(lit) => {
-                GlobalInit::I32(if lit.value { 1 } else { 0 })
-            }
+            Expression::BooleanLiteral(lit) => GlobalInit::I32(if lit.value { 1 } else { 0 }),
             Expression::CallExpression(call) => {
                 // Handle __static_alloc(size) at compile time
                 if let Expression::Identifier(ident) = &call.callee {
                     if ident.name.as_str() == "__static_alloc" && call.arguments.len() == 1 {
-                        if let Expression::NumericLiteral(lit) = &call.arguments[0].to_expression() {
+                        if let Expression::NumericLiteral(lit) = &call.arguments[0].to_expression()
+                        {
                             let size = lit.value as u32;
                             let offset = ctx.alloc_static(size);
                             GlobalInit::I32(offset as i32)
                         } else {
-                            return Err(CompileError::codegen("__static_alloc size must be a numeric literal"));
+                            return Err(CompileError::codegen(
+                                "__static_alloc size must be a numeric literal",
+                            ));
                         }
                     } else {
                         return Err(CompileError::unsupported("non-constant global initializer"));
@@ -771,7 +859,10 @@ fn collect_global(ctx: &mut ModuleContext, decl: &VariableDeclarator, mutable: b
     Ok(())
 }
 
-fn collect_enum(ctx: &mut ModuleContext, enum_decl: &TSEnumDeclaration) -> Result<(), CompileError> {
+fn collect_enum(
+    ctx: &mut ModuleContext,
+    enum_decl: &TSEnumDeclaration,
+) -> Result<(), CompileError> {
     let mut next_value: i32 = 0;
 
     for member in &enum_decl.body.members {
@@ -784,7 +875,9 @@ fn collect_enum(ctx: &mut ModuleContext, enum_decl: &TSEnumDeclaration) -> Resul
                     next_value = lit.value as i32 + 1;
                     lit.value as i32
                 }
-                Expression::UnaryExpression(un) if matches!(un.operator, UnaryOperator::UnaryNegation) => {
+                Expression::UnaryExpression(un)
+                    if matches!(un.operator, UnaryOperator::UnaryNegation) =>
+                {
                     if let Expression::NumericLiteral(lit) = &un.argument {
                         let v = -(lit.value as i32);
                         next_value = v + 1;
@@ -866,9 +959,16 @@ fn register_class_methods(ctx: &mut ModuleContext, class: &Class) -> Result<(), 
     Ok(())
 }
 
-fn codegen_method<'a>(ctx: &ModuleContext, class_name: &str, method: &MethodDefinition<'a>, source: &'a str) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
+fn codegen_method<'a>(
+    ctx: &ModuleContext,
+    class_name: &str,
+    method: &MethodDefinition<'a>,
+    source: &'a str,
+) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
     let func = &method.value;
-    let layout = ctx.class_registry.get(class_name)
+    let layout = ctx
+        .class_registry
+        .get(class_name)
         .ok_or_else(|| CompileError::codegen(format!("unknown class '{class_name}'")))?;
 
     // Build params: this (i32) + declared params
@@ -881,7 +981,9 @@ fn codegen_method<'a>(ctx: &ModuleContext, class_name: &str, method: &MethodDefi
         let pty = if let Some(ann) = &param.type_annotation {
             types::resolve_type_annotation_with_classes(ann, &ctx.class_names)?
         } else {
-            return Err(CompileError::type_err(format!("method param '{pname}' requires type annotation")));
+            return Err(CompileError::type_err(format!(
+                "method param '{pname}' requires type annotation"
+            )));
         };
         params.push((pname, pty));
     }
@@ -909,13 +1011,20 @@ fn codegen_method<'a>(ctx: &ModuleContext, class_name: &str, method: &MethodDefi
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
             if let Some(param_class) = types::get_class_type_name(ann)
-                && ctx.class_names.contains(&param_class) {
-                    func_ctx.local_class_types.insert(pname.clone(), param_class);
-                }
+                && ctx.class_names.contains(&param_class)
+            {
+                func_ctx
+                    .local_class_types
+                    .insert(pname.clone(), param_class);
+            }
             if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names) {
-                func_ctx.local_array_elem_types.insert(pname.clone(), elem_ty);
+                func_ctx
+                    .local_array_elem_types
+                    .insert(pname.clone(), elem_ty);
                 if let Some(elem_class) = types::get_array_element_class(ann) {
-                    func_ctx.local_array_elem_classes.insert(pname.clone(), elem_class);
+                    func_ctx
+                        .local_array_elem_classes
+                        .insert(pname.clone(), elem_class);
                 }
             }
             if types::is_string_type(ann) {
@@ -946,9 +1055,10 @@ fn has_super_call(stmts: &[Statement]) -> bool {
     for stmt in stmts {
         if let Statement::ExpressionStatement(expr_stmt) = stmt
             && let Expression::CallExpression(call) = &expr_stmt.expression
-                && matches!(&call.callee, Expression::Super(_)) {
-                    return true;
-                }
+            && matches!(&call.callee, Expression::Super(_))
+        {
+            return true;
+        }
     }
     false
 }
@@ -962,7 +1072,9 @@ fn emit_constructor_body<'a>(
 
     // Validate: child classes MUST call super()
     if layout.parent.is_some() {
-        let body_has_super = func.body.as_ref()
+        let body_has_super = func
+            .body
+            .as_ref()
             .is_some_and(|b| has_super_call(&b.statements));
         if !body_has_super {
             return Err(CompileError::codegen(format!(
@@ -989,8 +1101,13 @@ fn emit_constructor_body<'a>(
         if let Some(&(offset, ty)) = layout.field_map.get(pname) {
             // Store param value to this + offset
             func_ctx.push(Instruction::LocalGet(0)); // this pointer
-            let param_idx = func_ctx.locals.get(pname).map(|&(idx, _)| idx)
-                .ok_or_else(|| CompileError::codegen(format!("constructor param '{pname}' not found")))?;
+            let param_idx = func_ctx
+                .locals
+                .get(pname)
+                .map(|&(idx, _)| idx)
+                .ok_or_else(|| {
+                    CompileError::codegen(format!("constructor param '{pname}' not found"))
+                })?;
             func_ctx.push(Instruction::LocalGet(param_idx));
             match ty {
                 WasmType::F64 => {
@@ -1026,7 +1143,11 @@ fn emit_constructor_body<'a>(
     Ok(())
 }
 
-fn codegen_function<'a>(ctx: &ModuleContext, func_decl: &Function<'a>, source: &'a str) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
+fn codegen_function<'a>(
+    ctx: &ModuleContext,
+    func_decl: &Function<'a>,
+    source: &'a str,
+) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
     if func_decl.declare {
         return Err(CompileError::codegen("cannot codegen declare function"));
     }
@@ -1045,13 +1166,20 @@ fn codegen_function<'a>(ctx: &ModuleContext, func_decl: &Function<'a>, source: &
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
             if let Some(param_class) = types::get_class_type_name(ann)
-                && ctx.class_names.contains(&param_class) {
-                    func_ctx.local_class_types.insert(pname.clone(), param_class);
-                }
+                && ctx.class_names.contains(&param_class)
+            {
+                func_ctx
+                    .local_class_types
+                    .insert(pname.clone(), param_class);
+            }
             if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names) {
-                func_ctx.local_array_elem_types.insert(pname.clone(), elem_ty);
+                func_ctx
+                    .local_array_elem_types
+                    .insert(pname.clone(), elem_ty);
                 if let Some(elem_class) = types::get_array_element_class(ann) {
-                    func_ctx.local_array_elem_classes.insert(pname.clone(), elem_class);
+                    func_ctx
+                        .local_array_elem_classes
+                        .insert(pname.clone(), elem_class);
                 }
             }
             if types::is_string_type(ann) {
@@ -1104,10 +1232,9 @@ fn assemble_module(
     // Type section
     let mut type_section = TypeSection::new();
     for (params, results) in &all_type_sigs {
-        type_section.ty().function(
-            params.iter().copied(),
-            results.iter().copied(),
-        );
+        type_section
+            .ty()
+            .function(params.iter().copied(), results.iter().copied());
     }
     module.section(&type_section);
 
@@ -1115,7 +1242,11 @@ fn assemble_module(
     if !ctx.imports.is_empty() {
         let mut import_section = ImportSection::new();
         for (module_name, func_name, type_idx) in &ctx.imports {
-            import_section.import(module_name, func_name, wasm_encoder::EntityType::Function(*type_idx));
+            import_section.import(
+                module_name,
+                func_name,
+                wasm_encoder::EntityType::Function(*type_idx),
+            );
         }
         module.section(&import_section);
     }
@@ -1170,7 +1301,8 @@ fn assemble_module(
             // __arena_ptr is mutable (host resets it after each call)
             let is_arena_ptr = ctx.arena_ptr_global == Some(i as u32);
             let mutable = is_arena_ptr
-                || idx_to_name.get(&(i as u32))
+                || idx_to_name
+                    .get(&(i as u32))
                     .is_some_and(|n| ctx.mutable_globals.contains(*n));
 
             // If this is __arena_ptr, set its initial value to after static data
@@ -1189,19 +1321,31 @@ fn assemble_module(
             match init {
                 GlobalInit::I32(v) => {
                     global_section.global(
-                        GlobalType { val_type: ValType::I32, mutable, shared: false },
+                        GlobalType {
+                            val_type: ValType::I32,
+                            mutable,
+                            shared: false,
+                        },
                         &wasm_encoder::ConstExpr::i32_const(v),
                     );
                 }
                 GlobalInit::I64(v) => {
                     global_section.global(
-                        GlobalType { val_type: ValType::I64, mutable, shared: false },
+                        GlobalType {
+                            val_type: ValType::I64,
+                            mutable,
+                            shared: false,
+                        },
                         &wasm_encoder::ConstExpr::i64_const(v),
                     );
                 }
                 GlobalInit::F64(v) => {
                     global_section.global(
-                        GlobalType { val_type: ValType::F64, mutable, shared: false },
+                        GlobalType {
+                            val_type: ValType::F64,
+                            mutable,
+                            shared: false,
+                        },
                         &wasm_encoder::ConstExpr::f64_const(v),
                     );
                 }
@@ -1237,9 +1381,13 @@ fn assemble_module(
         // Fill method table entries: table_index -> wasm func_index
         for (mangled_name, &table_idx) in &ctx.method_table_indices {
             // mangled_name is "ClassName$methodName", look up the wasm func_index
-            let func_idx = ctx.func_map.get(mangled_name)
+            let func_idx = ctx
+                .func_map
+                .get(mangled_name)
                 .map(|&(idx, _)| idx)
-                .unwrap_or_else(|| panic!("vtable method '{}' not found in func_map", mangled_name));
+                .unwrap_or_else(|| {
+                    panic!("vtable method '{}' not found in func_map", mangled_name)
+                });
             all_table_func_indices[table_idx as usize] = func_idx;
         }
 

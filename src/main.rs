@@ -107,7 +107,10 @@ fn run_compile(args: &[String]) {
     }
 
     let output_path = output_path.unwrap_or_else(|| {
-        Path::new(input_path).with_extension("wasm").to_string_lossy().into_owned()
+        Path::new(input_path)
+            .with_extension("wasm")
+            .to_string_lossy()
+            .into_owned()
     });
 
     let source = match fs::read_to_string(input_path) {
@@ -132,7 +135,12 @@ fn run_compile(args: &[String]) {
                 eprintln!("error: cannot write '{output_path}': {e}");
                 process::exit(1);
             }
-            eprintln!("compiled {} -> {} ({} bytes)", input_path, output_path, wasm.len());
+            eprintln!(
+                "compiled {} -> {} ({} bytes)",
+                input_path,
+                output_path,
+                wasm.len()
+            );
         }
         Err(e) => {
             eprint!("{}", tscc::error::format_error_with_context(&e, &source));

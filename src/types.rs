@@ -40,10 +40,16 @@ pub fn resolve_type_annotation_with_classes(
     resolve_ts_type(&annotation.type_annotation, class_names)
 }
 
-pub fn resolve_ts_type(ts_type: &TSType, class_names: &HashSet<String>) -> Result<WasmType, CompileError> {
+pub fn resolve_ts_type(
+    ts_type: &TSType,
+    class_names: &HashSet<String>,
+) -> Result<WasmType, CompileError> {
     match ts_type {
         TSType::TSTypeReference(type_ref) => {
-            let name = type_ref.type_name.get_identifier_reference().map(|r| r.name.as_str());
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str());
             match name {
                 Some("i32") => Ok(WasmType::I32),
                 Some("f64") => Ok(WasmType::F64),
@@ -62,7 +68,9 @@ pub fn resolve_ts_type(ts_type: &TSType, class_names: &HashSet<String>) -> Resul
                 Some(other) => Err(CompileError::type_err(format!(
                     "unknown type '{other}' — supported types: i32, f64, int, bool, number, string, Array<T>, or a class name"
                 ))),
-                None => Err(CompileError::type_err("complex type references not supported")),
+                None => Err(CompileError::type_err(
+                    "complex type references not supported",
+                )),
             }
         }
         TSType::TSVoidKeyword(_) => Ok(WasmType::Void),
@@ -77,13 +85,18 @@ pub fn resolve_ts_type(ts_type: &TSType, class_names: &HashSet<String>) -> Resul
             // T[] is equivalent to Array<T> — a pointer into linear memory (i32).
             Ok(WasmType::I32)
         }
-        _ => Err(CompileError::type_err("unsupported type annotation".to_string())),
+        _ => Err(CompileError::type_err(
+            "unsupported type annotation".to_string(),
+        )),
     }
 }
 
 /// Parse a TSFunctionType annotation into a ClosureSig.
 /// E.g. `(x: i32, y: f64) => i32` → ClosureSig { param_types: [I32, F64], return_type: I32 }
-pub fn get_closure_sig(annotation: &TSTypeAnnotation, class_names: &HashSet<String>) -> Option<ClosureSig> {
+pub fn get_closure_sig(
+    annotation: &TSTypeAnnotation,
+    class_names: &HashSet<String>,
+) -> Option<ClosureSig> {
     match &annotation.type_annotation {
         TSType::TSFunctionType(func_type) => {
             let mut param_types = Vec::new();
@@ -95,8 +108,12 @@ pub fn get_closure_sig(annotation: &TSTypeAnnotation, class_names: &HashSet<Stri
                 };
                 param_types.push(ty);
             }
-            let return_type = resolve_ts_type(&func_type.return_type.type_annotation, class_names).ok()?;
-            Some(ClosureSig { param_types, return_type })
+            let return_type =
+                resolve_ts_type(&func_type.return_type.type_annotation, class_names).ok()?;
+            Some(ClosureSig {
+                param_types,
+                return_type,
+            })
         }
         _ => None,
     }
@@ -104,10 +121,16 @@ pub fn get_closure_sig(annotation: &TSTypeAnnotation, class_names: &HashSet<Stri
 
 /// Extract the element type from an Array<T> type annotation.
 /// Returns Some(WasmType) if the annotation is Array<T>, None otherwise.
-pub fn get_array_element_type(annotation: &TSTypeAnnotation, class_names: &HashSet<String>) -> Option<WasmType> {
+pub fn get_array_element_type(
+    annotation: &TSTypeAnnotation,
+    class_names: &HashSet<String>,
+) -> Option<WasmType> {
     match &annotation.type_annotation {
         TSType::TSTypeReference(type_ref) => {
-            let name = type_ref.type_name.get_identifier_reference().map(|r| r.name.as_str());
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str());
             if name != Some("Array") {
                 return None;
             }
@@ -129,7 +152,10 @@ pub fn get_array_element_type(annotation: &TSTypeAnnotation, class_names: &HashS
 pub fn get_array_element_class(annotation: &TSTypeAnnotation) -> Option<String> {
     let first = match &annotation.type_annotation {
         TSType::TSTypeReference(type_ref) => {
-            let name = type_ref.type_name.get_identifier_reference().map(|r| r.name.as_str());
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str());
             if name != Some("Array") {
                 return None;
             }
@@ -141,7 +167,10 @@ pub fn get_array_element_class(annotation: &TSTypeAnnotation) -> Option<String> 
     };
     // Check if the element type is a class reference
     if let TSType::TSTypeReference(elem_ref) = first {
-        let elem_name = elem_ref.type_name.get_identifier_reference().map(|r| r.name.as_str())?;
+        let elem_name = elem_ref
+            .type_name
+            .get_identifier_reference()
+            .map(|r| r.name.as_str())?;
         match elem_name {
             "i32" | "f64" | "bool" | "Array" | "string" | "int" | "number" => None,
             class_name => Some(class_name.to_string()),
@@ -156,7 +185,10 @@ pub fn is_string_type(annotation: &TSTypeAnnotation) -> bool {
     match &annotation.type_annotation {
         TSType::TSStringKeyword(_) => true,
         TSType::TSTypeReference(type_ref) => {
-            let name = type_ref.type_name.get_identifier_reference().map(|r| r.name.as_str());
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str());
             name == Some("string")
         }
         _ => false,
@@ -173,7 +205,10 @@ pub fn get_class_type_name(annotation: &TSTypeAnnotation) -> Option<String> {
 pub fn get_class_type_name_from_ts_type(ts_type: &TSType) -> Option<String> {
     match ts_type {
         TSType::TSTypeReference(type_ref) => {
-            let name = type_ref.type_name.get_identifier_reference().map(|r| r.name.as_str());
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str());
             match name {
                 Some("i32" | "f64" | "bool" | "string" | "int" | "number" | "Array") => None,
                 Some(class_name) => Some(class_name.to_string()),

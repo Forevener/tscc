@@ -37,14 +37,27 @@ const PCG_INC: i64 = 1442695040888963407_u64 as i64;
 /// Transcendental math functions: (Math method name, arity).
 /// Arity is 1 or 2; the import has the matching f64 signature.
 pub const MATH_TRANSCENDENTALS: &[(&str, u8)] = &[
-    ("sin", 1), ("cos", 1), ("tan", 1),
-    ("asin", 1), ("acos", 1), ("atan", 1),
-    ("sinh", 1), ("cosh", 1), ("tanh", 1),
-    ("asinh", 1), ("acosh", 1), ("atanh", 1),
-    ("log", 1), ("log2", 1), ("log10", 1),
+    ("sin", 1),
+    ("cos", 1),
+    ("tan", 1),
+    ("asin", 1),
+    ("acos", 1),
+    ("atan", 1),
+    ("sinh", 1),
+    ("cosh", 1),
+    ("tanh", 1),
+    ("asinh", 1),
+    ("acosh", 1),
+    ("atanh", 1),
+    ("log", 1),
+    ("log2", 1),
+    ("log10", 1),
     ("log1p", 1),
-    ("exp", 1), ("expm1", 1), ("cbrt", 1),
-    ("atan2", 2), ("pow", 2),
+    ("exp", 1),
+    ("expm1", 1),
+    ("cbrt", 1),
+    ("atan2", 2),
+    ("pow", 2),
 ];
 
 /// Returns true if `method` is a transcendental that lowers to a host import.
@@ -85,13 +98,21 @@ pub fn register_rng(ctx: &mut ModuleContext) {
     // `__rng_state`. We bypass add_global (which assumes I32/F64 WasmType)
     // and write directly to the context fields.
     let state_idx = ctx.next_global_index_internal();
-    ctx.globals.insert(RNG_STATE_GLOBAL.to_string(), (state_idx, WasmType::I32 /* placeholder; emit uses GlobalInit::I64 */));
+    ctx.globals.insert(
+        RNG_STATE_GLOBAL.to_string(),
+        (
+            state_idx,
+            WasmType::I32, /* placeholder; emit uses GlobalInit::I64 */
+        ),
+    );
     ctx.global_inits.push(GlobalInit::I64(0));
     ctx.mutable_globals.insert(RNG_STATE_GLOBAL.to_string());
-    ctx.exported_globals.push((RNG_STATE_GLOBAL.to_string(), state_idx));
+    ctx.exported_globals
+        .push((RNG_STATE_GLOBAL.to_string(), state_idx));
 
     // __rng_next() -> f64
-    ctx.register_func(RNG_NEXT_FUNC, &[], WasmType::F64, false).unwrap();
+    ctx.register_func(RNG_NEXT_FUNC, &[], WasmType::F64, false)
+        .unwrap();
 }
 
 /// Compile the body of `__rng_next`. Implements the PCG32 XSH-RR 64/32 step:
@@ -284,7 +305,9 @@ impl Scanner {
                 }
             }
             Statement::ExportDefaultDeclaration(e) => {
-                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) = &e.declaration {
+                if let oxc_ast::ast::ExportDefaultDeclarationKind::FunctionDeclaration(f) =
+                    &e.declaration
+                {
                     if let Some(body) = &f.body {
                         for s in &body.statements {
                             self.walk_stmt(s);
