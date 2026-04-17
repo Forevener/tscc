@@ -52,7 +52,21 @@ pub const STRING_HELPER_NAMES: &[&str] = &[
 /// Must be called after Pass 2 (all user functions registered), before Pass 3 (codegen).
 type HelperSig = (&'static str, Vec<(String, WasmType)>, WasmType);
 
-pub fn register_string_helpers(ctx: &mut ModuleContext, used: &HashSet<String>) {
+/// Output of helper registration, carrying the state needed by the matching
+/// body-emission pass (`compile_string_helpers`). Threads through `module.rs`
+/// because `compile_string_helpers` runs later, with immutable access to `ctx`.
+pub struct HelperRegistration {
+    /// Parallel to `precompiled::PRECOMPILED_FUNCS`: tscc function index for
+    /// each bundle entry, or `u32::MAX` if that entry wasn't registered.
+    pub bundle_tscc_indices: Vec<u32>,
+    /// Bundle indices that WERE registered, in registration (= emission) order.
+    pub registered_bundle: Vec<usize>,
+}
+
+pub fn register_string_helpers(
+    ctx: &mut ModuleContext,
+    used: &HashSet<String>,
+) -> HelperRegistration {
     let helpers: Vec<HelperSig> = vec![
         // __str_eq(a: i32, b: i32) -> i32
         (
@@ -258,23 +272,89 @@ pub fn register_string_helpers(ctx: &mut ModuleContext, used: &HashSet<String>) 
         ),
     ];
 
+    // Split registration into two phases so precompiled helpers can live in a
+    // contiguous block after all hand-written ones — this keeps
+    // `compile_string_helpers` emission order matching registration order,
+    // even when the bundle pulls in extra functions via transitive closure.
+    let mut precompiled_sigs: std::collections::HashMap<
+        String,
+        (Vec<(String, WasmType)>, WasmType),
+    > = std::collections::HashMap::new();
+
+    // Phase 1: hand-written helpers register by name immediately; precompiled
+    // exports have their signatures stashed for phase 3 (the bundle may pull
+    // them in via closure even if not directly `used`).
     for (name, params, ret) in helpers {
-        if used.contains(name) {
+        if super::precompiled::find_export(name).is_some() {
+            precompiled_sigs.insert(name.to_string(), (params, ret));
+        } else if used.contains(name) {
             ctx.register_func(name, &params, ret, false).unwrap();
         }
+    }
+
+    // Phase 2: seed the bundle from used precompiled exports, then walk the
+    // call graph to pull in every internal they transitively reach.
+    let seeds: Vec<usize> = super::precompiled::PRECOMPILED_FUNCS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, pf)| pf.name.filter(|n| used.contains(*n)).map(|_| i))
+        .collect();
+    let registered_bundle = super::precompiled::transitive_closure(&seeds);
+
+    // Phase 3: register each bundle function. Exports go through `register_func`
+    // so user TS can look them up by name; internals use `register_raw_func`
+    // (bypasses `func_map`, supports any ValType including i64).
+    let mut bundle_tscc_indices = vec![u32::MAX; super::precompiled::PRECOMPILED_FUNCS.len()];
+    for &bundle_idx in &registered_bundle {
+        let pf = &super::precompiled::PRECOMPILED_FUNCS[bundle_idx];
+        let tscc_idx = if let Some(name) = pf.name {
+            let (params, ret) = precompiled_sigs
+                .get(name)
+                .unwrap_or_else(|| panic!("no WasmType signature registered for precompiled export '{name}'"));
+            ctx.register_func(name, params, *ret, false).unwrap()
+        } else {
+            let synthetic = format!("__helper_internal_{bundle_idx}");
+            ctx.register_raw_func(&synthetic, pf.params.to_vec(), pf.results.to_vec())
+        };
+        bundle_tscc_indices[bundle_idx] = tscc_idx;
+    }
+
+    HelperRegistration {
+        bundle_tscc_indices,
+        registered_bundle,
     }
 }
 
 /// Compile bodies for the string helpers that were registered.
-/// Iterates in the same `STRING_HELPER_NAMES` order used by `register_string_helpers`,
-/// so the emitted function indices line up with registration.
-pub fn compile_string_helpers(ctx: &ModuleContext, used: &HashSet<String>) -> Vec<Function> {
+/// Emits hand-written helpers first (in `STRING_HELPER_NAMES` order, skipping
+/// precompiled exports) and then the precompiled bundle in registration order,
+/// matching exactly what `register_string_helpers` did.
+pub fn compile_string_helpers(
+    ctx: &ModuleContext,
+    used: &HashSet<String>,
+    reg: &HelperRegistration,
+) -> Vec<Function> {
     let arena_idx = ctx.arena_ptr_global.unwrap();
-    STRING_HELPER_NAMES
-        .iter()
-        .filter(|name| used.contains(**name))
-        .map(|name| compile_helper(name, arena_idx))
-        .collect()
+    let mut out: Vec<Function> = Vec::new();
+
+    for name in STRING_HELPER_NAMES {
+        if !used.contains(*name) {
+            continue;
+        }
+        if super::precompiled::find_export(name).is_some() {
+            continue;
+        }
+        out.push(compile_helper(name, arena_idx));
+    }
+
+    for &bundle_idx in &reg.registered_bundle {
+        out.push(super::precompiled::build_function(
+            bundle_idx,
+            &reg.bundle_tscc_indices,
+        ));
+    }
+
+    out
 }
 
 /// Pre-codegen AST scan that returns the set of string runtime helpers the program
@@ -692,10 +772,6 @@ fn compile_helper(name: &str, arena_idx: u32) -> Function {
         "__str_eq" => compare::build_str_eq(),
         "__str_cmp" => compare::build_str_cmp(),
         "__str_indexOf" => search::build_str_index_of(),
-        "__str_lastIndexOf" | "__str_slice" => {
-            super::precompiled::precompiled_function(name)
-                .unwrap_or_else(|| panic!("precompiled {name} not found"))
-        }
         "__str_startsWith" => search::build_str_starts_with(),
         "__str_endsWith" => search::build_str_ends_with(),
         "__str_includes" => search::build_str_includes(),

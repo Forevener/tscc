@@ -2,7 +2,6 @@
 const HEADER: u32 = 4;
 
 /// string.slice(start, end) — arena-allocating, accesses global 0 directly.
-/// No wrapper needed — uses inline asm for global.get/global.set.
 #[unsafe(no_mangle)]
 pub extern "C" fn __str_slice(s: u32, start: i32, end: i32) -> u32 {
     unsafe {
@@ -35,21 +34,12 @@ pub extern "C" fn __str_slice(s: u32, start: i32, end: i32) -> u32 {
         let new_len = if en > st { (en - st) as u32 } else { 0 };
         let total = HEADER + new_len;
 
-        // Arena-allocate the new string
         let ptr = crate::arena::alloc(total);
-
-        // Write string header
         (ptr as *mut u32).write(new_len);
 
-        // Copy bytes (byte loop — core::ptr::copy_nonoverlapping compiles to
-        // a memcpy call with a wrong function index when extracted)
         let src = (s as *const u8).add(HEADER as usize + st as usize);
         let dst = (ptr as *mut u8).add(HEADER as usize);
-        let mut i = 0u32;
-        while i < new_len {
-            *dst.add(i as usize) = *src.add(i as usize);
-            i += 1;
-        }
+        core::ptr::copy_nonoverlapping(src, dst, new_len as usize);
 
         ptr
     }

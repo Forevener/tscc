@@ -244,6 +244,28 @@ impl ModuleContext {
         Ok(func_idx)
     }
 
+    /// Register a function using raw `ValType` signatures, bypassing the
+    /// `WasmType` system. Used for precompiled helpers whose signatures may
+    /// include types tscc's frontend doesn't model (e.g. i64 in compiler-
+    /// inserted intrinsics). Does NOT populate `func_map` — callers who need
+    /// name lookup must do it themselves.
+    pub fn register_raw_func(
+        &mut self,
+        name: &str,
+        params: Vec<ValType>,
+        results: Vec<ValType>,
+    ) -> u32 {
+        let type_idx = self.add_type_sig(params, results);
+        let func_idx = self.next_func_index;
+        self.local_funcs.push(FuncDef {
+            name: name.to_string(),
+            type_index: type_idx,
+            is_export: false,
+        });
+        self.next_func_index += 1;
+        func_idx
+    }
+
     /// Get or register a type signature during codegen (&self).
     /// Checks existing sigs first, then extra_type_sigs, then adds a new one.
     /// Returns the type index usable for call_indirect.
@@ -557,7 +579,8 @@ pub fn compile_module<'a>(
     if !used_string_helpers.is_empty() {
         ctx.init_arena();
     }
-    super::string_builtins::register_string_helpers(&mut ctx, &used_string_helpers);
+    let helper_registration =
+        super::string_builtins::register_string_helpers(&mut ctx, &used_string_helpers);
 
     // Register RNG helpers (state global + step function) if Math.random is used.
     let uses_random = super::math_builtins::program_uses_random(program);
@@ -609,7 +632,11 @@ pub fn compile_module<'a>(
     }
 
     // Compile the string runtime helper bodies (only those that were registered).
-    let string_helpers = super::string_builtins::compile_string_helpers(&ctx, &used_string_helpers);
+    let string_helpers = super::string_builtins::compile_string_helpers(
+        &ctx,
+        &used_string_helpers,
+        &helper_registration,
+    );
     compiled_funcs.extend(string_helpers.into_iter().map(|f| (f, Vec::new())));
 
     // Compile RNG step function body if Math.random is used.

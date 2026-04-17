@@ -1,0 +1,12 @@
+# Pinning rustc for the helpers crate gives tscc byte-exact reproducibility
+# across downstream machines: the `helpers/` wasm is compiled with the version
+# below regardless of which rustc the user has globally. Rustup auto-installs
+# the pinned toolchain on first build.
+#
+# Bumping this version is a deliberate act — it will change the bytes of every
+# precompiled helper in tscc's output. Bump only when you're ready for a new
+# deterministic baseline (e.g. to pick up a rustc bugfix or a wasm feature).
+[toolchain]
+channel = "1.94.1"
+targets = ["wasm32-unknown-unknown"]
+profile = "minimal"
