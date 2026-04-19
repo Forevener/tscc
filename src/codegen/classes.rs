@@ -5,7 +5,7 @@ use oxc_ast::ast::*;
 use std::collections::HashSet;
 
 use crate::error::CompileError;
-use crate::types::{self, WasmType};
+use crate::types::{self, TypeBindings, WasmType};
 
 /// Layout of a single class in linear memory.
 #[derive(Debug, Clone)]
@@ -118,13 +118,38 @@ impl ClassRegistry {
         parent_name: Option<String>,
         is_polymorphic: bool,
     ) -> Result<(), CompileError> {
-        let name = class
-            .id
-            .as_ref()
-            .ok_or_else(|| CompileError::parse("class without name"))?
-            .name
-            .as_str()
-            .to_string();
+        self.register_class_with_bindings(class, class_names, parent_name, is_polymorphic, None, None)
+    }
+
+    /// Bindings-aware class registration: when `override_name` is supplied, the
+    /// synthesized layout is stored under that mangled name instead of the raw
+    /// AST identifier (used for monomorphized generic classes). `bindings`
+    /// substitute type parameters during field/method type resolution.
+    #[allow(
+        clippy::map_entry,
+        clippy::too_many_arguments,
+        reason = "override and new-slot branches are not symmetric; args are positional by design"
+    )]
+    pub fn register_class_with_bindings(
+        &mut self,
+        class: &Class,
+        class_names: &HashSet<String>,
+        parent_name: Option<String>,
+        is_polymorphic: bool,
+        override_name: Option<&str>,
+        bindings: Option<&TypeBindings>,
+    ) -> Result<(), CompileError> {
+        let name = if let Some(n) = override_name {
+            n.to_string()
+        } else {
+            class
+                .id
+                .as_ref()
+                .ok_or_else(|| CompileError::parse("class without name"))?
+                .name
+                .as_str()
+                .to_string()
+        };
 
         // Start with inherited fields from parent (if any)
         let mut fields = Vec::new();
@@ -178,7 +203,7 @@ impl ClassRegistry {
                 ClassElement::PropertyDefinition(prop) => {
                     let field_name = property_key_name(&prop.key)?;
                     let ty = if let Some(ann) = &prop.type_annotation {
-                        types::resolve_type_annotation_with_classes(ann, class_names)?
+                        types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
                     } else {
                         return Err(CompileError::type_err(format!(
                             "class field '{field_name}' requires a type annotation"
@@ -187,13 +212,13 @@ impl ClassRegistry {
 
                     // Track field class type if it's a class reference
                     if let Some(ann) = &prop.type_annotation {
-                        if let Some(class_type) = types::get_class_type_name(ann)
+                        if let Some(class_type) = types::get_class_type_name_with_bindings(ann, bindings)
                             && class_names.contains(&class_type)
                         {
                             field_class_types.insert(field_name.clone(), class_type);
                         }
                         // Track string fields
-                        if types::is_string_type(ann) {
+                        if types::is_string_type_with_bindings(ann, bindings) {
                             field_string_types.insert(field_name.clone());
                         }
                     }
@@ -234,7 +259,7 @@ impl ClassRegistry {
                                 }
                             };
                             if let Some(ann) = &param.type_annotation {
-                                types::resolve_type_annotation_with_classes(ann, class_names)?;
+                                types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?;
                             } else {
                                 return Err(CompileError::type_err(format!(
                                     "constructor parameter '{pname}' requires type annotation"
@@ -256,7 +281,7 @@ impl ClassRegistry {
                                 }
                             };
                             let pty = if let Some(ann) = &param.type_annotation {
-                                types::resolve_type_annotation_with_classes(ann, class_names)?
+                                types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
                             } else {
                                 return Err(CompileError::type_err(format!(
                                     "method parameter '{pname}' requires type annotation"
@@ -265,7 +290,7 @@ impl ClassRegistry {
                             params.push((pname, pty));
                         }
                         let ret = if let Some(ann) = &func.return_type {
-                            types::resolve_type_annotation_with_classes(ann, class_names)?
+                            types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
                         } else {
                             WasmType::Void
                         };
@@ -273,7 +298,7 @@ impl ClassRegistry {
                         let return_class = func
                             .return_type
                             .as_ref()
-                            .and_then(|ann| types::get_class_type_name(ann))
+                            .and_then(|ann| types::get_class_type_name_with_bindings(ann, bindings))
                             .filter(|cn| class_names.contains(cn));
                         methods.insert(
                             method_name.clone(),

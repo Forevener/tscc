@@ -1,22 +1,18 @@
-// Arena pointer access via a WASM global.
+// Arena access via a FUNCTION IMPORT.
 //
-// We declare __arena_ptr as an extern static, which compiles to a WASM
-// global import. When the function body is extracted by build.rs, the
-// global.get/global.set instructions reference this global's index.
-// Since it's the only imported global, it gets index 0 — matching
-// tscc's output where __arena_ptr is also global 0.
+// Function imports with `#[link(wasm_import_module = ...)]` are honored by
+// rustc+wasm-ld on stable, whereas `extern static` data symbols are not
+// (they compile to `i32.load/store at address 0` regardless). Exposing the
+// arena as a function makes the dependency explicit and lets tscc wire it
+// through to its own `__arena_alloc`.
 
+#[link(wasm_import_module = "env")]
 unsafe extern "C" {
-    #[link_name = "__arena_ptr"]
-    static mut ARENA_PTR: u32;
+    fn __tscc_arena_alloc(size: u32) -> u32;
 }
 
 /// Bump-allocate `size` bytes from the arena. Returns pointer to allocated region.
 #[inline(always)]
 pub unsafe fn alloc(size: u32) -> u32 {
-    unsafe {
-        let ptr = ARENA_PTR;
-        ARENA_PTR = ptr + size;
-        ptr
-    }
+    unsafe { __tscc_arena_alloc(size) }
 }

@@ -134,8 +134,17 @@ impl<'a> FuncContext<'a> {
                 self.emit_array_join(&member.object, elem_ty, call)?;
                 Ok(Some(WasmType::I32))
             }
+            "splice" => {
+                if call.arguments.is_empty() {
+                    return Err(CompileError::codegen(
+                        "Array.splice expects at least 1 argument (start)",
+                    ));
+                }
+                self.emit_array_splice(&member.object, elem_ty, call)?;
+                Ok(Some(WasmType::I32))
+            }
             _ => Err(CompileError::codegen(format!(
-                "Array has no method '{method_name}' — supported: push, pop, indexOf, lastIndexOf, includes, reverse, at, fill, slice, concat, join, filter, map, forEach, reduce, sort, find, findIndex, findLast, findLastIndex, some, every"
+                "Array has no method '{method_name}' — supported: push, pop, indexOf, lastIndexOf, includes, reverse, at, fill, slice, concat, join, splice, filter, map, forEach, reduce, sort, find, findIndex, findLast, findLastIndex, some, every"
             ))),
         }
     }
@@ -1303,6 +1312,432 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalGet(result_local));
         Ok(())
     }
+    /// Emit `arr.splice(start, deleteCount?, ...items)` — returns a new array
+    /// holding the removed elements, mutates the original in place (shrink or
+    /// stable shift) when capacity allows, otherwise copy-and-abandons like
+    /// push. Insert items are pre-evaluated into locals so their side-effects
+    /// happen before any mutation, matching JS spec order.
+    pub(crate) fn emit_array_splice(
+        &mut self,
+        arr_expr: &Expression<'a>,
+        elem_ty: WasmType,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        let esize: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => return Err(CompileError::type_err("invalid array element type")),
+        };
+
+        let insert_count: i32 = call.arguments.len().saturating_sub(2) as i32;
+
+        // Pre-evaluate insert items into locals (JS spec: arguments evaluated
+        // left-to-right before mutation). Doing this upfront also keeps the
+        // later shift/copy emission simple.
+        let mut item_locals: Vec<u32> = Vec::with_capacity(insert_count as usize);
+        for arg in call.arguments.iter().skip(2) {
+            let expr = arg.to_expression();
+            let ty = self.emit_expr(expr)?;
+            if ty != elem_ty {
+                if elem_ty == WasmType::F64 && ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                } else {
+                    return Err(CompileError::type_err(format!(
+                        "Array.splice insert item has type {ty:?}, expected {elem_ty:?}"
+                    )));
+                }
+            }
+            let local = self.alloc_local(elem_ty);
+            self.push(Instruction::LocalSet(local));
+            item_locals.push(local);
+        }
+
+        // Evaluate and save array pointer.
+        let arr_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(arr_expr)?;
+        self.push(Instruction::LocalSet(arr_local));
+
+        // Load length and capacity.
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+        let cap_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(cap_local));
+
+        // start: eval, truncate f64→i32, normalize negative (+len), clamp to [0, len].
+        let start_local = self.alloc_local(WasmType::I32);
+        let ty = self.emit_expr(call.arguments[0].to_expression())?;
+        if ty == WasmType::F64 {
+            self.push(Instruction::I32TruncF64S);
+        }
+        self.push(Instruction::LocalSet(start_local));
+        // if start < 0: start += len
+        self.push(Instruction::LocalGet(start_local));
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::I32LtS);
+        self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+        self.push(Instruction::LocalGet(start_local));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(start_local));
+        self.push(Instruction::End);
+        // clamp start to [0, len]
+        self.push(Instruction::LocalGet(start_local));
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::I32LtS);
+        self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(start_local));
+        self.push(Instruction::End);
+        self.push(Instruction::LocalGet(start_local));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32GtS);
+        self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::LocalSet(start_local));
+        self.push(Instruction::End);
+
+        // deleteCount: default len-start; otherwise clamp to [0, len-start].
+        let delete_local = self.alloc_local(WasmType::I32);
+        if call.arguments.len() >= 2 {
+            let ty = self.emit_expr(call.arguments[1].to_expression())?;
+            if ty == WasmType::F64 {
+                self.push(Instruction::I32TruncF64S);
+            }
+            self.push(Instruction::LocalSet(delete_local));
+            // if delete < 0: delete = 0
+            self.push(Instruction::LocalGet(delete_local));
+            self.push(Instruction::I32Const(0));
+            self.push(Instruction::I32LtS);
+            self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+            self.push(Instruction::I32Const(0));
+            self.push(Instruction::LocalSet(delete_local));
+            self.push(Instruction::End);
+            // cap_left = len - start; if delete > cap_left: delete = cap_left
+            self.push(Instruction::LocalGet(delete_local));
+            self.push(Instruction::LocalGet(len_local));
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Sub);
+            self.push(Instruction::I32GtS);
+            self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+            self.push(Instruction::LocalGet(len_local));
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Sub);
+            self.push(Instruction::LocalSet(delete_local));
+            self.push(Instruction::End);
+        } else {
+            // Default: remove everything from start onward.
+            self.push(Instruction::LocalGet(len_local));
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Sub);
+            self.push(Instruction::LocalSet(delete_local));
+        }
+
+        // Allocate removed array [header + delete * esize]. Header is written
+        // even when delete == 0 so the result is a valid empty array.
+        let removed_ptr = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::LocalGet(delete_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        let tmp_ptr = self.emit_arena_alloc_to_local(true)?;
+        self.push(Instruction::LocalGet(tmp_ptr));
+        self.push(Instruction::LocalSet(removed_ptr));
+        // length, capacity = delete
+        self.push(Instruction::LocalGet(removed_ptr));
+        self.push(Instruction::LocalGet(delete_local));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(removed_ptr));
+        self.push(Instruction::LocalGet(delete_local));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        // memory.copy(removed + HEADER, arr + HEADER + start*esize, delete*esize)
+        self.push(Instruction::LocalGet(removed_ptr));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(start_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(delete_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // new_len = len - delete + insert_count
+        let new_len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::LocalGet(delete_local));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::I32Const(insert_count));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(new_len_local));
+
+        // if new_len > cap: copy-and-abandon path; else: in-place.
+        self.push(Instruction::LocalGet(new_len_local));
+        self.push(Instruction::LocalGet(cap_local));
+        self.push(Instruction::I32GtU);
+        self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // Copy-and-abandon: allocate new buffer sized to new_len.
+            let new_ptr = self.alloc_local(WasmType::I32);
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::I32Add);
+            let alloc_tmp = self.emit_arena_alloc_to_local(true)?;
+            self.push(Instruction::LocalGet(alloc_tmp));
+            self.push(Instruction::LocalSet(new_ptr));
+
+            // new_ptr[0] = new_len, new_ptr[4] = new_len
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            // Copy prefix: memory.copy(new + HEADER, arr + HEADER, start*esize)
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(arr_local));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+
+            // Write insert items at new + HEADER + (start + i) * esize
+            for (i, &item_local) in item_locals.iter().enumerate() {
+                self.push(Instruction::LocalGet(new_ptr));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Const(i as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(item_local));
+                match elem_ty {
+                    WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    })),
+                    _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    })),
+                }
+            }
+
+            // Copy suffix:
+            //   dst = new + HEADER + (start + insert_count) * esize
+            //   src = arr + HEADER + (start + delete) * esize
+            //   len = (len - start - delete) * esize
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Const(insert_count));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(arr_local));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::LocalGet(delete_local));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(len_local));
+            self.push(Instruction::LocalGet(start_local));
+            self.push(Instruction::I32Sub);
+            self.push(Instruction::LocalGet(delete_local));
+            self.push(Instruction::I32Sub);
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+
+            // arr_local := new_ptr, and write back to the source variable if simple identifier.
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalSet(arr_local));
+            if let Expression::Identifier(ident) = arr_expr {
+                let name = ident.name.as_str();
+                if let Some(&(idx, _ty)) = self.locals.get(name) {
+                    self.push(Instruction::LocalGet(new_ptr));
+                    self.push(Instruction::LocalSet(idx));
+                }
+            }
+        }
+        self.push(Instruction::Else);
+        {
+            // In-place: shift suffix then write items then update length.
+            // memory.copy handles overlapping regions correctly per WASM spec.
+            // Only shift when insert_count != delete (otherwise source-equals-
+            // dest would be wasteful though harmless).
+            if insert_count != 0 {
+                // Always emit the shift: compile-time we don't know if delete==insert_count.
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Const(insert_count));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                // src = arr + HEADER + (start + delete) * esize
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::LocalGet(delete_local));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                // n = (len - start - delete) * esize
+                self.push(Instruction::LocalGet(len_local));
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Sub);
+                self.push(Instruction::LocalGet(delete_local));
+                self.push(Instruction::I32Sub);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+            } else {
+                // Pure shrink (or no-op when delete == 0): shift only when delete > 0.
+                // We still need a shift when inserting 0 but deleting >0.
+                self.push(Instruction::LocalGet(delete_local));
+                self.push(Instruction::I32Eqz);
+                self.push(Instruction::I32Eqz); // delete > 0?
+                self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+                // dst = arr + HEADER + start * esize
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                // src = arr + HEADER + (start + delete) * esize
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::LocalGet(delete_local));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                // n = (len - start - delete) * esize
+                self.push(Instruction::LocalGet(len_local));
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Sub);
+                self.push(Instruction::LocalGet(delete_local));
+                self.push(Instruction::I32Sub);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+                self.push(Instruction::End);
+            }
+
+            // Write insert items at arr + HEADER + (start + i) * esize
+            for (i, &item_local) in item_locals.iter().enumerate() {
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(start_local));
+                self.push(Instruction::I32Const(i as i32));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalGet(item_local));
+                match elem_ty {
+                    WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 3,
+                        memory_index: 0,
+                    })),
+                    _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    })),
+                }
+            }
+
+            // arr[0] = new_len
+            self.push(Instruction::LocalGet(arr_local));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        self.push(Instruction::End);
+
+        // Leave removed ptr on stack.
+        self.push(Instruction::LocalGet(removed_ptr));
+        Ok(())
+    }
+
     pub(crate) fn emit_array_bounds_check(&mut self, arr_local: u32, idx_local: u32) {
         // if (index >= length) unreachable
         self.push(Instruction::LocalGet(idx_local));
@@ -1323,12 +1758,15 @@ impl<'a> FuncContext<'a> {
                 .local_array_elem_types
                 .get(ident.name.as_str())
                 .copied(),
-            // arr.filter() / arr.sort() return arrays with the same element type as source
+            // arr.filter() / arr.sort() / arr.splice() / arr.slice() / arr.concat()
+            // return arrays with the same element type as source
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     let method = member.property.name.as_str();
                     match method {
-                        "filter" | "sort" => self.resolve_expr_array_elem(&member.object),
+                        "filter" | "sort" | "splice" | "slice" | "concat" => {
+                            self.resolve_expr_array_elem(&member.object)
+                        }
                         "map" => {
                             // map changes the element type — infer from arrow return
                             if let Some(arg) = call.arguments.first()
@@ -1376,12 +1814,14 @@ impl<'a> FuncContext<'a> {
                 .local_array_elem_classes
                 .get(ident.name.as_str())
                 .cloned(),
-            // Chained calls: arr.filter() preserves element class
+            // Chained calls: filter/sort/splice/slice/concat preserve element class
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     let method = member.property.name.as_str();
                     match method {
-                        "filter" | "sort" => self.resolve_expr_array_elem_class(&member.object),
+                        "filter" | "sort" | "splice" | "slice" | "concat" => {
+                            self.resolve_expr_array_elem_class(&member.object)
+                        }
                         _ => None,
                     }
                 } else {

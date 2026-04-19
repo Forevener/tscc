@@ -65,6 +65,13 @@ impl<'a> FuncContext<'a> {
             return Ok(result);
         }
 
+        // Check for Map<K, V> method calls (m.clear, m.get, ...). Must run
+        // before the generic class-method dispatch — Map's layout is
+        // synthesized and has no registered methods to fall through to.
+        if let Some(result) = self.try_emit_map_method_call(call)? {
+            return Ok(result);
+        }
+
         // Check for number instance method calls (x.toString(), x.toFixed())
         if let Some(result) = self.try_emit_number_instance_call(call)? {
             return Ok(result);
@@ -75,9 +82,39 @@ impl<'a> FuncContext<'a> {
             return Ok(result);
         }
 
-        let callee_name = match &call.callee {
+        let callee_name_raw = match &call.callee {
             Expression::Identifier(ident) => ident.name.as_str(),
             _ => return Err(CompileError::unsupported("non-identifier callee")),
+        };
+
+        // Generic function instantiation. Two cases:
+        //   - explicit args (`identity<i32>(x)`) — mangle per the type args.
+        //   - inferred args (`identity(x)`) — look up the pre-computed mangled
+        //     name the pre-codegen collector stashed per call-site span.
+        let mangled_call;
+        let callee_name: &str = if let Some(type_args) = call.type_arguments.as_ref() {
+            let mut tokens = Vec::with_capacity(type_args.params.len());
+            for p in &type_args.params {
+                let bt = crate::codegen::generics::resolve_bound_type(
+                    p,
+                    &self.module_ctx.class_names,
+                    self.type_bindings.as_ref(),
+                )?;
+                tokens.push(bt.mangle_token());
+            }
+            mangled_call = format!("{callee_name_raw}${}", tokens.join("$"));
+            if self.module_ctx.get_func(&mangled_call).is_some() {
+                &mangled_call
+            } else {
+                callee_name_raw
+            }
+        } else if let Some(stashed) = self.module_ctx.inferred_fn_calls.get(&call.span.start)
+            && self.module_ctx.get_func(stashed).is_some()
+        {
+            mangled_call = stashed.clone();
+            &mangled_call
+        } else {
+            callee_name_raw
         };
 
         // Type cast: f64(x) -> f64.convert_i32_s, i32(x) -> i32.trunc_f64_s
@@ -496,7 +533,10 @@ impl<'a> FuncContext<'a> {
         };
 
         let method = member.property.name.as_str();
-        if !matches!(method, "toString" | "toFixed" | "toPrecision") {
+        if !matches!(
+            method,
+            "toString" | "toFixed" | "toPrecision" | "toExponential"
+        ) {
             return Ok(None);
         }
 
@@ -539,16 +579,21 @@ impl<'a> FuncContext<'a> {
                 Ok(Some(WasmType::I32))
             }
             "toFixed" => {
-                if call.arguments.len() != 1 {
+                // ES § 21.1.3.3: fractionDigits defaults to 0.
+                if call.arguments.len() > 1 {
                     return Err(CompileError::codegen(
-                        "toFixed() expects 1 argument (digits)",
+                        "toFixed() expects 0 or 1 arguments (digits)",
                     ));
                 }
                 let ty = self.emit_expr(&member.object)?;
                 if ty == WasmType::I32 {
                     self.push(Instruction::F64ConvertI32S);
                 }
-                self.emit_expr(call.arguments[0].to_expression())?;
+                if call.arguments.is_empty() {
+                    self.push(Instruction::I32Const(0));
+                } else {
+                    self.emit_expr(call.arguments[0].to_expression())?;
+                }
                 let (func_idx, _) = self
                     .module_ctx
                     .get_func("__str_toFixed")
@@ -557,20 +602,59 @@ impl<'a> FuncContext<'a> {
                 Ok(Some(WasmType::I32))
             }
             "toPrecision" => {
-                if call.arguments.len() != 1 {
+                // ES § 21.1.3.5: if precision is undefined, return ToString(x).
+                // We route the no-arg form straight to __str_from_f64.
+                if call.arguments.len() > 1 {
                     return Err(CompileError::codegen(
-                        "toPrecision() expects 1 argument (precision)",
+                        "toPrecision() expects 0 or 1 arguments (precision)",
                     ));
                 }
                 let ty = self.emit_expr(&member.object)?;
                 if ty == WasmType::I32 {
                     self.push(Instruction::F64ConvertI32S);
                 }
-                self.emit_expr(call.arguments[0].to_expression())?;
+                if call.arguments.is_empty() {
+                    let (func_idx, _) = self
+                        .module_ctx
+                        .get_func("__str_from_f64")
+                        .ok_or_else(|| {
+                            CompileError::codegen("__str_from_f64 not registered")
+                        })?;
+                    self.push(Instruction::Call(func_idx));
+                } else {
+                    self.emit_expr(call.arguments[0].to_expression())?;
+                    let (func_idx, _) = self
+                        .module_ctx
+                        .get_func("__str_toPrecision")
+                        .ok_or_else(|| {
+                            CompileError::codegen("__str_toPrecision not registered")
+                        })?;
+                    self.push(Instruction::Call(func_idx));
+                }
+                Ok(Some(WasmType::I32))
+            }
+            "toExponential" => {
+                // ES § 21.1.3.4: if fractionDigits is undefined, pick the shortest
+                // round-trippable mantissa. We signal that to the helper by
+                // passing a negative sentinel for `digits`.
+                if call.arguments.len() > 1 {
+                    return Err(CompileError::codegen(
+                        "toExponential() expects 0 or 1 arguments (digits)",
+                    ));
+                }
+                let ty = self.emit_expr(&member.object)?;
+                if ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                }
+                if call.arguments.is_empty() {
+                    self.push(Instruction::I32Const(-1));
+                } else {
+                    self.emit_expr(call.arguments[0].to_expression())?;
+                }
                 let (func_idx, _) = self
                     .module_ctx
-                    .get_func("__str_toPrecision")
-                    .ok_or_else(|| CompileError::codegen("__str_toPrecision not registered"))?;
+                    .get_func("__str_toExponential")
+                    .ok_or_else(|| CompileError::codegen("__str_toExponential not registered"))?;
                 self.push(Instruction::Call(func_idx));
                 Ok(Some(WasmType::I32))
             }

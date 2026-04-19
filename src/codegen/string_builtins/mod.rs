@@ -1,6 +1,4 @@
-mod compare;
 mod convert;
-mod search;
 mod split_join;
 mod transform;
 use std::collections::HashSet;
@@ -45,6 +43,7 @@ pub const STRING_HELPER_NAMES: &[&str] = &[
     "__str_replaceAll",
     "__str_toFixed",
     "__str_toPrecision",
+    "__str_toExponential",
     "__str_lastIndexOf",
 ];
 
@@ -56,18 +55,34 @@ type HelperSig = (&'static str, Vec<(String, WasmType)>, WasmType);
 /// body-emission pass (`compile_string_helpers`). Threads through `module.rs`
 /// because `compile_string_helpers` runs later, with immutable access to `ctx`.
 pub struct HelperRegistration {
-    /// Parallel to `precompiled::PRECOMPILED_FUNCS`: tscc function index for
-    /// each bundle entry, or `u32::MAX` if that entry wasn't registered.
-    pub bundle_tscc_indices: Vec<u32>,
     /// Bundle indices that WERE registered, in registration (= emission) order.
     pub registered_bundle: Vec<usize>,
+    /// Combined helper-space → tscc function index map. Length =
+    /// `PRECOMPILED_IMPORTS.len() + PRECOMPILED_FUNCS.len()`; entries for
+    /// import slots come first and map to synthesized/user-provided tscc
+    /// functions, then bundle slots follow. The Element-section emitter in
+    /// `sections.rs` indexes this directly with helper full-space funcrefs.
+    pub func_index_map: Vec<u32>,
+    /// Parallel to `precompiled::PRECOMPILED_TYPES`: tscc type index for each
+    /// helper type referenced by some registered `call_indirect`.
+    pub type_index_map: Vec<u32>,
+    /// Parallel to `precompiled::PRECOMPILED_GLOBALS`: tscc global index for
+    /// each helper global referenced by some registered `global.get/set`.
+    pub global_index_map: Vec<u32>,
+    /// True iff any registered helper uses `call_indirect`.
+    pub requires_table: bool,
+    /// True iff the bundle contributed any Data segments to the output.
+    pub requires_data: bool,
+    /// Destination table index for helper `call_indirect`s.
+    pub helper_table_index: u32,
 }
 
 pub fn register_string_helpers(
     ctx: &mut ModuleContext,
     used: &HashSet<String>,
+    exposed: &HashSet<String>,
 ) -> HelperRegistration {
-    let helpers: Vec<HelperSig> = vec![
+    let mut helpers: Vec<HelperSig> = vec![
         // __str_eq(a: i32, b: i32) -> i32
         (
             "__str_eq",
@@ -270,7 +285,21 @@ pub fn register_string_helpers(
             ],
             WasmType::I32,
         ),
+        // __str_toExponential(n: f64, digits: i32) -> i32
+        (
+            "__str_toExponential",
+            vec![
+                ("n".into(), WasmType::F64),
+                ("digits".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
     ];
+
+    // Hash/equality helpers for Map/Set keys. The precompiled bodies live
+    // alongside the string helpers in `tscc_helpers.wasm`; they share the
+    // same registration path via `precompiled::find_export`.
+    helpers.extend(super::hash_builtins::hash_helper_sigs());
 
     // Split registration into two phases so precompiled helpers can live in a
     // contiguous block after all hand-written ones — this keeps
@@ -292,37 +321,192 @@ pub fn register_string_helpers(
         }
     }
 
-    // Phase 2: seed the bundle from used precompiled exports, then walk the
-    // call graph to pull in every internal they transitively reach.
+    // Phase 2: seed the bundle from used precompiled exports, walk the call
+    // graph, then expand with dynamic dispatch.
     let seeds: Vec<usize> = super::precompiled::PRECOMPILED_FUNCS
         .iter()
         .enumerate()
         .filter_map(|(i, pf)| pf.name.filter(|n| used.contains(*n)).map(|_| i))
         .collect();
-    let registered_bundle = super::precompiled::transitive_closure(&seeds);
+    let direct_closure = super::precompiled::transitive_closure(&seeds);
+    let (registered_bundle, requires_table) =
+        super::precompiled::expand_with_dynamic_dispatch(direct_closure);
 
-    // Phase 3: register each bundle function. Exports go through `register_func`
-    // so user TS can look them up by name; internals use `register_raw_func`
-    // (bypasses `func_map`, supports any ValType including i64).
-    let mut bundle_tscc_indices = vec![u32::MAX; super::precompiled::PRECOMPILED_FUNCS.len()];
+    // Tscc needs __arena_ptr to exist if any helper in the bundle got pulled
+    // in — the helper-arena-alloc shim (registered below) bumps it, and
+    // helpers' string allocations all flow through that shim.
+    if !registered_bundle.is_empty() {
+        ctx.init_arena();
+    }
+
+    // Phase 3a: register helper function imports. The helper bundle's import
+    // table lists the `(module, name, signature)` triples that its internal
+    // functions `call` into. Each one needs a tscc function in the same
+    // signature shape — some we know how to synthesize (the arena shim),
+    // others would be user-provided host imports (not supported yet).
+    let num_imports = super::precompiled::PRECOMPILED_IMPORTS.len();
+    let num_bundle = super::precompiled::PRECOMPILED_FUNCS.len();
+    let mut func_index_map = vec![u32::MAX; num_imports + num_bundle];
+
+    for (import_idx, imp) in super::precompiled::PRECOMPILED_IMPORTS.iter().enumerate() {
+        let tscc_idx = match (imp.module, imp.name) {
+            ("env", "__tscc_arena_alloc") => register_helper_arena_alloc(ctx),
+            _ => panic!(
+                "helper wasm imports {}::{} — no tscc handler registered for it",
+                imp.module, imp.name
+            ),
+        };
+        func_index_map[import_idx] = tscc_idx;
+    }
+
+    // Phase 3b: register each bundle (internal) function. Exports go through
+    // `register_func`; internals use `register_raw_func` (supports any
+    // ValType including i64). `exposed` is a test/debug hook that forces a
+    // named export on specific helpers so the host can call them directly.
     for &bundle_idx in &registered_bundle {
         let pf = &super::precompiled::PRECOMPILED_FUNCS[bundle_idx];
         let tscc_idx = if let Some(name) = pf.name {
             let (params, ret) = precompiled_sigs
                 .get(name)
                 .unwrap_or_else(|| panic!("no WasmType signature registered for precompiled export '{name}'"));
-            ctx.register_func(name, params, *ret, false).unwrap()
+            let is_export = exposed.contains(name);
+            ctx.register_func(name, params, *ret, is_export).unwrap()
         } else {
             let synthetic = format!("__helper_internal_{bundle_idx}");
             ctx.register_raw_func(&synthetic, pf.params.to_vec(), pf.results.to_vec())
         };
-        bundle_tscc_indices[bundle_idx] = tscc_idx;
+        func_index_map[num_imports + bundle_idx] = tscc_idx;
     }
 
-    HelperRegistration {
-        bundle_tscc_indices,
-        registered_bundle,
+    // Phase 4: map every call_indirect type referenced by registered helpers
+    // into tscc's merged type section.
+    let mut type_index_map = vec![u32::MAX; super::precompiled::PRECOMPILED_TYPES.len()];
+    for &bundle_idx in &registered_bundle {
+        let pf = &super::precompiled::PRECOMPILED_FUNCS[bundle_idx];
+        for cs in pf.call_indirect_sites {
+            let helper_ty = cs.original_type_idx as usize;
+            if type_index_map[helper_ty] == u32::MAX {
+                let t = &super::precompiled::PRECOMPILED_TYPES[helper_ty];
+                let tscc_ty = ctx.get_or_add_type_sig(t.params.to_vec(), t.results.to_vec());
+                type_index_map[helper_ty] = tscc_ty;
+            }
+        }
     }
+
+    // Phase 5: register every helper global that any registered body
+    // references via `global.get/set`. Each becomes a new internal tscc
+    // global with the rustc-emitted init value (stack pointer, __data_end,
+    // __heap_base, …). They don't enter `ctx.globals` (which is reserved for
+    // named tscc-visible globals) — we track them only by index.
+    let mut global_index_map =
+        vec![u32::MAX; super::precompiled::PRECOMPILED_GLOBALS.len()];
+    for &bundle_idx in &registered_bundle {
+        let pf = &super::precompiled::PRECOMPILED_FUNCS[bundle_idx];
+        for gs in pf.global_sites {
+            let helper_g = gs.original_global_idx as usize;
+            if global_index_map[helper_g] == u32::MAX {
+                let g = &super::precompiled::PRECOMPILED_GLOBALS[helper_g];
+                global_index_map[helper_g] = register_raw_helper_global(ctx, g);
+            }
+        }
+    }
+
+    let helper_table_index = if requires_table { 1 } else { 0 };
+    let requires_data =
+        !registered_bundle.is_empty() && super::precompiled::has_data();
+
+    HelperRegistration {
+        registered_bundle,
+        func_index_map,
+        type_index_map,
+        global_index_map,
+        requires_table,
+        requires_data,
+        helper_table_index,
+    }
+}
+
+/// Synthesize a tscc function `__helper_arena_alloc(size: i32) -> i32` that
+/// services every helper's `env::__tscc_arena_alloc` import call with a plain
+/// bump on tscc's `__arena_ptr`. No overflow check — helper allocations are
+/// short-lived within a single host call, matching the arena lifecycle. If
+/// the host has opted in to checked growth via `ArenaOverflow != Unchecked`,
+/// the existing `__arena_alloc` function already provides the checked
+/// variant; we could route there, but it has an extra branch helpers don't
+/// need for their own allocations.
+fn register_helper_arena_alloc(ctx: &mut ModuleContext) -> u32 {
+    use wasm_encoder::{Function, Instruction};
+
+    // Register the function signature and get an index.
+    let params = vec![("size".to_string(), WasmType::I32)];
+    let func_idx = ctx
+        .register_func("__helper_arena_alloc", &params, WasmType::I32, false)
+        .unwrap();
+
+    // Build the body: ptr = arena_ptr; arena_ptr += size; return ptr.
+    let arena_idx = ctx
+        .arena_ptr_global
+        .expect("__arena_ptr global must be initialized before helper registration");
+    let mut func = Function::new(vec![(1, wasm_encoder::ValType::I32)]);
+    let size_param = 0u32;
+    let ret_local = 1u32;
+
+    func.instruction(&Instruction::GlobalGet(arena_idx));
+    func.instruction(&Instruction::LocalSet(ret_local));
+    func.instruction(&Instruction::GlobalGet(arena_idx));
+    func.instruction(&Instruction::LocalGet(size_param));
+    func.instruction(&Instruction::I32Add);
+    func.instruction(&Instruction::GlobalSet(arena_idx));
+    func.instruction(&Instruction::LocalGet(ret_local));
+    func.instruction(&Instruction::End);
+
+    // Stash the body — it gets emitted alongside the other helper bodies in
+    // `compile_string_helpers` via the `helper_arena_alloc_body` field on
+    // `HelperRegistration`. For now, we keep the emission path in
+    // `compile_string_helpers` and return just the func_idx.
+    ctx.helper_arena_alloc_body
+        .replace(Some(func));
+    func_idx
+}
+
+/// Register a tscc global mirroring a rustc-emitted helper global (stack
+/// pointer, `__data_end`, `__heap_base`). Uses a synthetic name so it never
+/// collides with user-visible globals. Returns the tscc global index.
+fn register_raw_helper_global(
+    ctx: &mut ModuleContext,
+    g: &super::precompiled::DeclaredGlobal,
+) -> u32 {
+    let idx = ctx.next_global_index_internal();
+    let name = format!("__helper_global_{idx}");
+    // For the emission pass, tscc expects:
+    //  - entry in `ctx.globals` keyed by name (for mutability lookup)
+    //  - entry in `ctx.global_inits` at position `idx`
+    //  - entry in `ctx.mutable_globals` if mutable (matched by name)
+    let ty = match g.val_type {
+        wasm_encoder::ValType::I32 => WasmType::I32,
+        wasm_encoder::ValType::F64 => WasmType::F64,
+        // Other wasm types don't have a WasmType equivalent; globals of those
+        // types would need raw plumbing. Rustc never emits them for our
+        // helpers today, so error loudly if it ever starts.
+        other => panic!(
+            "unsupported helper global type {:?} (only i32/f64 are handled)",
+            other
+        ),
+    };
+    ctx.globals.insert(name.clone(), (idx, ty));
+    let init = match g.init {
+        super::precompiled::GlobalInit::I32(v) => crate::codegen::module::GlobalInit::I32(v),
+        super::precompiled::GlobalInit::I64(v) => crate::codegen::module::GlobalInit::I64(v),
+        super::precompiled::GlobalInit::F64(v) => crate::codegen::module::GlobalInit::F64(v),
+        super::precompiled::GlobalInit::F32(_) => {
+            panic!("f32 helper global init not yet supported")
+        }
+    };
+    ctx.global_inits.push(init);
+    if g.mutable {
+        ctx.mutable_globals.insert(name);
+    }
+    idx
 }
 
 /// Compile bodies for the string helpers that were registered.
@@ -347,11 +531,20 @@ pub fn compile_string_helpers(
         out.push(compile_helper(name, arena_idx));
     }
 
+    // Emit the helper-arena-alloc shim body (registered during
+    // `register_string_helpers` via &mut ctx, body stashed on ctx).
+    if let Some(body) = ctx.helper_arena_alloc_body.borrow_mut().take() {
+        out.push(body);
+    }
+
+    let plan = super::precompiled::RewritePlan {
+        func_index_map: &reg.func_index_map,
+        type_index_map: &reg.type_index_map,
+        global_index_map: &reg.global_index_map,
+        helper_table_index: reg.helper_table_index,
+    };
     for &bundle_idx in &reg.registered_bundle {
-        out.push(super::precompiled::build_function(
-            bundle_idx,
-            &reg.bundle_tscc_indices,
-        ));
+        out.push(super::precompiled::build_function(bundle_idx, &plan));
     }
 
     out
@@ -480,8 +673,17 @@ impl Scanner {
         }
 
         // Number.prototype.toPrecision(digits) needs the dedicated helper.
+        // The no-arg form routes directly to __str_from_f64 at codegen time
+        // (ES § 21.1.3.5: `toPrecision()` is `toString()`), so pull that
+        // helper in too — the dependency is invisible to transitive closure.
         if self.method_names.contains("toPrecision") {
             add("__str_toPrecision", &mut used);
+            add("__str_from_f64", &mut used);
+        }
+
+        // Number.prototype.toExponential(digits) needs the dedicated helper.
+        if self.method_names.contains("toExponential") {
+            add("__str_toExponential", &mut used);
         }
 
         // `parseInt` / `parseFloat` can appear as bare identifiers OR as
@@ -769,31 +971,21 @@ impl Scanner {
 
 fn compile_helper(name: &str, arena_idx: u32) -> Function {
     match name {
-        "__str_eq" => compare::build_str_eq(),
-        "__str_cmp" => compare::build_str_cmp(),
-        "__str_indexOf" => search::build_str_index_of(),
-        "__str_startsWith" => search::build_str_starts_with(),
-        "__str_endsWith" => search::build_str_ends_with(),
-        "__str_includes" => search::build_str_includes(),
         "__str_toLower" => transform::build_str_to_lower(arena_idx),
         "__str_toUpper" => transform::build_str_to_upper(arena_idx),
         "__str_trim" => transform::build_str_trim_impl(arena_idx, true, true),
         "__str_trimStart" => transform::build_str_trim_impl(arena_idx, true, false),
         "__str_trimEnd" => transform::build_str_trim_impl(arena_idx, false, true),
         "__str_from_i32" => convert::build_str_from_i32(arena_idx),
-        "__str_from_f64" => convert::build_str_from_f64(arena_idx),
         "__str_split" => split_join::build_str_split(arena_idx),
         "__str_replace" => transform::build_str_replace(arena_idx),
         "__str_parseInt" => convert::build_str_parse_int(),
-        "__str_parseFloat" => convert::build_str_parse_float(),
         "__str_fromCharCode" => convert::build_str_from_char_code(arena_idx),
         "__str_repeat" => transform::build_str_repeat(arena_idx),
         "__str_padStart" => transform::build_str_pad_start(arena_idx),
         "__str_padEnd" => transform::build_str_pad_end(arena_idx),
         "__str_concat" => transform::build_str_concat(arena_idx),
         "__str_replaceAll" => transform::build_str_replace_all(arena_idx),
-        "__str_toFixed" => convert::build_str_to_fixed(arena_idx),
-        "__str_toPrecision" => convert::build_str_to_precision(arena_idx),
         _ => unreachable!("unknown string helper: {name}"),
     }
 }

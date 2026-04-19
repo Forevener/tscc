@@ -14,15 +14,40 @@ impl<'a> FuncContext<'a> {
         &mut self,
         new_expr: &NewExpression<'a>,
     ) -> Result<WasmType, CompileError> {
-        let class_name = match &new_expr.callee {
+        let base_name = match &new_expr.callee {
             Expression::Identifier(ident) => ident.name.as_str(),
             _ => return Err(CompileError::unsupported("non-identifier new target")),
         };
 
         // Handle new Array<T>(capacity)
-        if class_name == "Array" {
+        if base_name == "Array" {
             return self.emit_new_array(new_expr);
         }
+
+        // Handle new Map<K, V>() — compiler-owned, per-monomorphization layout.
+        if base_name == crate::codegen::map_builtins::MAP_BASE {
+            return self.emit_new_map(new_expr);
+        }
+
+        // Generic instantiation: `new Box<i32>(...)` → look up the mangled
+        // monomorphization. Type args may themselves reference the enclosing
+        // function's type parameters, so we thread through `type_bindings`.
+        let mangled_owned;
+        let class_name: &str = if let Some(type_args) = new_expr.type_arguments.as_ref() {
+            let mut tokens = Vec::with_capacity(type_args.params.len());
+            for p in &type_args.params {
+                let bt = crate::codegen::generics::resolve_bound_type(
+                    p,
+                    &self.module_ctx.class_names,
+                    self.type_bindings.as_ref(),
+                )?;
+                tokens.push(bt.mangle_token());
+            }
+            mangled_owned = format!("{base_name}${}", tokens.join("$"));
+            &mangled_owned
+        } else {
+            base_name
+        };
 
         let layout = self
             .module_ctx
@@ -62,6 +87,121 @@ impl<'a> FuncContext<'a> {
         // Return pointer
         self.push(Instruction::LocalGet(ptr_local));
         Ok(WasmType::I32)
+    }
+
+    /// Emit `new Map<K, V>()` — arena-allocate the 5-field header and an
+    /// initial bucket array of size `INITIAL_CAPACITY`, then initialize the
+    /// header. State bytes in the bucket array default to `BUCKET_EMPTY` (0)
+    /// via the arena's bump-over-fresh-memory property, so no explicit
+    /// memory.fill is needed here. `head_idx`/`tail_idx` are set to `-1` so
+    /// the first `set()` can detect an empty list.
+    pub(crate) fn emit_new_map(
+        &mut self,
+        new_expr: &NewExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        use crate::codegen::map_builtins::{self, INITIAL_CAPACITY};
+
+        if !new_expr.arguments.is_empty() {
+            return Err(CompileError::codegen(
+                "new Map<K, V>() takes no arguments",
+            ));
+        }
+        let type_args = new_expr.type_arguments.as_ref().ok_or_else(|| {
+            CompileError::type_err("new Map requires explicit <K, V> type arguments")
+        })?;
+        if type_args.params.len() != map_builtins::MAP_ARITY {
+            return Err(CompileError::type_err(format!(
+                "Map<K, V> expects 2 type arguments, got {}",
+                type_args.params.len()
+            )));
+        }
+        let key_ty = crate::codegen::generics::resolve_bound_type(
+            &type_args.params[0],
+            &self.module_ctx.class_names,
+            self.type_bindings.as_ref(),
+        )?;
+        let value_ty = crate::codegen::generics::resolve_bound_type(
+            &type_args.params[1],
+            &self.module_ctx.class_names,
+            self.type_bindings.as_ref(),
+        )?;
+        let mangled = map_builtins::mangle_map_name(&key_ty, &value_ty);
+        let info = self.module_ctx.map_info.get(&mangled).ok_or_else(|| {
+            CompileError::codegen(format!("map instantiation '{mangled}' not registered"))
+        })?;
+        let header_size = self
+            .module_ctx
+            .class_registry
+            .get(&mangled)
+            .expect("map layout registered alongside map_info")
+            .size;
+        let bucket_size = info.bucket.total_size;
+
+        // Allocate header.
+        self.push(Instruction::I32Const(header_size as i32));
+        let header_ptr = self.emit_arena_alloc_to_local(true)?;
+
+        // Allocate bucket array.
+        self.push(Instruction::I32Const(
+            (INITIAL_CAPACITY * bucket_size) as i32,
+        ));
+        let buckets_ptr = self.emit_arena_alloc_to_local(true)?;
+
+        let buckets_off = self.field_offset(&mangled, "buckets_ptr");
+        let capacity_off = self.field_offset(&mangled, "capacity");
+        let head_off = self.field_offset(&mangled, "head_idx");
+        let tail_off = self.field_offset(&mangled, "tail_idx");
+
+        // header.buckets_ptr = buckets_ptr
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::LocalGet(buckets_ptr));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: buckets_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // header.capacity = INITIAL_CAPACITY
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(INITIAL_CAPACITY as i32));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: capacity_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // header.head_idx = -1, header.tail_idx = -1
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(map_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: head_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(map_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: tail_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // size defaults to 0 from arena zero-init.
+
+        self.push(Instruction::LocalGet(header_ptr));
+        Ok(WasmType::I32)
+    }
+
+    /// Field offset lookup shared between Map codegen paths. Panics if the
+    /// class or field is missing — callers stage the check earlier.
+    fn field_offset(&self, class_name: &str, field_name: &str) -> u32 {
+        self.module_ctx
+            .class_registry
+            .get(class_name)
+            .and_then(|l| l.field_map.get(field_name).map(|(off, _)| *off))
+            .unwrap_or_else(|| {
+                panic!("class '{class_name}' has no field '{field_name}'");
+            })
     }
 
     /// Emit `new Array<T>(capacity)` — arena-allocate array with header + element space.
@@ -123,6 +263,309 @@ impl<'a> FuncContext<'a> {
         }));
 
         // Return pointer
+        self.push(Instruction::LocalGet(ptr_local));
+        Ok(WasmType::I32)
+    }
+
+    /// Emit an array literal `[a, b, c]` — arena-allocates header + elements in
+    /// a single bump, then stores each element inline. Element type is taken
+    /// from `expected_elem_ty` when supplied (e.g. the declared annotation on
+    /// the target variable), otherwise inferred from the first element. Empty
+    /// literals without context raise a type error rather than silently picking
+    /// a default.
+    pub(crate) fn emit_array_literal(
+        &mut self,
+        arr_expr: &ArrayExpression<'a>,
+        expected_elem_ty: Option<WasmType>,
+    ) -> Result<WasmType, CompileError> {
+        // Reject holes; spreads go through a runtime-length path.
+        let mut has_spread = false;
+        for el in &arr_expr.elements {
+            match el {
+                ArrayExpressionElement::SpreadElement(_) => has_spread = true,
+                ArrayExpressionElement::Elision(_) => {
+                    return Err(CompileError::unsupported("hole in array literal"));
+                }
+                _ => {}
+            }
+        }
+
+        // Determine element type from context, first inline element, or first spread source.
+        let elem_ty = if let Some(ty) = expected_elem_ty {
+            ty
+        } else if arr_expr.elements.is_empty() {
+            return Err(CompileError::type_err(
+                "cannot infer element type of empty array literal — add a type annotation: `let x: number[] = []`",
+            ));
+        } else {
+            let first = &arr_expr.elements[0];
+            match first {
+                ArrayExpressionElement::SpreadElement(s) => self
+                    .resolve_expr_array_elem(&s.argument)
+                    .ok_or_else(|| CompileError::type_err(
+                        "cannot infer element type from spread source — add a type annotation on the target variable",
+                    ))?,
+                _ => {
+                    let expr = first.as_expression().ok_or_else(|| {
+                        CompileError::codegen("unsupported first array literal element")
+                    })?;
+                    let (ty, _class) = self.infer_init_type(expr)?;
+                    ty
+                }
+            }
+        };
+
+        let elem_size: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => {
+                return Err(CompileError::type_err(
+                    "Array element type must be i32 or f64",
+                ));
+            }
+        };
+
+        if !has_spread {
+            return self.emit_array_literal_fixed(arr_expr, elem_ty, elem_size);
+        }
+        self.emit_array_literal_with_spread(arr_expr, elem_ty, elem_size)
+    }
+
+    /// Fast path for spread-free array literals: element count is known at
+    /// compile time, so we allocate once and emit inline stores.
+    fn emit_array_literal_fixed(
+        &mut self,
+        arr_expr: &ArrayExpression<'a>,
+        elem_ty: WasmType,
+        elem_size: i32,
+    ) -> Result<WasmType, CompileError> {
+        let elem_count = arr_expr.elements.len() as i32;
+        let total = ARRAY_HEADER_SIZE as i32 + elem_count * elem_size;
+        self.push(Instruction::I32Const(total));
+        let ptr_local = self.emit_arena_alloc_to_local(true)?;
+
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(elem_count));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(elem_count));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        for (i, el) in arr_expr.elements.iter().enumerate() {
+            let expr = el.as_expression().ok_or_else(|| {
+                CompileError::codegen("unsupported array literal element kind")
+            })?;
+            self.push(Instruction::LocalGet(ptr_local));
+            let ty = self.emit_expr(expr)?;
+            if ty != elem_ty {
+                if elem_ty == WasmType::F64 && ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                } else {
+                    return Err(CompileError::type_err(format!(
+                        "array literal element {i} has type {ty:?}, expected {elem_ty:?}"
+                    )));
+                }
+            }
+            let offset = (ARRAY_HEADER_SIZE as i32 + (i as i32) * elem_size) as u64;
+            match elem_ty {
+                WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                    offset,
+                    align: 3,
+                    memory_index: 0,
+                })),
+                WasmType::I32 => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                    offset,
+                    align: 2,
+                    memory_index: 0,
+                })),
+                _ => unreachable!(),
+            }
+        }
+
+        self.push(Instruction::LocalGet(ptr_local));
+        Ok(WasmType::I32)
+    }
+
+    /// Runtime-length path for array literals containing `...spread` elements.
+    /// Strategy:
+    ///   1. Evaluate every inline element and every spread source upfront into
+    ///      locals (JS evaluation order, and protects against arena moves).
+    ///   2. Sum spread lengths + inline count into `total_len` at runtime.
+    ///   3. Allocate header + total_len * elem_size; write header.
+    ///   4. Walk elements again, copying each inline value or memory.copy'ing
+    ///      each spread source into the output at the running write cursor.
+    fn emit_array_literal_with_spread(
+        &mut self,
+        arr_expr: &ArrayExpression<'a>,
+        elem_ty: WasmType,
+        elem_size: i32,
+    ) -> Result<WasmType, CompileError> {
+        // Pre-evaluate elements into locals, tagging what each slot holds.
+        enum Piece {
+            Inline(u32), // local holds the value
+            Spread { ptr: u32, len: u32 }, // locals hold source pointer and its length
+        }
+        let mut pieces: Vec<Piece> = Vec::with_capacity(arr_expr.elements.len());
+
+        for (i, el) in arr_expr.elements.iter().enumerate() {
+            match el {
+                ArrayExpressionElement::SpreadElement(s) => {
+                    // Validate spread source element type matches.
+                    let src_elem = self.resolve_expr_array_elem(&s.argument).ok_or_else(|| {
+                        CompileError::type_err(format!(
+                            "spread source at literal position {i} is not a known array"
+                        ))
+                    })?;
+                    if src_elem != elem_ty {
+                        return Err(CompileError::type_err(format!(
+                            "spread source element type {src_elem:?} does not match array literal element type {elem_ty:?}"
+                        )));
+                    }
+                    // Evaluate once, save pointer.
+                    let ptr = self.alloc_local(WasmType::I32);
+                    self.emit_expr(&s.argument)?;
+                    self.push(Instruction::LocalSet(ptr));
+                    // Load .length
+                    let len = self.alloc_local(WasmType::I32);
+                    self.push(Instruction::LocalGet(ptr));
+                    self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    self.push(Instruction::LocalSet(len));
+                    pieces.push(Piece::Spread { ptr, len });
+                }
+                _ => {
+                    let expr = el.as_expression().ok_or_else(|| {
+                        CompileError::codegen("unsupported array literal element kind")
+                    })?;
+                    let ty = self.emit_expr(expr)?;
+                    if ty != elem_ty {
+                        if elem_ty == WasmType::F64 && ty == WasmType::I32 {
+                            self.push(Instruction::F64ConvertI32S);
+                        } else {
+                            return Err(CompileError::type_err(format!(
+                                "array literal element {i} has type {ty:?}, expected {elem_ty:?}"
+                            )));
+                        }
+                    }
+                    let val = self.alloc_local(elem_ty);
+                    self.push(Instruction::LocalSet(val));
+                    pieces.push(Piece::Inline(val));
+                }
+            }
+        }
+
+        // total_len = inline_count + sum(spread.len)
+        let inline_count: i32 = pieces
+            .iter()
+            .filter(|p| matches!(p, Piece::Inline(_)))
+            .count() as i32;
+        let total_len = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(inline_count));
+        self.push(Instruction::LocalSet(total_len));
+        for p in &pieces {
+            if let Piece::Spread { len, .. } = p {
+                self.push(Instruction::LocalGet(total_len));
+                self.push(Instruction::LocalGet(*len));
+                self.push(Instruction::I32Add);
+                self.push(Instruction::LocalSet(total_len));
+            }
+        }
+
+        // Allocate: HEADER + total_len * elem_size
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::LocalGet(total_len));
+        self.push(Instruction::I32Const(elem_size));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        let ptr_local = self.emit_arena_alloc_to_local(true)?;
+
+        // Header: length = total_len, capacity = total_len
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::LocalGet(total_len));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::LocalGet(total_len));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // write_off: byte offset from ptr + HEADER at which the next element lands.
+        let write_off = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(write_off));
+
+        for piece in &pieces {
+            match piece {
+                Piece::Inline(val) => {
+                    // Store val at ptr + HEADER + write_off; write_off += elem_size.
+                    self.push(Instruction::LocalGet(ptr_local));
+                    self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalGet(write_off));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalGet(*val));
+                    match elem_ty {
+                        WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 3,
+                            memory_index: 0,
+                        })),
+                        _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        })),
+                    }
+                    self.push(Instruction::LocalGet(write_off));
+                    self.push(Instruction::I32Const(elem_size));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalSet(write_off));
+                }
+                Piece::Spread { ptr, len } => {
+                    // memory.copy(ptr + HEADER + write_off, src + HEADER, len * elem_size)
+                    self.push(Instruction::LocalGet(ptr_local));
+                    self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalGet(write_off));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalGet(*ptr));
+                    self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalGet(*len));
+                    self.push(Instruction::I32Const(elem_size));
+                    self.push(Instruction::I32Mul);
+                    self.push(Instruction::MemoryCopy {
+                        src_mem: 0,
+                        dst_mem: 0,
+                    });
+                    // write_off += len * elem_size
+                    self.push(Instruction::LocalGet(write_off));
+                    self.push(Instruction::LocalGet(*len));
+                    self.push(Instruction::I32Const(elem_size));
+                    self.push(Instruction::I32Mul);
+                    self.push(Instruction::I32Add);
+                    self.push(Instruction::LocalSet(write_off));
+                }
+            }
+        }
+
         self.push(Instruction::LocalGet(ptr_local));
         Ok(WasmType::I32)
     }
@@ -385,12 +828,28 @@ impl<'a> FuncContext<'a> {
                 .this_class
                 .clone()
                 .ok_or_else(|| CompileError::codegen("`this` used outside of a method")),
-            // new ClassName(...) → class is ClassName
+            // new ClassName(...) → class is ClassName (or the mangled
+            // monomorphization when type arguments are present).
             Expression::NewExpression(new_expr) => {
                 if let Expression::Identifier(ident) = &new_expr.callee {
-                    let name = ident.name.as_str();
-                    if self.module_ctx.class_names.contains(name) {
-                        return Ok(name.to_string());
+                    let base = ident.name.as_str();
+                    if let Some(type_args) = new_expr.type_arguments.as_ref() {
+                        let mut tokens = Vec::with_capacity(type_args.params.len());
+                        for p in &type_args.params {
+                            let bt = crate::codegen::generics::resolve_bound_type(
+                                p,
+                                &self.module_ctx.class_names,
+                                self.type_bindings.as_ref(),
+                            )?;
+                            tokens.push(bt.mangle_token());
+                        }
+                        let mangled = format!("{base}${}", tokens.join("$"));
+                        if self.module_ctx.class_names.contains(&mangled) {
+                            return Ok(mangled);
+                        }
+                    }
+                    if self.module_ctx.class_names.contains(base) {
+                        return Ok(base.to_string());
                     }
                 }
                 Err(CompileError::codegen(

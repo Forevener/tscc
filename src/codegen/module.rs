@@ -7,7 +7,7 @@ use wasm_encoder::ValType;
 use super::classes::ClassRegistry;
 use crate::ArenaOverflow;
 use crate::error::CompileError;
-use crate::types::{self, ClosureSig, WasmType};
+use crate::types::{self, ClosureSig, TypeBindings, WasmType};
 
 use super::func::FuncContext;
 use super::wasm_types;
@@ -74,6 +74,27 @@ pub struct ModuleContext {
     /// Internal globals to expose under their declared name (e.g. __rng_state).
     /// Vec of (export name, global index). Emitted as exports alongside __arena_ptr.
     pub exported_globals: Vec<(String, u32)>,
+    /// Body for the `__helper_arena_alloc` shim that satisfies helper wasm's
+    /// `env::__tscc_arena_alloc` import. Built eagerly during helper
+    /// registration (needs `&mut ctx`) and emitted later from
+    /// `compile_string_helpers` (which has only `&ctx`). Cleared after use.
+    pub helper_arena_alloc_body: RefCell<Option<wasm_encoder::Function>>,
+    /// Monomorphized generic-class name -> type-parameter bindings. Populated
+    /// during pre-codegen from `generics::collect_instantiations`. Read by
+    /// `codegen_method` to push the correct bindings when compiling each
+    /// monomorphized method body.
+    pub class_bindings: HashMap<String, TypeBindings>,
+    /// Monomorphized generic-function name -> type-parameter bindings.
+    pub fn_bindings: HashMap<String, TypeBindings>,
+    /// Call-site span.start -> mangled monomorphization name. Populated by
+    /// `collect_instantiations` when it infers type arguments of an implicit
+    /// generic function call (`identity(5)`). `emit_call` consults this map
+    /// to route the call through the right monomorphization.
+    pub inferred_fn_calls: HashMap<u32, String>,
+    /// Mangled Map<K, V> name -> (key_ty, value_ty, bucket layout). Populated
+    /// in Pass 0a-iii. Dispatchers in `expr/map.rs` and `emit_new` read this
+    /// to route per-monomorphization codegen.
+    pub map_info: HashMap<String, super::map_builtins::MapInfo>,
 }
 
 /// A lifted closure function to be added to the WASM module's function table.
@@ -127,6 +148,11 @@ impl ModuleContext {
             arena_overflow: ArenaOverflow::Unchecked,
             arena_alloc_func: None,
             exported_globals: Vec::new(),
+            helper_arena_alloc_body: RefCell::new(None),
+            class_bindings: HashMap::new(),
+            fn_bindings: HashMap::new(),
+            inferred_fn_calls: HashMap::new(),
+            map_info: HashMap::new(),
         }
     }
 
@@ -324,6 +350,7 @@ pub enum GlobalInit {
     F64(f64),
 }
 
+#[allow(clippy::too_many_arguments)] // Mirrors the public `CompileOptions` fields.
 pub fn compile_module<'a>(
     program: &Program<'a>,
     host_module: &str,
@@ -332,11 +359,21 @@ pub fn compile_module<'a>(
     debug: bool,
     filename: &str,
     arena_overflow: ArenaOverflow,
+    expose_helpers: &HashSet<String>,
 ) -> Result<Vec<u8>, CompileError> {
     let mut ctx = ModuleContext::new(host_module);
     ctx.arena_overflow = arena_overflow;
 
-    // Pass 0a: collect class names and extends relationships
+    // Pass 0a: discover generic templates (classes + functions with type
+    // parameters). These are NOT registered as concrete classes — only their
+    // monomorphized instantiations are.
+    let (class_templates, fn_templates) = super::generics::discover_templates(program);
+
+    // Pass 0a-i: collect concrete class names and extends relationships.
+    // Generic templates (e.g. `class Box<T>`) are skipped — their
+    // monomorphizations take their place below. A concrete class that extends
+    // a generic parent (e.g. `class Foo extends Parent<i32>`) has its parent
+    // name mangled here so the relationship threads into Pass 0b's topo sort.
     let mut class_info: Vec<(String, Option<String>)> = Vec::new();
     let mut class_ast_map: HashMap<String, &Class> = HashMap::new();
     for stmt in &program.body {
@@ -348,20 +385,86 @@ pub fn compile_module<'a>(
                 .name
                 .as_str()
                 .to_string();
-            let parent = class
-                .super_class
-                .as_ref()
-                .map(|expr| match expr {
-                    Expression::Identifier(id) => Ok(id.name.as_str().to_string()),
-                    _ => Err(CompileError::unsupported(
-                        "non-identifier in extends clause",
-                    )),
-                })
-                .transpose()?;
+            if class_templates.contains_key(&name) {
+                continue;
+            }
+            let parent = super::generics::mangle_parent_name(
+                class,
+                &ctx.class_names,
+                &class_templates,
+                None,
+            )?;
             ctx.class_names.insert(name.clone());
             class_info.push((name.clone(), parent));
             class_ast_map.insert(name, class);
         }
+    }
+
+    // Pass 0a-ii: collect all generic instantiations (both class and function).
+    // The collector walks the whole program — class fields/method bodies,
+    // function bodies, top-level declarations/expressions — for any
+    // TSTypeReference / NewExpression / CallExpression whose base identifier is
+    // a generic template. Nested generics (Array<Box<i32>>) are expanded.
+    let super::generics::CollectResult {
+        class_insts,
+        fn_insts,
+        inferred_call_sites,
+        map_insts,
+    } = super::generics::collect_instantiations(
+        program,
+        &class_templates,
+        &fn_templates,
+        &ctx.class_names,
+    )?;
+    ctx.inferred_fn_calls = inferred_call_sites;
+
+    // Add each monomorphized class to the pipeline as if it were a concrete
+    // class: its mangled name enters class_names, class_info, and
+    // class_ast_map (pointing at the template's AST). If the template extends
+    // a generic parent (e.g. `class Child<T> extends Parent<T>`), the parent
+    // name is mangled here under the child's bindings so Pass 0b sees e.g.
+    // `Child$i32 -> Parent$i32` and emits layouts in dependency order.
+    for inst in &class_insts {
+        let template = &class_templates[&inst.template_name];
+        ctx.class_names.insert(inst.mangled_name.clone());
+        let parent = super::generics::mangle_parent_name(
+            template.ast,
+            &ctx.class_names,
+            &class_templates,
+            Some(&inst.bindings),
+        )?;
+        class_info.push((inst.mangled_name.clone(), parent));
+        class_ast_map.insert(inst.mangled_name.clone(), template.ast);
+        ctx.class_bindings
+            .insert(inst.mangled_name.clone(), inst.bindings.clone());
+    }
+    for inst in &fn_insts {
+        ctx.fn_bindings
+            .insert(inst.mangled_name.clone(), inst.bindings.clone());
+    }
+
+    // Pass 0a-iii: register compiler-owned Map<K, V> instantiations. Maps
+    // live outside class_info/class_ast_map — they carry no user AST, no
+    // inheritance, and no user-facing methods yet. Their header layouts are
+    // synthesized directly in the ClassRegistry so field access + member
+    // resolution flow through the same paths as user classes; bucket
+    // layouts are stashed on `ctx.map_info` for `emit_new_map` and the
+    // method dispatcher to consume.
+    for inst in &map_insts {
+        ctx.class_names.insert(inst.mangled_name.clone());
+        super::map_builtins::register_map_layout(
+            &mut ctx.class_registry,
+            &inst.mangled_name,
+        )?;
+        let bucket = super::map_builtins::BucketLayout::compute(&inst.key_ty, &inst.value_ty);
+        ctx.map_info.insert(
+            inst.mangled_name.clone(),
+            super::map_builtins::MapInfo {
+                key_ty: inst.key_ty.clone(),
+                value_ty: inst.value_ty.clone(),
+                bucket,
+            },
+        );
     }
 
     // Pass 0b: determine which classes are polymorphic and topological order
@@ -372,8 +475,19 @@ pub fn compile_module<'a>(
     for (name, parent) in &sorted_classes {
         let class = class_ast_map[name.as_str()];
         let is_poly = polymorphic.contains(name);
-        ctx.class_registry
-            .register_class(class, &ctx.class_names, parent.clone(), is_poly)?;
+        if let Some(bindings) = ctx.class_bindings.get(name).cloned() {
+            ctx.class_registry.register_class_with_bindings(
+                class,
+                &ctx.class_names,
+                parent.clone(),
+                is_poly,
+                Some(name),
+                Some(&bindings),
+            )?;
+        } else {
+            ctx.class_registry
+                .register_class(class, &ctx.class_names, parent.clone(), is_poly)?;
+        }
     }
     ctx.class_registry.mark_polymorphic(&polymorphic);
 
@@ -409,11 +523,22 @@ pub fn compile_module<'a>(
     }
 
     // Pass 1b: register class methods as WASM functions
-    // Methods get an implicit `this: i32` first parameter
+    // Methods get an implicit `this: i32` first parameter.
+    // Non-generic classes register under their AST name; monomorphized classes
+    // register under their mangled name using the template's AST with bindings.
     for stmt in &program.body {
         if let Statement::ClassDeclaration(class) = stmt {
-            register_class_methods(&mut ctx, class)?;
+            let name = class.id.as_ref().unwrap().name.as_str();
+            if class_templates.contains_key(name) {
+                continue;
+            }
+            register_class_methods(&mut ctx, name, class, None)?;
         }
+    }
+    for inst in &class_insts {
+        let template = &class_templates[&inst.template_name];
+        let bindings = inst.bindings.clone();
+        register_class_methods(&mut ctx, &inst.mangled_name, template.ast, Some(&bindings))?;
     }
 
     // Pass 1c: build vtables for polymorphic classes
@@ -515,10 +640,16 @@ pub fn compile_module<'a>(
         }
     }
 
-    // Pass 2: register all free functions (get indices)
+    // Pass 2: register all free functions (get indices). Generic function
+    // templates are skipped — only their monomorphizations get registered.
     for stmt in &program.body {
         match stmt {
             Statement::FunctionDeclaration(func_decl) if !func_decl.declare => {
+                if let Some(id) = &func_decl.id
+                    && fn_templates.contains_key(id.name.as_str())
+                {
+                    continue;
+                }
                 register_function(&mut ctx, func_decl, false)?;
             }
             Statement::ExportDefaultDeclaration(export) => {
@@ -530,18 +661,38 @@ pub fn compile_module<'a>(
                         .as_ref()
                         .map(|id| id.name.as_str())
                         .unwrap_or("default");
-                    register_func_from_decl(&mut ctx, func_decl, name, true)?;
+                    register_func_from_decl(&mut ctx, func_decl, name, true, None)?;
                 }
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(decl) = &export.declaration
                     && let Declaration::FunctionDeclaration(func_decl) = decl
                 {
+                    if let Some(id) = &func_decl.id
+                        && fn_templates.contains_key(id.name.as_str())
+                    {
+                        continue;
+                    }
                     register_function(&mut ctx, func_decl, true)?;
                 }
             }
             _ => {}
         }
+    }
+
+    // Register each monomorphized function under its mangled name, pulling the
+    // body from the template AST. `register_func_from_decl` threads bindings
+    // into parameter + return-type resolution.
+    for inst in &fn_insts {
+        let template = &fn_templates[&inst.template_name];
+        let bindings = inst.bindings.clone();
+        register_func_from_decl(
+            &mut ctx,
+            template.ast,
+            &inst.mangled_name,
+            template.is_export,
+            Some(&bindings),
+        )?;
     }
 
     // Collect top-level const/let declarations as globals
@@ -574,13 +725,29 @@ pub fn compile_module<'a>(
 
     // Register only the string runtime helpers that the program actually uses.
     // Pre-scan the AST to build the used-set; this replaces the prior
-    // "register all 21, stub the unused ones" approach.
-    let used_string_helpers = super::string_builtins::collect_used_helpers(program);
+    // "register all 21, stub the unused ones" approach. `expose_helpers`
+    // lets a caller force specific helpers into the bundle AND re-export
+    // them by name — used by the hash-helper test suite and by any
+    // debug/profiling tooling that wants direct helper access.
+    let mut used_string_helpers = super::string_builtins::collect_used_helpers(program);
+    for name in expose_helpers {
+        used_string_helpers.insert(name.clone());
+    }
+    // Map<K, V> methods route hashing + (for f64 / string keys) equality to the
+    // same precompiled bundle the string helpers ride on. Seed based on the
+    // collected instantiations so the tree-shaker pulls in only what this
+    // program's Maps actually need.
+    for name in super::map_builtins::required_runtime_helpers(&map_insts) {
+        used_string_helpers.insert(name);
+    }
     if !used_string_helpers.is_empty() {
         ctx.init_arena();
     }
-    let helper_registration =
-        super::string_builtins::register_string_helpers(&mut ctx, &used_string_helpers);
+    let helper_registration = super::string_builtins::register_string_helpers(
+        &mut ctx,
+        &used_string_helpers,
+        expose_helpers,
+    );
 
     // Register RNG helpers (state global + step function) if Math.random is used.
     let uses_random = super::math_builtins::program_uses_random(program);
@@ -592,13 +759,34 @@ pub fn compile_module<'a>(
     // Each entry: (compiled_function, source_map)
     let mut compiled_funcs: Vec<(wasm_encoder::Function, Vec<(u32, u32)>)> = Vec::new();
 
+    // Non-generic class methods. Order must match Pass 1b registration.
     for stmt in &program.body {
         if let Statement::ClassDeclaration(class) = stmt {
             let class_name = class.id.as_ref().unwrap().name.as_str();
+            if class_templates.contains_key(class_name) {
+                continue;
+            }
             for element in &class.body.body {
                 if let ClassElement::MethodDefinition(method) = element {
-                    compiled_funcs.push(codegen_method(&ctx, class_name, method, source)?);
+                    compiled_funcs.push(codegen_method(&ctx, class_name, method, source, None)?);
                 }
+            }
+        }
+    }
+
+    // Monomorphized class methods — same order as Pass 1b.
+    for inst in &class_insts {
+        let template = &class_templates[&inst.template_name];
+        let bindings = inst.bindings.clone();
+        for element in &template.ast.body.body {
+            if let ClassElement::MethodDefinition(method) = element {
+                compiled_funcs.push(codegen_method(
+                    &ctx,
+                    &inst.mangled_name,
+                    method,
+                    source,
+                    Some(&bindings),
+                )?);
             }
         }
     }
@@ -606,24 +794,42 @@ pub fn compile_module<'a>(
     for stmt in &program.body {
         match stmt {
             Statement::FunctionDeclaration(func_decl) if !func_decl.declare => {
-                compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
+                if let Some(id) = &func_decl.id
+                    && fn_templates.contains_key(id.name.as_str())
+                {
+                    continue;
+                }
+                compiled_funcs.push(codegen_function(&ctx, func_decl, source, None)?);
             }
             Statement::ExportDefaultDeclaration(export) => {
                 if let ExportDefaultDeclarationKind::FunctionDeclaration(func_decl) =
                     &export.declaration
                 {
-                    compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
+                    compiled_funcs.push(codegen_function(&ctx, func_decl, source, None)?);
                 }
             }
             Statement::ExportNamedDeclaration(export) => {
                 if let Some(decl) = &export.declaration
                     && let Declaration::FunctionDeclaration(func_decl) = decl
                 {
-                    compiled_funcs.push(codegen_function(&ctx, func_decl, source)?);
+                    if let Some(id) = &func_decl.id
+                        && fn_templates.contains_key(id.name.as_str())
+                    {
+                        continue;
+                    }
+                    compiled_funcs.push(codegen_function(&ctx, func_decl, source, None)?);
                 }
             }
             _ => {}
         }
+    }
+
+    // Monomorphized free function bodies — same order as the fn_insts
+    // registration loop.
+    for inst in &fn_insts {
+        let template = &fn_templates[&inst.template_name];
+        let bindings = inst.bindings.clone();
+        compiled_funcs.push(codegen_function(&ctx, template.ast, source, Some(&bindings))?);
     }
 
     // Compile __arena_alloc body if registered
@@ -645,7 +851,15 @@ pub fn compile_module<'a>(
     }
 
     // Assemble the WASM module
-    super::sections::assemble_module(&ctx, &compiled_funcs, memory_pages, source, debug, filename)
+    super::sections::assemble_module(
+        &ctx,
+        &compiled_funcs,
+        memory_pages,
+        source,
+        debug,
+        filename,
+        &helper_registration,
+    )
 }
 
 /// Compile the __arena_alloc(size: i32) -> i32 helper function.
@@ -731,7 +945,7 @@ fn collect_import_from_func(
         .name
         .as_str();
 
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names)?;
+    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, None)?;
     let param_types: Vec<WasmType> = params.iter().map(|(_, ty)| *ty).collect();
     ctx.add_import(name, &param_types, ret)?;
     Ok(())
@@ -752,7 +966,7 @@ fn register_function(
         .name
         .as_str();
 
-    register_func_from_decl(ctx, func_decl, name, is_export)
+    register_func_from_decl(ctx, func_decl, name, is_export, None)
 }
 
 fn register_func_from_decl(
@@ -760,15 +974,17 @@ fn register_func_from_decl(
     func_decl: &Function,
     name: &str,
     is_export: bool,
+    bindings: Option<&TypeBindings>,
 ) -> Result<(), CompileError> {
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names)?;
+    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, bindings)?;
     // Track if this function returns a closure
     if let Some(ann) = &func_decl.return_type {
         if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
             ctx.func_return_closure_sigs.insert(name.to_string(), sig);
         }
-        // Track if this function returns a string
-        if types::is_string_type(ann) {
+        // Track if this function returns a string (bindings-aware so a
+        // generic function returning T bound to `string` flows through).
+        if types::is_string_type_with_bindings(ann, bindings) {
             ctx.func_return_strings.insert(name.to_string());
         }
     }
@@ -779,6 +995,7 @@ fn register_func_from_decl(
 fn extract_func_signature(
     func_decl: &Function,
     class_names: &HashSet<String>,
+    bindings: Option<&TypeBindings>,
 ) -> Result<(Vec<(String, WasmType)>, WasmType), CompileError> {
     let mut params = Vec::new();
     for param in &func_decl.params.items {
@@ -787,7 +1004,7 @@ fn extract_func_signature(
             _ => return Err(CompileError::unsupported("destructured parameter")),
         };
         let ty = if let Some(ann) = &param.type_annotation {
-            types::resolve_type_annotation_with_classes(ann, class_names)?
+            types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
         } else {
             return Err(CompileError::type_err(format!(
                 "parameter '{name}' requires a type annotation — tscc does not infer parameter types; write `{name}: i32` (or f64, bool, string, or a class name)"
@@ -797,7 +1014,7 @@ fn extract_func_signature(
     }
 
     let ret = if let Some(ann) = &func_decl.return_type {
-        types::resolve_type_annotation_with_classes(ann, class_names)?
+        types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
     } else {
         WasmType::Void
     };
@@ -923,9 +1140,12 @@ fn collect_enum(
     Ok(())
 }
 
-fn register_class_methods(ctx: &mut ModuleContext, class: &Class) -> Result<(), CompileError> {
-    let class_name = class.id.as_ref().unwrap().name.as_str();
-
+fn register_class_methods(
+    ctx: &mut ModuleContext,
+    class_name: &str,
+    class: &Class,
+    bindings: Option<&TypeBindings>,
+) -> Result<(), CompileError> {
     for element in &class.body.body {
         if let ClassElement::MethodDefinition(method) = element {
             let method_name_str = match &method.key {
@@ -943,7 +1163,7 @@ fn register_class_methods(ctx: &mut ModuleContext, class: &Class) -> Result<(), 
                     _ => return Err(CompileError::unsupported("destructured method param")),
                 };
                 let pty = if let Some(ann) = &param.type_annotation {
-                    types::resolve_type_annotation_with_classes(ann, &ctx.class_names)?
+                    types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
                 } else {
                     return Err(CompileError::type_err(format!(
                         "method parameter '{pname}' requires type annotation"
@@ -956,7 +1176,7 @@ fn register_class_methods(ctx: &mut ModuleContext, class: &Class) -> Result<(), 
                 // Constructor returns the this pointer
                 WasmType::I32
             } else if let Some(ann) = &func.return_type {
-                types::resolve_type_annotation_with_classes(ann, &ctx.class_names)?
+                types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
             } else {
                 WasmType::Void
             };
@@ -987,6 +1207,7 @@ fn codegen_method<'a>(
     class_name: &str,
     method: &MethodDefinition<'a>,
     source: &'a str,
+    bindings: Option<&TypeBindings>,
 ) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
     let func = &method.value;
     let layout = ctx
@@ -1002,7 +1223,7 @@ fn codegen_method<'a>(
             _ => return Err(CompileError::unsupported("destructured method param")),
         };
         let pty = if let Some(ann) = &param.type_annotation {
-            types::resolve_type_annotation_with_classes(ann, &ctx.class_names)?
+            types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
         } else {
             return Err(CompileError::type_err(format!(
                 "method param '{pname}' requires type annotation"
@@ -1014,14 +1235,15 @@ fn codegen_method<'a>(
     let ret = if method.kind == MethodDefinitionKind::Constructor {
         WasmType::I32
     } else if let Some(ann) = &func.return_type {
-        types::resolve_type_annotation_with_classes(ann, &ctx.class_names)?
+        types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
     } else {
         WasmType::Void
     };
 
     let mut func_ctx = FuncContext::new(ctx, &params, ret, source);
-    // Mark `this` as referencing this class
+    // Mark `this` as referencing this class (mangled, for generic monomorphizations)
     func_ctx.this_class = Some(class_name.to_string());
+    func_ctx.type_bindings = bindings.cloned();
 
     // Track class types, array types, closure sigs, and string types for method parameters
     for param in &func.params.items {
@@ -1033,7 +1255,7 @@ fn codegen_method<'a>(
             if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
-            if let Some(param_class) = types::get_class_type_name(ann)
+            if let Some(param_class) = types::get_class_type_name_with_bindings(ann, bindings)
                 && ctx.class_names.contains(&param_class)
             {
                 func_ctx
@@ -1050,7 +1272,7 @@ fn codegen_method<'a>(
                         .insert(pname.clone(), elem_class);
                 }
             }
-            if types::is_string_type(ann) {
+            if types::is_string_type_with_bindings(ann, bindings) {
                 func_ctx.local_string_vars.insert(pname.clone());
             }
         }
@@ -1170,13 +1392,15 @@ fn codegen_function<'a>(
     ctx: &ModuleContext,
     func_decl: &Function<'a>,
     source: &'a str,
+    bindings: Option<&TypeBindings>,
 ) -> Result<(wasm_encoder::Function, Vec<(u32, u32)>), CompileError> {
     if func_decl.declare {
         return Err(CompileError::codegen("cannot codegen declare function"));
     }
 
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names)?;
+    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, bindings)?;
     let mut func_ctx = FuncContext::new(ctx, &params, ret, source);
+    func_ctx.type_bindings = bindings.cloned();
 
     // Track class types, array types, closure sigs, and string types for function parameters
     for param in &func_decl.params.items {
@@ -1188,7 +1412,7 @@ fn codegen_function<'a>(
             if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
-            if let Some(param_class) = types::get_class_type_name(ann)
+            if let Some(param_class) = types::get_class_type_name_with_bindings(ann, bindings)
                 && ctx.class_names.contains(&param_class)
             {
                 func_ctx
@@ -1205,7 +1429,7 @@ fn codegen_function<'a>(
                         .insert(pname.clone(), elem_class);
                 }
             }
-            if types::is_string_type(ann) {
+            if types::is_string_type_with_bindings(ann, bindings) {
                 func_ctx.local_string_vars.insert(pname.clone());
             }
         }

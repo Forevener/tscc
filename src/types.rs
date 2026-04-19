@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use oxc_ast::ast::{TSType, TSTypeAnnotation};
 use wasm_encoder::ValType;
@@ -18,6 +18,47 @@ pub struct ClosureSig {
     pub param_types: Vec<WasmType>,
     pub return_type: WasmType,
 }
+
+/// Resolved concrete type that a generic type parameter is bound to in a given
+/// monomorphization. Richer than `WasmType` because Map/Set keys + class fields
+/// need to distinguish `string` from other i32's, and class-ref bindings carry
+/// the class name for member access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoundType {
+    I32,
+    F64,
+    Bool,
+    Str,
+    /// Class reference; holds the concrete class name (post-monomorphization if
+    /// the class was itself generic).
+    Class(String),
+}
+
+impl BoundType {
+    pub fn wasm_ty(&self) -> WasmType {
+        match self {
+            BoundType::F64 => WasmType::F64,
+            _ => WasmType::I32,
+        }
+    }
+
+    /// Short token used in mangled names: `i32`, `f64`, `bool`, `string`, or the
+    /// class name verbatim (already unique — class names can themselves be
+    /// mangled forms like `Box$i32`).
+    pub fn mangle_token(&self) -> String {
+        match self {
+            BoundType::I32 => "i32".to_string(),
+            BoundType::F64 => "f64".to_string(),
+            BoundType::Bool => "bool".to_string(),
+            BoundType::Str => "string".to_string(),
+            BoundType::Class(name) => name.clone(),
+        }
+    }
+}
+
+/// Map from type-parameter name (as written in source, e.g. `T`, `K`, `V`) to
+/// the concrete type it resolves to in the current monomorphization scope.
+pub type TypeBindings = HashMap<String, BoundType>;
 
 impl WasmType {
     pub fn to_val_type(self) -> Option<ValType> {
@@ -40,9 +81,28 @@ pub fn resolve_type_annotation_with_classes(
     resolve_ts_type(&annotation.type_annotation, class_names)
 }
 
+/// Resolve a type annotation under a type-parameter binding scope. When a
+/// TSTypeReference's name matches a key in `bindings`, it substitutes the bound
+/// type. Falls through to the regular resolver otherwise.
+pub fn resolve_type_annotation_with_bindings(
+    annotation: &TSTypeAnnotation,
+    class_names: &HashSet<String>,
+    bindings: Option<&TypeBindings>,
+) -> Result<WasmType, CompileError> {
+    resolve_ts_type_with_bindings(&annotation.type_annotation, class_names, bindings)
+}
+
 pub fn resolve_ts_type(
     ts_type: &TSType,
     class_names: &HashSet<String>,
+) -> Result<WasmType, CompileError> {
+    resolve_ts_type_with_bindings(ts_type, class_names, None)
+}
+
+pub fn resolve_ts_type_with_bindings(
+    ts_type: &TSType,
+    class_names: &HashSet<String>,
+    bindings: Option<&TypeBindings>,
 ) -> Result<WasmType, CompileError> {
     match ts_type {
         TSType::TSTypeReference(type_ref) => {
@@ -50,6 +110,11 @@ pub fn resolve_ts_type(
                 .type_name
                 .get_identifier_reference()
                 .map(|r| r.name.as_str());
+            if let Some(other) = name
+                && let Some(bound) = bindings.and_then(|b| b.get(other))
+            {
+                return Ok(bound.wasm_ty());
+            }
             match name {
                 Some("i32") => Ok(WasmType::I32),
                 Some("f64") => Ok(WasmType::F64),
@@ -65,9 +130,17 @@ pub fn resolve_ts_type(
                     Ok(WasmType::I32)
                 }
                 Some("string") => Ok(WasmType::I32),
-                Some(other) => Err(CompileError::type_err(format!(
-                    "unknown type '{other}' — supported types: i32, f64, int, bool, number, string, Array<T>, or a class name"
-                ))),
+                Some(other) => {
+                    // Generic class reference: `Box<i32>` is a class pointer
+                    // even though "Box" itself isn't in class_names — the
+                    // mangled instantiation is.
+                    if type_ref.type_arguments.is_some() {
+                        return Ok(WasmType::I32);
+                    }
+                    Err(CompileError::type_err(format!(
+                        "unknown type '{other}' — supported types: i32, f64, int, bool, number, string, Array<T>, or a class name"
+                    )))
+                }
                 None => Err(CompileError::type_err(
                     "complex type references not supported",
                 )),
@@ -180,8 +253,13 @@ pub fn get_array_element_class(annotation: &TSTypeAnnotation) -> Option<String> 
     }
 }
 
-/// Check if a type annotation is the `string` type.
-pub fn is_string_type(annotation: &TSTypeAnnotation) -> bool {
+/// Bindings-aware string-type check. A type parameter bound to `BoundType::Str`
+/// counts as string here so that field/param tracking flags it for string-aware
+/// codegen paths.
+pub fn is_string_type_with_bindings(
+    annotation: &TSTypeAnnotation,
+    bindings: Option<&TypeBindings>,
+) -> bool {
     match &annotation.type_annotation {
         TSType::TSStringKeyword(_) => true,
         TSType::TSTypeReference(type_ref) => {
@@ -189,20 +267,39 @@ pub fn is_string_type(annotation: &TSTypeAnnotation) -> bool {
                 .type_name
                 .get_identifier_reference()
                 .map(|r| r.name.as_str());
-            name == Some("string")
+            if name == Some("string") {
+                return true;
+            }
+            if let Some(other) = name
+                && let Some(bound) = bindings.and_then(|b| b.get(other))
+            {
+                return matches!(bound, BoundType::Str);
+            }
+            false
         }
         _ => false,
     }
 }
 
-/// Extract the type name string from a TS type annotation.
-/// Returns Some("ClassName") for class references, None for primitives.
-pub fn get_class_type_name(annotation: &TSTypeAnnotation) -> Option<String> {
-    get_class_type_name_from_ts_type(&annotation.type_annotation)
-}
-
 /// Extract class type name from a TSType (used by both annotation and as-expression paths).
 pub fn get_class_type_name_from_ts_type(ts_type: &TSType) -> Option<String> {
+    get_class_type_name_from_ts_type_with_bindings(ts_type, None)
+}
+
+/// Bindings-aware variant. A type parameter bound to `BoundType::Class(name)`
+/// resolves to `Some(name)`, enabling methods/fields on generic-param-typed
+/// values to route through the concrete class's layout.
+pub fn get_class_type_name_with_bindings(
+    annotation: &TSTypeAnnotation,
+    bindings: Option<&TypeBindings>,
+) -> Option<String> {
+    get_class_type_name_from_ts_type_with_bindings(&annotation.type_annotation, bindings)
+}
+
+pub fn get_class_type_name_from_ts_type_with_bindings(
+    ts_type: &TSType,
+    bindings: Option<&TypeBindings>,
+) -> Option<String> {
     match ts_type {
         TSType::TSTypeReference(type_ref) => {
             let name = type_ref
@@ -211,8 +308,64 @@ pub fn get_class_type_name_from_ts_type(ts_type: &TSType) -> Option<String> {
                 .map(|r| r.name.as_str());
             match name {
                 Some("i32" | "f64" | "bool" | "string" | "int" | "number" | "Array") => None,
-                Some(class_name) => Some(class_name.to_string()),
+                Some(other) => {
+                    if let Some(BoundType::Class(class_name)) =
+                        bindings.and_then(|b| b.get(other))
+                    {
+                        return Some(class_name.clone());
+                    }
+                    // If the reference carries type arguments, return the mangled
+                    // monomorphized name so downstream class-registry lookups route
+                    // to the concrete instantiation.
+                    if let Some(args) = type_ref.type_arguments.as_ref() {
+                        let mut tokens = Vec::with_capacity(args.params.len());
+                        for param in &args.params {
+                            let tok = mangle_ts_type_token(param, bindings)?;
+                            tokens.push(tok);
+                        }
+                        return Some(format!("{other}${}", tokens.join("$")));
+                    }
+                    Some(other.to_string())
+                }
                 None => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Internal: render a TSType as a mangle token (e.g. `i32`, `Box$i32`). Returns
+/// None for types that cannot participate in a mangled name (e.g. function
+/// types). This mirrors `BoundType::mangle_token` for non-bound references.
+fn mangle_ts_type_token(ts_type: &TSType, bindings: Option<&TypeBindings>) -> Option<String> {
+    match ts_type {
+        TSType::TSNumberKeyword(_) => Some("f64".to_string()),
+        TSType::TSBooleanKeyword(_) => Some("bool".to_string()),
+        TSType::TSStringKeyword(_) => Some("string".to_string()),
+        TSType::TSTypeReference(type_ref) => {
+            let name = type_ref
+                .type_name
+                .get_identifier_reference()
+                .map(|r| r.name.as_str())?;
+            if let Some(bound) = bindings.and_then(|b| b.get(name)) {
+                return Some(bound.mangle_token());
+            }
+            match name {
+                "i32" | "int" => Some("i32".to_string()),
+                "f64" | "number" => Some("f64".to_string()),
+                "bool" => Some("bool".to_string()),
+                "string" => Some("string".to_string()),
+                other => {
+                    if let Some(args) = type_ref.type_arguments.as_ref() {
+                        let mut tokens = Vec::with_capacity(args.params.len());
+                        for param in &args.params {
+                            tokens.push(mangle_ts_type_token(param, bindings)?);
+                        }
+                        Some(format!("{other}${}", tokens.join("$")))
+                    } else {
+                        Some(other.to_string())
+                    }
+                }
             }
         }
         _ => None,

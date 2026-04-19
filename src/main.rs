@@ -42,6 +42,9 @@ fn print_usage() {
     eprintln!("  --host-module <name> WASM import module name (default: \"host\")");
     eprintln!("  --memory-pages <n>   Initial linear memory pages (default: 1, 64KB each)");
     eprintln!("  --debug, -g          Emit DWARF debug info and name section");
+    eprintln!(
+        "  --arena-overflow <m> Behavior when arena exceeds memory: grow (default), trap, unchecked"
+    );
     eprintln!("  --help, -h           Show this help");
     eprintln!("  --version, -V        Show version");
     eprintln!();
@@ -63,6 +66,7 @@ fn run_compile(args: &[String]) {
     let mut host_module = "host".to_string();
     let mut memory_pages: u32 = 1;
     let mut debug = false;
+    let mut arena_overflow = tscc::ArenaOverflow::default();
 
     // Parse remaining options
     let mut i = 1;
@@ -98,6 +102,24 @@ fn run_compile(args: &[String]) {
             "--debug" | "-g" => {
                 debug = true;
             }
+            "--arena-overflow" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --arena-overflow requires a mode (grow|trap|unchecked)");
+                    process::exit(1);
+                }
+                arena_overflow = match args[i].as_str() {
+                    "grow" => tscc::ArenaOverflow::Grow,
+                    "trap" => tscc::ArenaOverflow::Trap,
+                    "unchecked" => tscc::ArenaOverflow::Unchecked,
+                    other => {
+                        eprintln!(
+                            "error: --arena-overflow must be one of grow|trap|unchecked, got '{other}'"
+                        );
+                        process::exit(1);
+                    }
+                };
+            }
             other => {
                 eprintln!("error: unknown option '{other}'");
                 process::exit(1);
@@ -126,7 +148,8 @@ fn run_compile(args: &[String]) {
         memory_pages,
         debug,
         filename: input_path.to_string(),
-        arena_overflow: tscc::ArenaOverflow::default(),
+        arena_overflow,
+        ..Default::default()
     };
 
     match tscc::compile(&source, &options) {

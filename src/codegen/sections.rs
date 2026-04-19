@@ -9,6 +9,9 @@ use std::collections::HashMap;
 use crate::error::CompileError;
 
 use super::module::{GlobalInit, ModuleContext};
+use super::precompiled;
+use super::string_builtins::HelperRegistration;
+
 pub(crate) fn assemble_module(
     ctx: &ModuleContext,
     compiled_funcs: &[(wasm_encoder::Function, Vec<(u32, u32)>)],
@@ -16,6 +19,7 @@ pub(crate) fn assemble_module(
     source: &str,
     debug: bool,
     filename: &str,
+    helper_reg: &HelperRegistration,
 ) -> Result<Vec<u8>, CompileError> {
     let mut module = Module::new();
 
@@ -71,26 +75,77 @@ pub(crate) fn assemble_module(
     }
     module.section(&func_section);
 
-    // Table section (for vtable methods and/or closures)
+    // Table section (vtable methods, closures, and helper call_indirect targets).
+    //
+    // Layout: table 0 is tscc's (methods + closures). Table 1, when present,
+    // is the helpers' — rustc's `call_indirect` emissions in helper bodies are
+    // byte-rewritten from table 0 → table 1 by `precompiled::build_function`,
+    // so the two tables never share indices.
     let num_method_table_entries = ctx.method_table_indices.len() as u64;
-    let has_table = has_closures || num_method_table_entries > 0;
-    if has_table {
-        let total_table_size = num_method_table_entries + closure_funcs.len() as u64;
+    let has_tscc_table = has_closures || num_method_table_entries > 0;
+    let has_helper_table = helper_reg.requires_table && precompiled::PRECOMPILED_TABLE.is_some();
+    let helper_table_size = if has_helper_table {
+        precompiled::PRECOMPILED_TABLE.as_ref().unwrap().min as u64
+    } else {
+        0
+    };
+    if has_tscc_table || has_helper_table {
         let mut table_section = TableSection::new();
+        // Table 0: always present when either side needs a table (so helpers
+        // can rely on their renumbered table index 1 existing).
+        let tscc_table_size = num_method_table_entries + closure_funcs.len() as u64;
         table_section.table(TableType {
             element_type: wasm_encoder::RefType::FUNCREF,
-            minimum: total_table_size,
-            maximum: Some(total_table_size),
+            minimum: tscc_table_size,
+            maximum: Some(tscc_table_size),
             table64: false,
             shared: false,
         });
+        if has_helper_table {
+            table_section.table(TableType {
+                element_type: wasm_encoder::RefType::FUNCREF,
+                minimum: helper_table_size,
+                maximum: Some(helper_table_size),
+                table64: false,
+                shared: false,
+            });
+        }
         module.section(&table_section);
     }
 
-    // Memory section
+    // Memory section. When helper Data segments are pulled in, they live at
+    // rustc's default `__data_end = 0x100000` (so 17+ pages minimum). The
+    // caller-supplied `memory_pages` only gets raised, never lowered — a host
+    // that requested a huge initial size still gets it.
+    let helper_min_pages = if helper_reg.requires_data {
+        precompiled::required_memory_pages()
+    } else {
+        0
+    };
+    let effective_memory_pages = memory_pages.max(helper_min_pages);
+
+    // Collision guard: tscc packs static data from offset 0 upward. Helper
+    // Data segments sit at rustc-assigned offsets (typically `0x100000+`). If
+    // tscc's packed data ever reaches a helper segment, the two would clobber
+    // each other. Check once here and surface a clear error.
+    if helper_reg.requires_data {
+        let tscc_high_water = ctx.static_data_ptr.get();
+        let helper_low_water = precompiled::PRECOMPILED_DATA
+            .iter()
+            .map(|d| d.offset)
+            .min()
+            .unwrap_or(u32::MAX);
+        if tscc_high_water > helper_low_water {
+            return Err(CompileError::codegen(format!(
+                "static data (high water {tscc_high_water:#x}) overlaps helper Data segment \
+                 at {helper_low_water:#x}; reduce compile-time constants or split the program"
+            )));
+        }
+    }
+
     let mut mem_section = MemorySection::new();
     mem_section.memory(MemoryType {
-        minimum: memory_pages as u64,
+        minimum: effective_memory_pages as u64,
         maximum: None,
         memory64: false,
         shared: false,
@@ -181,37 +236,83 @@ pub(crate) fn assemble_module(
     }
     module.section(&export_section);
 
-    // Element section (populates the function table with method + closure func indices)
-    if has_table {
+    // Element section (populates the function tables).
+    if has_tscc_table || has_helper_table {
         let mut elem_section = ElementSection::new();
 
-        // Build combined table: method entries (slots 0..M-1) + closure entries (slots M..M+C-1)
-        let mut all_table_func_indices: Vec<u32> = vec![0; num_method_table_entries as usize];
+        // --- Table 0 (tscc): method entries then closure entries ---
+        if has_tscc_table {
+            let mut all_table_func_indices: Vec<u32> =
+                vec![0; num_method_table_entries as usize];
 
-        // Fill method table entries: table_index -> wasm func_index
-        for (mangled_name, &table_idx) in &ctx.method_table_indices {
-            // mangled_name is "ClassName$methodName", look up the wasm func_index
-            let func_idx = ctx
-                .func_map
-                .get(mangled_name)
-                .map(|&(idx, _)| idx)
-                .unwrap_or_else(|| {
-                    panic!("vtable method '{}' not found in func_map", mangled_name)
-                });
-            all_table_func_indices[table_idx as usize] = func_idx;
+            for (mangled_name, &table_idx) in &ctx.method_table_indices {
+                let func_idx = ctx
+                    .func_map
+                    .get(mangled_name)
+                    .map(|&(idx, _)| idx)
+                    .unwrap_or_else(|| {
+                        panic!("vtable method '{}' not found in func_map", mangled_name)
+                    });
+                all_table_func_indices[table_idx as usize] = func_idx;
+            }
+
+            let closure_func_base = ctx.imports.len() as u32 + ctx.local_funcs.len() as u32;
+            for i in 0..closure_funcs.len() as u32 {
+                all_table_func_indices.push(closure_func_base + i);
+            }
+
+            elem_section.active(
+                Some(0),
+                &wasm_encoder::ConstExpr::i32_const(0),
+                Elements::Functions(std::borrow::Cow::Borrowed(&all_table_func_indices)),
+            );
+        } else if has_helper_table {
+            // Table 0 is empty but must still exist because helpers' renumbered
+            // table index is 1. Nothing to emit here — an empty table needs no
+            // element segment.
         }
 
-        // Append closure entries
-        let closure_func_base = ctx.imports.len() as u32 + ctx.local_funcs.len() as u32;
-        for i in 0..closure_funcs.len() as u32 {
-            all_table_func_indices.push(closure_func_base + i);
+        // --- Table 1 (helpers): element segments copied from the bundle ---
+        // Rustc uses active element segments with MVP Functions form. We copy
+        // the offset and function-index list, remapping every function index
+        // through the bundle registration map (bundle idx → tscc func idx).
+        // Segments that reference bundle indices which weren't registered get
+        // skipped entirely — such entries represent table slots that point
+        // at functions no registered helper can reach, so leaving them as 0
+        // (the default-init state of a funcref slot) is correct. The dynamic-
+        // dispatch expansion in `precompiled::expand_with_dynamic_dispatch`
+        // already pulls in every function reachable from table 1 when any
+        // helper uses `call_indirect`, so a skip here should be rare.
+        if has_helper_table {
+            // `seg.func_indices` lives in helper FULL function space (imports
+            // first, then internals). `func_index_map` is sized to match that
+            // exact layout, so we can look up directly without the bundle-
+            // index offset dance.
+            for seg in precompiled::PRECOMPILED_ELEMENTS {
+                let remapped: Vec<u32> = seg
+                    .func_indices
+                    .iter()
+                    .map(|&full_helper_idx| {
+                        let tscc_idx =
+                            helper_reg.func_index_map[full_helper_idx as usize];
+                        if tscc_idx == u32::MAX {
+                            // Point unregistered slots at a sentinel (func 0).
+                            // The slot is unreachable by construction; this
+                            // just keeps the wasm valid.
+                            0
+                        } else {
+                            tscc_idx
+                        }
+                    })
+                    .collect();
+                elem_section.active(
+                    Some(1),
+                    &wasm_encoder::ConstExpr::i32_const(seg.offset as i32),
+                    Elements::Functions(std::borrow::Cow::Owned(remapped)),
+                );
+            }
         }
 
-        elem_section.active(
-            Some(0), // table index 0
-            &wasm_encoder::ConstExpr::i32_const(0),
-            Elements::Functions(std::borrow::Cow::Borrowed(&all_table_func_indices)),
-        );
         module.section(&elem_section);
     }
 
@@ -225,16 +326,29 @@ pub(crate) fn assemble_module(
     }
     module.section(&code_section);
 
-    // Data section (string literals and other static data)
+    // Data section (string literals and other static data — both tscc-emitted
+    // and helper-bundled). Helper Data segments are emitted verbatim at their
+    // original rustc-assigned offsets (typically `0x100000+`); the collision
+    // guard above ensures tscc's packed-from-0 data does not reach them.
     let static_entries = ctx.static_data_entries.borrow();
-    if !static_entries.is_empty() {
+    let emit_helper_data = helper_reg.requires_data;
+    if !static_entries.is_empty() || emit_helper_data {
         let mut data_section = DataSection::new();
         for (offset, bytes) in static_entries.iter() {
             data_section.active(
-                0, // memory index
+                0,
                 &wasm_encoder::ConstExpr::i32_const(*offset as i32),
                 bytes.iter().copied(),
             );
+        }
+        if emit_helper_data {
+            for seg in precompiled::PRECOMPILED_DATA {
+                data_section.active(
+                    0,
+                    &wasm_encoder::ConstExpr::i32_const(seg.offset as i32),
+                    seg.bytes.iter().copied(),
+                );
+            }
         }
         module.section(&data_section);
     }
@@ -243,8 +357,12 @@ pub(crate) fn assemble_module(
     {
         let mut names = NameSection::new();
         let mut func_names = NameMap::new();
-        for func_def in &ctx.local_funcs {
-            let func_idx = ctx.func_map[&func_def.name].0;
+        // local_funcs[i] lives at wasm index imports.len() + i. Can't use
+        // func_map here because register_raw_func (precompiled-helper internals)
+        // deliberately skips it.
+        let imports_len = ctx.imports.len() as u32;
+        for (i, func_def) in ctx.local_funcs.iter().enumerate() {
+            let func_idx = imports_len + i as u32;
             func_names.append(func_idx, &func_def.name);
         }
         // Also name imported functions

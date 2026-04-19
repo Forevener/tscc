@@ -267,7 +267,10 @@ impl<'a> FuncContext<'a> {
                     } else {
                         // Number instance methods that return strings
                         let method = member.property.name.as_str();
-                        matches!(method, "toString" | "toFixed" | "toPrecision")
+                        matches!(
+                            method,
+                            "toString" | "toFixed" | "toPrecision" | "toExponential"
+                        )
                     }
                 } else if let Expression::Identifier(ident) = &call.callee {
                     // Check if function returns string

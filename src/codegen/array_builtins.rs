@@ -218,7 +218,7 @@ fn build_elem_index_bindings(
 /// For expression arrows (`x => expr`), evaluates the expression and returns its type.
 /// For block arrows (`x => { stmts; return val; }`), evaluates statements.
 /// Returns the type of the result left on the WASM stack.
-fn eval_arrow_body<'a>(
+pub(crate) fn eval_arrow_body<'a>(
     func_ctx: &mut FuncContext<'a>,
     arrow: &ArrowFunctionExpression<'a>,
 ) -> Result<WasmType, CompileError> {

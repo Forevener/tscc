@@ -6,8 +6,23 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib"]
 
+[dependencies]
+# ryu-js: JS-spec-compliant f64 → shortest decimal string. no_std by default.
+# Brings in ~11 KB of lookup tables via wasm Data segments (extracted by our
+# build.rs, emitted at rustc's default `__data_end = 0x100000`).
+ryu-js = { version = "1", default-features = false }
+# xxhash-rust: xxh3 variant for hashing string keys in Map<string, _> /
+# Set<string>. Pulls in a ~200-byte secret table as a Data segment — watch
+# total static data doesn't exceed the 0x100000 ceiling when combined with
+# ryu-js.
+#
+# FxHash for i32/f64/bool/ptr keys is inlined directly in `src/hash.rs` (one
+# wrapping multiply by `FX_K`). Avoiding `rustc-hash` here keeps the helper
+# outputs platform-independent — that crate's `FxHasher` alias silently picks
+# a different state width on 32-bit vs 64-bit targets.
+xxhash-rust = { version = "0.8", features = ["xxh3"], default-features = false }
+
 [profile.release]
 opt-level = "s"
 lto = true
 strip = true
-

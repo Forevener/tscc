@@ -3,6 +3,8 @@ pub mod error;
 pub(crate) mod parse;
 pub(crate) mod types;
 
+use std::collections::HashSet;
+
 use error::CompileError;
 
 /// Behavior when the arena allocator exceeds available linear memory.
@@ -29,6 +31,11 @@ pub struct CompileOptions {
     pub filename: String,
     /// Behavior when the arena allocator runs out of linear memory.
     pub arena_overflow: ArenaOverflow,
+    /// Runtime-helper names to force into the output AND expose as named
+    /// exports. Lets the host side call internal helpers directly — useful
+    /// for determinism tests over the hash helpers and for profiling tools
+    /// that want direct access. Empty in production.
+    pub expose_helpers: HashSet<String>,
 }
 
 impl Default for CompileOptions {
@@ -39,6 +46,7 @@ impl Default for CompileOptions {
             debug: false,
             filename: "input.ts".to_string(),
             arena_overflow: ArenaOverflow::default(),
+            expose_helpers: HashSet::new(),
         }
     }
 }
@@ -54,5 +62,6 @@ pub fn compile(source: &str, options: &CompileOptions) -> Result<Vec<u8>, Compil
         options.debug,
         &options.filename,
         options.arena_overflow,
+        &options.expose_helpers,
     )
 }

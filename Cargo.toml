@@ -24,3 +24,8 @@ wasmparser = "0.226"
 [dev-dependencies]
 wasmtime = { version = "31", default-features = false, features = ["cranelift", "runtime"] }
 wasmparser = "0.226"
+# Reference xxh3 for the string-hash determinism tests. Must match the version
+# pinned by `helpers/Cargo.toml` so native reference outputs agree with the
+# wasm-side bytes. (FxHash is inlined in both places and needs no reference
+# crate — see `fx_round_u64` in `tests/hashers.rs`.)
+xxhash-rust = { version = "0.8", features = ["xxh3"] }

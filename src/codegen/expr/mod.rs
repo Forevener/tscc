@@ -4,6 +4,7 @@ mod binary;
 mod call;
 mod class;
 mod closure;
+mod map;
 mod member;
 mod string;
 
@@ -49,9 +50,9 @@ impl<'a> FuncContext<'a> {
             Expression::ArrowFunctionExpression(arrow) => self.emit_arrow_closure(arrow),
             Expression::StringLiteral(s) => self.emit_string_literal(s),
             Expression::TemplateLiteral(tpl) => self.emit_template_literal(tpl),
+            Expression::ArrayExpression(arr) => self.emit_array_literal(arr, None),
             _ => {
                 let span_start = match expr {
-                    Expression::ArrayExpression(a) => a.span.start,
                     Expression::ObjectExpression(o) => o.span.start,
                     _ => 0,
                 };

@@ -1511,6 +1511,100 @@ fn number_to_string_f64() {
     assert_eq!(read_wasm_string(&store, &memory, ptr), "3.14");
 }
 
+/// ryu-js must produce JS-spec shortest-round-trip output. The hand-written
+/// fixed-point scheme truncated at 6 fractional digits and emitted wrong
+/// output for values like 0.1+0.2, integer f64s, and very small fractions.
+#[test]
+fn number_to_string_f64_js_conformance() {
+    let wasm = compile(
+        r#"
+        export function integer_f64(): i32 { return (1.0 as f64).toString(); }
+        export function classic_floating_point(): i32 { return (0.1 + 0.2).toString(); }
+        export function scientific_small(): i32 { return (0.000001 as f64).toString(); }
+        export function negative_zero(): i32 { return (-0.0 as f64).toString(); }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+    for (func_name, expected) in [
+        ("integer_f64", "1"),
+        ("classic_floating_point", "0.30000000000000004"),
+        ("scientific_small", "0.000001"),
+        ("negative_zero", "0"),
+    ] {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, func_name)
+            .unwrap();
+        let ptr = f.call(&mut store, ()).unwrap();
+        assert_eq!(
+            read_wasm_string(&store, &memory, ptr),
+            expected,
+            "toString({func_name})"
+        );
+    }
+}
+
+/// Correctly-rounded parseFloat via `f64::from_str`. Includes cases where
+/// the hand-written parser's naïve `int + frac/div` accumulator was wrong
+/// (long fractional strings near an ULP boundary) and JS-specific prefix
+/// scanning that stops at the first non-numeric byte.
+#[test]
+fn string_parse_float_js_conformance() {
+    let wasm = compile(
+        r#"
+        export function halfway_even(): f64 {
+            return parseFloat("0.30000000000000004");
+        }
+        export function prefix_scan(): f64 {
+            return parseFloat("  12.5abc");
+        }
+        export function infinity(): f64 {
+            return parseFloat("-Infinity");
+        }
+        export function empty_is_nan(): f64 {
+            return parseFloat("no digits here");
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+
+    let halfway = instance
+        .get_typed_func::<(), f64>(&mut store, "halfway_even")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    // Round-trip with the literal's own f64 representation.
+    assert_eq!(halfway.to_bits(), 0.30000000000000004f64.to_bits());
+
+    let prefix = instance
+        .get_typed_func::<(), f64>(&mut store, "prefix_scan")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    assert_eq!(prefix, 12.5);
+
+    let inf = instance
+        .get_typed_func::<(), f64>(&mut store, "infinity")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    assert!(inf.is_infinite() && inf.is_sign_negative());
+
+    let nan = instance
+        .get_typed_func::<(), f64>(&mut store, "empty_is_nan")
+        .unwrap()
+        .call(&mut store, ())
+        .unwrap();
+    assert!(nan.is_nan());
+}
+
 #[test]
 fn number_to_fixed_basic() {
     let wasm = compile(
@@ -1623,6 +1717,7 @@ fn number_to_precision_basic() {
 
 #[test]
 fn number_to_precision_fewer_than_int_digits() {
+    // ES § 21.1.3.5: when e (== 4 here) ≥ p (== 3), output exponential form.
     let wasm = compile(
         r#"
         export function test(): i32 {
@@ -1640,7 +1735,7 @@ fn number_to_precision_fewer_than_int_digits() {
         .unwrap();
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
-    assert_eq!(read_wasm_string(&store, &memory, ptr), "12300");
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.23e+4");
 }
 
 #[test]
@@ -1707,6 +1802,260 @@ fn number_to_precision_negative() {
     let ptr = test.call(&mut store, ()).unwrap();
     let memory = instance.get_memory(&mut store, "memory").unwrap();
     assert_eq!(read_wasm_string(&store, &memory, ptr), "-45.68");
+}
+
+#[test]
+fn number_to_exponential_basic() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 123.456;
+            return x.toExponential(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.23e+2");
+}
+
+#[test]
+fn number_to_exponential_small_value() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.001;
+            return x.toExponential(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.00e-3");
+}
+
+#[test]
+fn number_to_exponential_zero() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.0;
+            return x.toExponential(3);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "0.000e+0");
+}
+
+#[test]
+fn number_to_exponential_negative() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -12345.0;
+            return x.toExponential(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-1.23e+4");
+}
+
+// === Half-away-from-zero rounding (JS spec § 21.1.3.3 step 6) ===
+// These cases hit exact-tie binary fractions where Rust's default
+// `{:.*}`/`{:.*e}` would round half-to-even and diverge from V8.
+
+#[test]
+fn number_to_fixed_tie_positive_rounds_away() {
+    // (2.5).toFixed(0) → "3" in V8 (pick larger n on tie); banker's gives "2".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 2.5;
+            return x.toFixed(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "3");
+}
+
+#[test]
+fn number_to_fixed_tie_negative_rounds_away() {
+    // (-2.5).toFixed(0) → "-3" per spec (rule operates on |n|, sign re-attached).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -2.5;
+            return x.toFixed(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-3");
+}
+
+#[test]
+fn number_to_fixed_carry_out_of_int_part() {
+    // (9.5).toFixed(0): mantissa rounds 9 → 10, length grows.
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 9.5;
+            return x.toFixed(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "10");
+}
+
+#[test]
+fn number_to_fixed_one_dot_oh_oh_five() {
+    // (1.005).toFixed(2) → "1.00" because the closest f64 to 1.005 is
+    // 1.0049999...989, which rounds to 1.00 (not 1.01). V8 agrees.
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 1.005;
+            return x.toFixed(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.00");
+}
+
+#[test]
+fn number_to_precision_tie_rounds_away() {
+    // (2.5).toPrecision(1) → "3" (tie at the only significant digit).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 2.5;
+            return x.toPrecision(1);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "3");
+}
+
+#[test]
+fn number_to_exponential_tie_rounds_away() {
+    // (1.5).toExponential(0) → "2e+0" (tie at the only significant digit).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 1.5;
+            return x.toExponential(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "2e+0");
+}
+
+#[test]
+fn number_to_exponential_carry_renormalizes_exponent() {
+    // (9.5).toExponential(0): mantissa 9 → 10, renormalize to "1e+1".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 9.5;
+            return x.toExponential(0);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1e+1");
 }
 
 #[test]
@@ -1848,5 +2197,341 @@ fn string_helper_tree_shaking_shrinks_module() {
         "should not include __str_padStart"
     );
     assert!(!s.contains("__str_split"), "should not include __str_split");
+}
+
+// === toPrecision dispatch per ES § 21.1.3.5 step 10 ===
+// Switch to exponential form when e < -6 or e ≥ p; otherwise fixed.
+
+#[test]
+fn number_to_precision_large_value_uses_exp() {
+    // (1234567).toPrecision(4) → e=6, p=4, e≥p ⇒ "1.235e+6".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 1234567.0;
+            return x.toPrecision(4);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.235e+6");
+}
+
+#[test]
+fn number_to_precision_boundary_e_lt_p_fixed() {
+    // (9999).toPrecision(4) → e=3, p=4, e<p ⇒ fixed "9999".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 9999.0;
+            return x.toPrecision(4);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "9999");
+}
+
+#[test]
+fn number_to_precision_carry_into_exp() {
+    // (9999.5).toPrecision(4): rounds to n=1000, e=4 (tie rule picks larger n),
+    // so e≥p ⇒ exponential "1.000e+4". Exercises post-carry exp bump.
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 9999.5;
+            return x.toPrecision(4);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.000e+4");
+}
+
+#[test]
+fn number_to_precision_tiny_value_uses_exp() {
+    // (0.0000001).toPrecision(2) → e=-7, e<-6 ⇒ "1.0e-7".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.0000001;
+            return x.toPrecision(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.0e-7");
+}
+
+#[test]
+fn number_to_precision_boundary_e_neg_six_fixed() {
+    // (0.000001).toPrecision(2) → e=-6, e is NOT < -6 ⇒ fixed "0.0000010".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.000001;
+            return x.toPrecision(2);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "0.0000010");
+}
+
+#[test]
+fn number_to_precision_negative_large_value_uses_exp() {
+    // (-98765).toPrecision(3) → e=4, e≥p ⇒ exponential, sign re-attached.
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -98765.0;
+            return x.toPrecision(3);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-9.88e+4");
+}
+
+// === ES default-argument behavior for number formatters ===
+// ES § 21.1.3.3-5: toFixed/toPrecision/toExponential all accept zero args.
+//   toFixed()        → toFixed(0)
+//   toPrecision()    → ToString(x)  (shortest round-trip)
+//   toExponential()  → shortest round-trip in exponential form
+
+#[test]
+fn number_to_fixed_default_is_zero_digits() {
+    // (3.7).toFixed() → "4"  (same as toFixed(0), half-away-from-zero).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 3.7;
+            return x.toFixed();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "4");
+}
+
+#[test]
+fn number_to_precision_default_is_to_string() {
+    // (0.1 + 0.2).toPrecision() → "0.30000000000000004"  (identical to
+    // toString — no rounding to a fixed precision).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.1 + 0.2;
+            return x.toPrecision();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(
+        read_wasm_string(&store, &memory, ptr),
+        "0.30000000000000004"
+    );
+}
+
+#[test]
+fn number_to_exponential_default_is_shortest() {
+    // (0.000001).toExponential() → "1e-6"  (shortest round-trip in exp form).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.000001;
+            return x.toExponential();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1e-6");
+}
+
+#[test]
+fn number_to_exponential_default_fractional() {
+    // (123.456).toExponential() → "1.23456e+2"  (digits from ryu-js shortest).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 123.456;
+            return x.toExponential();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1.23456e+2");
+}
+
+#[test]
+fn number_to_exponential_default_negative() {
+    // (-0.5).toExponential() → "-5e-1".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = -0.5;
+            return x.toExponential();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "-5e-1");
+}
+
+#[test]
+fn number_to_exponential_default_zero() {
+    // (0).toExponential() → "0e+0" (no sign, even for -0).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 0.0;
+            return x.toExponential();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "0e+0");
+}
+
+#[test]
+fn number_to_exponential_default_large_magnitude() {
+    // (1e21).toExponential() → "1e+21" (ryu already emits exp form here).
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 1e21;
+            return x.toExponential();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1e+21");
+}
+
+#[test]
+fn number_to_precision_one_digit_carry_to_exp() {
+    // (9.5).toPrecision(1): rounds to n=1, e=1 ⇒ e≥p ⇒ "1e+1".
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            let x: f64 = 9.5;
+            return x.toPrecision(1);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "1e+1");
 }
 

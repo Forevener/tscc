@@ -4,14 +4,23 @@ use oxc_ast::ast::*;
 use wasm_encoder::{Function, Instruction, ValType};
 
 use crate::error::{self, CompileError};
-use crate::types::{self, ClosureSig, WasmType};
+use crate::types::{self, ClosureSig, TypeBindings, WasmType};
 
 use super::module::ModuleContext;
+
+/// One emit slot in a function body. Most of tscc pushes `Instruction` values
+/// one at a time; the splicer (L_splice) pastes a pre-rewritten helper body as
+/// a single `RawBytes` chunk to avoid a wasmparser→wasm_encoder op-conversion
+/// table that would grow unboundedly with every helper.
+pub enum EmittedChunk {
+    Instruction(Instruction<'static>),
+    RawBytes(Vec<u8>),
+}
 
 pub struct FuncContext<'a> {
     pub module_ctx: &'a ModuleContext,
     pub locals: HashMap<String, (u32, WasmType)>,
-    pub instructions: Vec<Instruction<'static>>,
+    pub emitted: Vec<EmittedChunk>,
     local_types: Vec<ValType>,
     param_count: u32,
     #[allow(dead_code)]
@@ -46,6 +55,11 @@ pub struct FuncContext<'a> {
     /// receiver expression use `LocalGet(idx)` instead. Used by optional-call
     /// codegen (`obj?.m()`) to null-check a receiver without double evaluation.
     pub method_receiver_override: Option<u32>,
+    /// Type-parameter bindings for the surrounding monomorphized class or
+    /// function. When a field/param/return annotation mentions a name present
+    /// in this map, the binding substitutes for the annotation during type
+    /// resolution. `None` for non-generic code.
+    pub type_bindings: Option<TypeBindings>,
 }
 
 pub(crate) struct LoopLabels {
@@ -67,7 +81,7 @@ impl<'a> FuncContext<'a> {
         FuncContext {
             module_ctx,
             locals,
-            instructions: Vec::new(),
+            emitted: Vec::new(),
             local_types: Vec::new(),
             param_count: params.len() as u32,
             return_type,
@@ -85,17 +99,26 @@ impl<'a> FuncContext<'a> {
             local_string_vars: HashSet::new(),
             source_map: Vec::new(),
             method_receiver_override: None,
+            type_bindings: None,
         }
     }
 
     pub fn push(&mut self, inst: Instruction<'static>) {
-        self.instructions.push(inst);
+        self.emitted.push(EmittedChunk::Instruction(inst));
     }
 
-    /// Record a source location for the next instruction to be emitted.
+    /// Append pre-encoded opcode bytes as a single emit slot. Used by the
+    /// L_splice splicer to paste a rewritten helper body without round-
+    /// tripping every operator through the `Instruction` enum.
+    pub fn push_raw_bytes(&mut self, bytes: Vec<u8>) {
+        self.emitted.push(EmittedChunk::RawBytes(bytes));
+    }
+
+    /// Record a source location for the next chunk to be emitted. A raw-byte
+    /// chunk maps to one source position for its entire byte range — fine,
+    /// since the bytes come from a precompiled helper with no TS source.
     pub fn mark_loc(&mut self, source_offset: u32) {
-        self.source_map
-            .push((self.instructions.len(), source_offset));
+        self.source_map.push((self.emitted.len(), source_offset));
     }
 
     pub fn alloc_local(&mut self, ty: WasmType) -> u32 {
@@ -162,21 +185,28 @@ impl<'a> FuncContext<'a> {
             self.local_types.iter().map(|vt| (1, *vt)).collect();
         let mut func = Function::new(local_groups);
 
-        // Track byte offset of each instruction within the function body
-        let mut inst_byte_offsets: Vec<u32> = Vec::with_capacity(self.instructions.len());
-        for inst in &self.instructions {
-            inst_byte_offsets.push(func.byte_len() as u32);
-            func.instruction(inst);
+        // Track byte offset of the start of each chunk within the function body
+        let mut chunk_byte_offsets: Vec<u32> = Vec::with_capacity(self.emitted.len());
+        for chunk in &self.emitted {
+            chunk_byte_offsets.push(func.byte_len() as u32);
+            match chunk {
+                EmittedChunk::Instruction(inst) => {
+                    func.instruction(inst);
+                }
+                EmittedChunk::RawBytes(bytes) => {
+                    func.raw(bytes.iter().copied());
+                }
+            }
         }
         func.instruction(&Instruction::End);
 
-        // Convert source_map from instruction indices to byte offsets
+        // Convert source_map from chunk indices to byte offsets
         let byte_source_map: Vec<(u32, u32)> = self
             .source_map
             .iter()
-            .filter_map(|&(inst_idx, src_offset)| {
-                inst_byte_offsets
-                    .get(inst_idx)
+            .filter_map(|&(chunk_idx, src_offset)| {
+                chunk_byte_offsets
+                    .get(chunk_idx)
                     .map(|&byte_off| (byte_off, src_offset))
             })
             .collect();
@@ -309,6 +339,18 @@ impl<'a> FuncContext<'a> {
             }
             // Arrow functions are closure pointers (i32)
             Expression::ArrowFunctionExpression(_) => Ok((WasmType::I32, None)),
+            // Array literals [a, b, c] are pointers into the arena. Element
+            // type tracking happens at the var-decl layer where we have the
+            // target name; the local itself is always an i32 handle.
+            Expression::ArrayExpression(a) => {
+                if a.elements.is_empty() {
+                    Err(CompileError::type_err(
+                        "cannot infer type of empty array literal — add a type annotation: `let x: number[] = []`",
+                    ))
+                } else {
+                    Ok((WasmType::I32, None))
+                }
+            }
             _ => Err(CompileError::type_err(
                 "cannot infer type from this expression — add a type annotation",
             )),

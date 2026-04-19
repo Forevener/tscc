@@ -4,7 +4,7 @@ use std::cell::Cell;
 
 use wasmtime::*;
 
-use common::{compile, run_sink_tick};
+use common::{compile, compile_err, run_sink_tick};
 
 #[test]
 fn array_is_array_static() {
@@ -1647,5 +1647,408 @@ fn array_destructuring_rest_does_not_alias_source() {
         .unwrap();
     // src[1] still 2, rest[0] now 999, head is 1
     assert_eq!(test.call(&mut store, ()).unwrap(), 2 + 999 + 1);
+}
+
+#[test]
+fn array_literal_i32_inferred() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [10, 20, 30];
+            sink(xs.length as f64); // 3
+            sink(xs[0] as f64);     // 10
+            sink(xs[1] as f64);     // 20
+            sink(xs[2] as f64);     // 30
+            xs.push(40);
+            sink(xs[3] as f64);     // 40 — capacity grew correctly
+            sink(xs.length as f64); // 4
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 10.0, 20.0, 30.0, 40.0, 4.0]);
+}
+
+#[test]
+fn array_literal_f64_inferred() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const ys = [1.5, 2.5, 3.5];
+            sink(ys[0]);
+            sink(ys[1]);
+            sink(ys[2]);
+            sink(ys.length as f64);
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.5, 2.5, 3.5, 3.0]);
+}
+
+#[test]
+fn array_literal_empty_with_annotation() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: number[] = [];
+            sink(xs.length as f64); // 0
+            xs.push(7.0);
+            xs.push(9.0);
+            sink(xs[0]);           // 7
+            sink(xs[1]);           // 9
+            sink(xs.length as f64); // 2
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![0.0, 7.0, 9.0, 2.0]);
+}
+
+#[test]
+fn array_literal_typed_with_annotation() {
+    // When the annotation says number[] but the literal has integer-valued
+    // elements, they widen to f64 automatically.
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: number[] = [1, 2, 3];
+            sink(xs[0]);
+            sink(xs[1]);
+            sink(xs[2]);
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn array_literal_works_with_hof() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3, 4];
+            const doubled: Array<i32> = xs.map((v, _i) => v * 2);
+            sink(doubled[0] as f64);
+            sink(doubled[1] as f64);
+            sink(doubled[2] as f64);
+            sink(doubled[3] as f64);
+            const sum: i32 = xs.reduce((acc, v) => acc + v, 0);
+            sink(sum as f64); // 10
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![2.0, 4.0, 6.0, 8.0, 10.0]);
+}
+
+#[test]
+fn array_splice_remove_single() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [10, 20, 30, 40, 50];
+            const removed: Array<i32> = xs.splice(2, 1);
+            sink(removed.length as f64); // 1
+            sink(removed[0] as f64);     // 30
+            sink(xs.length as f64);      // 4
+            sink(xs[0] as f64);          // 10
+            sink(xs[1] as f64);          // 20
+            sink(xs[2] as f64);          // 40
+            sink(xs[3] as f64);          // 50
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 30.0, 4.0, 10.0, 20.0, 40.0, 50.0]);
+}
+
+#[test]
+fn array_splice_insert_only() {
+    // Delete 0, insert 2 items — array grows beyond initial capacity (5 → 7).
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3, 4, 5];
+            const removed: Array<i32> = xs.splice(2, 0, 99, 100);
+            sink(removed.length as f64); // 0
+            sink(xs.length as f64);      // 7
+            sink(xs[0] as f64);          // 1
+            sink(xs[1] as f64);          // 2
+            sink(xs[2] as f64);          // 99
+            sink(xs[3] as f64);          // 100
+            sink(xs[4] as f64);          // 3
+            sink(xs[5] as f64);          // 4
+            sink(xs[6] as f64);          // 5
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![0.0, 7.0, 1.0, 2.0, 99.0, 100.0, 3.0, 4.0, 5.0]
+    );
+}
+
+#[test]
+fn array_splice_replace_same_count() {
+    // Delete 2, insert 2 — in-place, no length change.
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3, 4, 5];
+            const removed: Array<i32> = xs.splice(1, 2, 99, 88);
+            sink(removed.length as f64); // 2
+            sink(removed[0] as f64);     // 2
+            sink(removed[1] as f64);     // 3
+            sink(xs.length as f64);      // 5
+            sink(xs[0] as f64);          // 1
+            sink(xs[1] as f64);          // 99
+            sink(xs[2] as f64);          // 88
+            sink(xs[3] as f64);          // 4
+            sink(xs[4] as f64);          // 5
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![2.0, 2.0, 3.0, 5.0, 1.0, 99.0, 88.0, 4.0, 5.0]
+    );
+}
+
+#[test]
+fn array_splice_no_delete_count_removes_tail() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3, 4, 5];
+            const removed: Array<i32> = xs.splice(2);
+            sink(removed.length as f64); // 3
+            sink(removed[0] as f64);     // 3
+            sink(removed[1] as f64);     // 4
+            sink(removed[2] as f64);     // 5
+            sink(xs.length as f64);      // 2
+            sink(xs[0] as f64);          // 1
+            sink(xs[1] as f64);          // 2
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 3.0, 4.0, 5.0, 2.0, 1.0, 2.0]);
+}
+
+#[test]
+fn array_splice_negative_start() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3, 4, 5];
+            // -2 means start at index len-2 = 3
+            const removed: Array<i32> = xs.splice(-2, 1);
+            sink(removed.length as f64); // 1
+            sink(removed[0] as f64);     // 4
+            sink(xs.length as f64);      // 4
+            sink(xs[3] as f64);          // 5
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 4.0, 4.0, 5.0]);
+}
+
+#[test]
+fn array_splice_delete_clamped_to_length() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [10, 20, 30];
+            // Request deleting more than available — clamped to len - start.
+            const removed: Array<i32> = xs.splice(1, 99);
+            sink(removed.length as f64); // 2
+            sink(removed[0] as f64);     // 20
+            sink(removed[1] as f64);     // 30
+            sink(xs.length as f64);      // 1
+            sink(xs[0] as f64);          // 10
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![2.0, 20.0, 30.0, 1.0, 10.0]);
+}
+
+#[test]
+fn array_splice_f64_elements() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: number[] = [1.5, 2.5, 3.5, 4.5];
+            const removed: number[] = xs.splice(1, 2, 7.0, 8.0, 9.0);
+            sink(removed.length as f64); // 2
+            sink(removed[0]);            // 2.5
+            sink(removed[1]);            // 3.5
+            sink(xs.length as f64);      // 5
+            sink(xs[0]);                 // 1.5
+            sink(xs[1]);                 // 7.0
+            sink(xs[2]);                 // 8.0
+            sink(xs[3]);                 // 9.0
+            sink(xs[4]);                 // 4.5
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![2.0, 2.5, 3.5, 5.0, 1.5, 7.0, 8.0, 9.0, 4.5]
+    );
+}
+
+#[test]
+fn array_splice_empty_delete_empty_insert_noop() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = [1, 2, 3];
+            const removed: Array<i32> = xs.splice(1, 0);
+            sink(removed.length as f64); // 0
+            sink(xs.length as f64);      // 3
+            sink(xs[0] as f64);          // 1
+            sink(xs[1] as f64);          // 2
+            sink(xs[2] as f64);          // 3
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![0.0, 3.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn array_literal_spread_single_source() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const src = [1, 2, 3];
+            const copy = [...src];
+            sink(copy.length as f64); // 3
+            sink(copy[0] as f64);     // 1
+            sink(copy[1] as f64);     // 2
+            sink(copy[2] as f64);     // 3
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 1.0, 2.0, 3.0]);
+}
+
+#[test]
+fn array_literal_spread_with_inline_head_and_tail() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const mid = [20, 30];
+            const xs = [10, ...mid, 40, 50];
+            sink(xs.length as f64); // 5
+            sink(xs[0] as f64);     // 10
+            sink(xs[1] as f64);     // 20
+            sink(xs[2] as f64);     // 30
+            sink(xs[3] as f64);     // 40
+            sink(xs[4] as f64);     // 50
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![5.0, 10.0, 20.0, 30.0, 40.0, 50.0]);
+}
+
+#[test]
+fn array_literal_spread_multiple_sources() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const a = [1, 2];
+            const b = [3, 4];
+            const c = [5, 6];
+            const joined = [...a, ...b, ...c];
+            sink(joined.length as f64); // 6
+            sink(joined[0] as f64);     // 1
+            sink(joined[2] as f64);     // 3
+            sink(joined[5] as f64);     // 6
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![6.0, 1.0, 3.0, 6.0]);
+}
+
+#[test]
+fn array_literal_spread_f64_elements() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const src: number[] = [1.5, 2.5];
+            const xs: number[] = [0.5, ...src, 3.5];
+            sink(xs.length as f64); // 4
+            sink(xs[0]);            // 0.5
+            sink(xs[1]);            // 1.5
+            sink(xs[2]);            // 2.5
+            sink(xs[3]);            // 3.5
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![4.0, 0.5, 1.5, 2.5, 3.5]);
+}
+
+#[test]
+fn array_literal_spread_from_empty_source() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const empty: Array<i32> = new Array<i32>(0);
+            const xs = [1, ...empty, 2, ...empty];
+            sink(xs.length as f64); // 2
+            sink(xs[0] as f64);     // 1
+            sink(xs[1] as f64);     // 2
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![2.0, 1.0, 2.0]);
+}
+
+#[test]
+fn array_literal_spread_element_type_mismatch_errors() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const xs: number[] = [1.5];
+            const ys: Array<i32> = [...xs]; // f64 spread into i32 literal
+            return ys.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not match") || msg.contains("element type"),
+        "expected type-mismatch error, got: {msg}"
+    );
+}
+
+#[test]
+fn array_literal_empty_without_annotation_errors() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const xs = [];
+            return xs.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("empty array literal"),
+        "expected empty-literal error, got: {msg}"
+    );
 }
 

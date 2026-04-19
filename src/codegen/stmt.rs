@@ -83,19 +83,25 @@ impl<'a> FuncContext<'a> {
         };
 
         // Resolve type from annotation (on VariableDeclarator, not BindingPattern)
+        let mut annotated_array_elem_ty: Option<WasmType> = None;
         let ty = if let Some(ann) = &decl.type_annotation {
             // Track closure signature from function type annotation
             if let Some(sig) = types::get_closure_sig(ann, &self.module_ctx.class_names) {
                 self.local_closure_sigs.insert(name.clone(), sig);
             }
-            // Track class type for property access resolution
-            if let Some(class_name) = types::get_class_type_name(ann) {
+            // Track class type for property access resolution (threading
+            // type_bindings so generic-param annotations inside monomorphized
+            // methods resolve to the mangled instantiation).
+            if let Some(class_name) =
+                types::get_class_type_name_with_bindings(ann, self.type_bindings.as_ref())
+            {
                 self.local_class_types.insert(name.clone(), class_name);
             }
             // Track array element type
             if let Some(elem_ty) = types::get_array_element_type(ann, &self.module_ctx.class_names)
             {
                 self.local_array_elem_types.insert(name.clone(), elem_ty);
+                annotated_array_elem_ty = Some(elem_ty);
                 // Track array element class if applicable
                 if let Some(elem_class) = types::get_array_element_class(ann) {
                     self.local_array_elem_classes
@@ -103,11 +109,15 @@ impl<'a> FuncContext<'a> {
                 }
             }
             // Track string type
-            if types::is_string_type(ann) {
+            if types::is_string_type_with_bindings(ann, self.type_bindings.as_ref()) {
                 self.local_string_vars.insert(name.clone());
             }
-            types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names)
-                .map_err(|e| self.locate(e, decl.span.start))?
+            types::resolve_type_annotation_with_bindings(
+                ann,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+            )
+            .map_err(|e| self.locate(e, decl.span.start))?
         } else if let Some(init) = &decl.init {
             // Infer closure sig from arrow initializer
             if let Expression::ArrowFunctionExpression(arrow) = init
@@ -128,6 +138,35 @@ impl<'a> FuncContext<'a> {
             // Infer string from string literal initializer
             if matches!(init, Expression::StringLiteral(_)) {
                 self.local_string_vars.insert(name.clone());
+            }
+            // Infer array element type from a non-empty array literal initializer
+            if let Expression::ArrayExpression(arr) = init
+                && let Some(first) = arr.elements.first()
+            {
+                match first {
+                    ArrayExpressionElement::SpreadElement(s) => {
+                        if let Some(elem_ty) = self.resolve_expr_array_elem(&s.argument) {
+                            self.local_array_elem_types.insert(name.clone(), elem_ty);
+                            if let Some(class_name) =
+                                self.resolve_expr_array_elem_class(&s.argument)
+                            {
+                                self.local_array_elem_classes
+                                    .insert(name.clone(), class_name);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(expr) = first.as_expression()
+                            && let Ok((first_ty, first_class)) = self.infer_init_type(expr)
+                        {
+                            self.local_array_elem_types.insert(name.clone(), first_ty);
+                            if let Some(class_name) = first_class {
+                                self.local_array_elem_classes
+                                    .insert(name.clone(), class_name);
+                            }
+                        }
+                    }
+                }
             }
             let (inferred_ty, inferred_class) = self
                 .infer_init_type(init)
@@ -200,7 +239,14 @@ impl<'a> FuncContext<'a> {
 
         // Emit initializer if present
         if let Some(init) = &decl.init {
-            let init_ty = self.emit_expr(init)?;
+            // Array literals get the annotation's element type threaded in so
+            // empty `[]` can be typed purely from the declaration.
+            let init_ty = match init {
+                Expression::ArrayExpression(arr) if annotated_array_elem_ty.is_some() => {
+                    self.emit_array_literal(arr, annotated_array_elem_ty)?
+                }
+                _ => self.emit_expr(init)?,
+            };
             if init_ty != ty {
                 return Err(CompileError::type_err(format!(
                     "cannot initialize {ty:?} variable '{name}' with {init_ty:?}"
