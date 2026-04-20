@@ -1,15 +1,15 @@
 /// String header size in bytes (length field).
-const HEADER: u32 = 4;
+pub(crate) const HEADER: u32 = 4;
 
 /// Read a string's length field.
 #[inline(always)]
-unsafe fn str_len(s: u32) -> usize {
+pub(crate) unsafe fn str_len(s: u32) -> usize {
     unsafe { (s as *const u32).read() as usize }
 }
 
 /// Get a byte slice over a string's content (skipping the 4-byte header).
 #[inline(always)]
-unsafe fn str_bytes<'a>(s: u32, len: usize) -> &'a [u8] {
+pub(crate) unsafe fn str_bytes<'a>(s: u32, len: usize) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts((s + HEADER) as *const u8, len) }
 }
 
@@ -57,34 +57,13 @@ pub extern "C" fn __str_slice(s: u32, start: i32, end: i32) -> u32 {
     }
 }
 
-/// string == string. Returns 1 if equal, 0 otherwise.
-#[unsafe(no_mangle)]
-pub extern "C" fn __str_eq(a: u32, b: u32) -> i32 {
-    unsafe {
-        let al = str_len(a);
-        let bl = str_len(b);
-        if al != bl {
-            return 0;
-        }
-        if str_bytes(a, al) == str_bytes(b, bl) { 1 } else { 0 }
-    }
-}
-
-/// Lexicographic byte compare. Returns -1, 0, or 1.
-#[unsafe(no_mangle)]
-pub extern "C" fn __str_cmp(a: u32, b: u32) -> i32 {
-    unsafe {
-        let al = str_len(a);
-        let bl = str_len(b);
-        let ap = str_bytes(a, al);
-        let bp = str_bytes(b, bl);
-        match ap.cmp(bp) {
-            core::cmp::Ordering::Less => -1,
-            core::cmp::Ordering::Equal => 0,
-            core::cmp::Ordering::Greater => 1,
-        }
-    }
-}
+// `__str_eq` and `__str_cmp` both live in `helpers/src/inline.rs` as L_splice
+// helpers — they're called once per `<` / `<=` / `>` / `>=` / `==` / `!=`
+// expression between strings, and Map<string, V> probes hit `__str_eq` once
+// per occupied bucket checked. The splicer pastes each body at every call
+// site rather than paying the `Call` boundary. Both bodies still contain a
+// `Call` to rustc's memcmp (slice-eq / slice-cmp lowering), which stays as a
+// Call in the spliced output — only the outer helper boundary is removed.
 
 /// string.indexOf(needle) -> i32. Byte offset of first match, or -1.
 /// Empty needle returns 0 (matches JS).

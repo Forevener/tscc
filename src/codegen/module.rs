@@ -95,6 +95,12 @@ pub struct ModuleContext {
     /// in Pass 0a-iii. Dispatchers in `expr/map.rs` and `emit_new` read this
     /// to route per-monomorphization codegen.
     pub map_info: HashMap<String, super::map_builtins::MapInfo>,
+    /// Output of `register_string_helpers`, stashed here so that method-body
+    /// codegen can build a `RewritePlan` to feed the L_splice splicer.
+    /// `None` until that pass has run; never observed `None` from method code
+    /// (helper registration runs in Pass 2, before Pass 3 codegen).
+    pub helper_registration:
+        RefCell<Option<super::string_builtins::HelperRegistration>>,
 }
 
 /// A lifted closure function to be added to the WASM module's function table.
@@ -153,6 +159,7 @@ impl ModuleContext {
             fn_bindings: HashMap::new(),
             inferred_fn_calls: HashMap::new(),
             map_info: HashMap::new(),
+            helper_registration: RefCell::new(None),
         }
     }
 
@@ -748,6 +755,12 @@ pub fn compile_module<'a>(
         &used_string_helpers,
         expose_helpers,
     );
+    // Stash on ctx so method-body codegen (Pass 3 below) can build a
+    // RewritePlan to drive the L_splice splicer for inline helpers like
+    // `__hash_fx_i32`. We still pass `&helper_registration` by reference to
+    // the later compile/assemble calls; both views observe the same data.
+    ctx.helper_registration
+        .replace(Some(helper_registration.clone()));
 
     // Register RNG helpers (state global + step function) if Math.random is used.
     let uses_random = super::math_builtins::program_uses_random(program);

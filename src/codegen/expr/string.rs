@@ -362,32 +362,20 @@ impl<'a> FuncContext<'a> {
             BinaryOperator::StrictEquality | BinaryOperator::Equality => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_eq")
-                    .ok_or_else(|| CompileError::codegen("__str_eq not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_eq");
                 Ok(WasmType::I32)
             }
             BinaryOperator::StrictInequality | BinaryOperator::Inequality => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_eq")
-                    .ok_or_else(|| CompileError::codegen("__str_eq not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_eq");
                 self.push(Instruction::I32Eqz); // negate
                 Ok(WasmType::I32)
             }
             BinaryOperator::LessThan => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_cmp")
-                    .ok_or_else(|| CompileError::codegen("__str_cmp not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_cmp");
                 self.push(Instruction::I32Const(0));
                 self.push(Instruction::I32LtS);
                 Ok(WasmType::I32)
@@ -395,11 +383,7 @@ impl<'a> FuncContext<'a> {
             BinaryOperator::GreaterThan => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_cmp")
-                    .ok_or_else(|| CompileError::codegen("__str_cmp not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_cmp");
                 self.push(Instruction::I32Const(0));
                 self.push(Instruction::I32GtS);
                 Ok(WasmType::I32)
@@ -407,11 +391,7 @@ impl<'a> FuncContext<'a> {
             BinaryOperator::LessEqualThan => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_cmp")
-                    .ok_or_else(|| CompileError::codegen("__str_cmp not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_cmp");
                 self.push(Instruction::I32Const(0));
                 self.push(Instruction::I32LeS);
                 Ok(WasmType::I32)
@@ -419,11 +399,7 @@ impl<'a> FuncContext<'a> {
             BinaryOperator::GreaterEqualThan => {
                 self.emit_expr(&bin.left)?;
                 self.emit_expr(&bin.right)?;
-                let (func_idx, _) = self
-                    .module_ctx
-                    .get_func("__str_cmp")
-                    .ok_or_else(|| CompileError::codegen("__str_cmp not found"))?;
-                self.push(Instruction::Call(func_idx));
+                self.emit_helper_invocation("__str_cmp");
                 self.push(Instruction::I32Const(0));
                 self.push(Instruction::I32GeS);
                 Ok(WasmType::I32)

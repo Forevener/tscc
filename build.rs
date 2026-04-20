@@ -75,6 +75,15 @@ fn main() {
              pub original_idx: u32,\n    \
              pub uleb128_len: u8,\n\
          }\n\n\
+         pub struct ReturnSite {\n    \
+             /// Byte offset of the `return` opcode (0x0F, always 1 byte long).\n    \
+             pub byte_offset: u32,\n    \
+             /// Control-frame nesting depth at this site, counting blocks\n    \
+             /// opened inside the helper body. The splicer rewrites each\n    \
+             /// return into `br block_depth` so the branch targets the\n    \
+             /// wrapping block that replaces the helper's function frame.\n    \
+             pub block_depth: u32,\n\
+         }\n\n\
          pub struct PrecompiledFunc {\n    \
              pub name: Option<&'static str>,\n    \
              pub params: &'static [ValType],\n    \
@@ -87,8 +96,9 @@ fn main() {
              /// L_splice-only: byte offsets of every local op in the body.\n    \
              /// Empty for L_helper functions.\n    \
              pub local_sites: &'static [LocalSite],\n    \
-             /// L_splice-only: body contains a `return` opcode.\n    \
-             pub has_return: bool,\n    \
+             /// L_splice-only: every `return` opcode with its control-frame\n    \
+             /// nesting depth at that site. Empty for L_helper functions.\n    \
+             pub return_sites: &'static [ReturnSite],\n    \
              /// L_splice-only: body contains a `br_table` opcode.\n    \
              pub has_br_table: bool,\n    \
              /// True iff this helper was authored via `tscc_inline!`. The\n    \
@@ -154,7 +164,7 @@ fn main() {
         let call_indirect_sites = format_call_indirect_sites(&func.call_indirect_sites);
         let global_sites = format_global_sites(&func.global_sites);
         let local_sites = format_local_sites(&func.local_sites);
-        let has_return = func.has_return;
+        let return_sites = format_return_sites(&func.return_sites);
         let has_br_table = func.has_br_table;
         let is_inline = func.is_inline;
         write!(
@@ -169,7 +179,7 @@ fn main() {
                  call_indirect_sites: {call_indirect_sites},\n        \
                  global_sites: {global_sites},\n        \
                  local_sites: {local_sites},\n        \
-                 has_return: {has_return},\n        \
+                 return_sites: {return_sites},\n        \
                  has_br_table: {has_br_table},\n        \
                  is_inline: {is_inline},\n    \
              }},\n",
@@ -292,10 +302,11 @@ struct ExtractedFunc {
     /// emitted unmodified). Recorded once at extraction time so splice.rs
     /// stays a pure byte-rewriter at runtime.
     local_sites: Vec<ExtractedLocalSite>,
-    /// L_splice-only: true iff body contains `return`. Splicer rewrites these
-    /// to `Br(0)` against the wrapping block. POC subset rejects helpers
-    /// where this is true.
-    has_return: bool,
+    /// L_splice-only: every `return` opcode with its control-frame nesting
+    /// depth at that site. The splicer rewrites each to
+    /// `br block_depth`, which targets the wrapping block that replaces
+    /// the helper's function frame.
+    return_sites: Vec<ExtractedReturnSite>,
     /// L_splice-only: true iff body contains `br_table`. POC subset rejects.
     has_br_table: bool,
     /// True iff this function was authored via `tscc_inline!` (L_splice).
@@ -350,6 +361,11 @@ struct ExtractedLocalSite {
     byte_offset: u32,
     original_idx: u32,
     uleb128_len: u8,
+}
+
+struct ExtractedReturnSite {
+    byte_offset: u32,
+    block_depth: u32,
 }
 
 struct DataSegment {
@@ -578,10 +594,10 @@ fn extract_bundle(wasm_bytes: &[u8]) -> ExtractedBundle {
             extract_body(body, wasm_bytes);
         // Splice metadata is only needed for inline helpers — skip the extra
         // op walk for L_helper bodies.
-        let (local_sites, has_return, has_br_table) = if is_inline {
+        let (local_sites, return_sites, has_br_table) = if is_inline {
             extract_inline_metadata(body)
         } else {
-            (Vec::new(), false, false)
+            (Vec::new(), Vec::new(), false)
         };
         funcs.push(ExtractedFunc {
             name,
@@ -593,7 +609,7 @@ fn extract_bundle(wasm_bytes: &[u8]) -> ExtractedBundle {
             call_indirect_sites,
             global_sites,
             local_sites,
-            has_return,
+            return_sites,
             has_br_table,
             is_inline,
         });
@@ -737,13 +753,15 @@ fn extract_body(body: &wasmparser::FunctionBody, wasm_bytes: &[u8]) -> Extracted
     (locals, raw_body, call_sites, call_indirect_sites, global_sites)
 }
 
-/// Splice-specific scan: enumerate every `local.get/set/tee` site (with
-/// byte-offset + immediate width) and detect any unsupported control flow
-/// the splicer would need extra work to handle. Only invoked for inline
-/// helpers — splice metadata for L_helper functions stays empty.
+/// Splice-specific scan: enumerate every `local.get/set/tee` site, record
+/// each `return` with the control-frame depth at that point (so the splicer
+/// can rewrite it to a `br` targeting the wrapping block), and detect any
+/// unsupported control flow the splicer would need extra work to handle.
+/// Only invoked for inline helpers — splice metadata for L_helper functions
+/// stays empty.
 fn extract_inline_metadata(
     body: &wasmparser::FunctionBody,
-) -> (Vec<ExtractedLocalSite>, bool, bool) {
+) -> (Vec<ExtractedLocalSite>, Vec<ExtractedReturnSite>, bool) {
     let op_reader = body.get_operators_reader().unwrap();
     let body_start = op_reader.original_position();
     let body_end = body.range().end;
@@ -755,8 +773,13 @@ fn extract_inline_metadata(
     }
 
     let mut local_sites = Vec::new();
-    let mut has_return = false;
+    let mut return_sites = Vec::new();
     let mut has_br_table = false;
+    // Control-frame depth counting only blocks opened *inside* the helper
+    // body (Block/Loop/If). Each opens one frame; their matching End closes
+    // it. The function-terminator `End` is the final op and decrements below
+    // zero, but we never read `depth` at that point.
+    let mut depth: i32 = 0;
     for (i, (off, op)) in ops.iter().enumerate() {
         let next_off = if i + 1 < ops.len() {
             ops[i + 1].0
@@ -775,13 +798,26 @@ fn extract_inline_metadata(
                     uleb128_len: uleb_len,
                 });
             }
-            Operator::Return => has_return = true,
+            Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. } => {
+                depth += 1;
+            }
+            Operator::End => {
+                depth -= 1;
+            }
+            Operator::Return => {
+                let rel = (*off - body_start) as u32;
+                assert!(depth >= 0, "return op with negative nesting depth");
+                return_sites.push(ExtractedReturnSite {
+                    byte_offset: rel,
+                    block_depth: depth as u32,
+                });
+            }
             Operator::BrTable { .. } => has_br_table = true,
             _ => {}
         }
     }
 
-    (local_sites, has_return, has_br_table)
+    (local_sites, return_sites, has_br_table)
 }
 
 fn decode_uleb128(bytes: &[u8]) -> Option<(u64, usize)> {
@@ -887,6 +923,26 @@ fn format_local_sites(sites: &[ExtractedLocalSite]) -> String {
             s,
             "LocalSite {{ byte_offset: {}, original_idx: {}, uleb128_len: {} }}",
             ls.byte_offset, ls.original_idx, ls.uleb128_len
+        )
+        .unwrap();
+    }
+    s.push(']');
+    s
+}
+
+fn format_return_sites(sites: &[ExtractedReturnSite]) -> String {
+    if sites.is_empty() {
+        return "&[]".to_string();
+    }
+    let mut s = String::from("&[");
+    for (i, rs) in sites.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write!(
+            s,
+            "ReturnSite {{ byte_offset: {}, block_depth: {} }}",
+            rs.byte_offset, rs.block_depth
         )
         .unwrap();
     }

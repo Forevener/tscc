@@ -192,6 +192,13 @@ pub fn equality_helper_for(key_ty: &BoundType) -> Option<&'static str> {
 /// Consumed by `compile_module` to seed `used_string_helpers` before
 /// `register_string_helpers` runs — keeps registration tree-shaken when the
 /// program doesn't use Maps and correct when it does.
+///
+/// Inline (L_splice) helpers are included alongside L_helper ones. They have
+/// no bundle slot themselves (the splicer pastes their bodies at each call
+/// site), but `register_string_helpers` consults the same `used` set to
+/// decide which inline helpers' Call targets need to be registered in tscc's
+/// function space — without that, an inline helper whose body calls
+/// `memcmp` (e.g. `__str_eq`) would splice out a `Call(u32::MAX)`.
 pub fn required_runtime_helpers(insts: &[MapInstantiation]) -> HashSet<String> {
     let mut out = HashSet::new();
     for inst in insts {

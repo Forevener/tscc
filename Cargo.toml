@@ -1,7 +1,14 @@
 [package]
 name = "tscc"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "TypeScript → WebAssembly ahead-of-time compiler. Typed static subset, arena allocation, deterministic output."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/forevener/tscc"
+readme = "README.md"
+keywords = ["typescript", "webassembly", "wasm", "compiler", "aot"]
+categories = ["compilers", "wasm"]
+rust-version = "1.94"
 
 [lib]
 name = "tscc"
@@ -10,6 +17,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "tscc"
 path = "src/main.rs"
+
+[[example]]
+name = "hello-world"
+path = "examples/hello-world/main.rs"
 
 [dependencies]
 oxc_parser = "0.124"

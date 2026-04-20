@@ -32,17 +32,17 @@ mod hash;
 mod inline;
 mod string;
 
+pub use inline::__hash_fx_f64;
+pub use inline::__hash_fx_i32;
+pub use inline::__hash_fx_ptr;
 pub use inline::__inline_test_passthrough;
+pub use inline::__key_eq_f64;
+pub use inline::__str_cmp;
+pub use inline::__str_eq;
 
 pub use hash::__hash_fx_bool;
-pub use hash::__hash_fx_f64;
-pub use hash::__hash_fx_i32;
-pub use hash::__hash_fx_ptr;
 pub use hash::__hash_xxh3_str;
-pub use hash::__key_eq_f64;
-pub use string::__str_cmp;
 pub use string::__str_endsWith;
-pub use string::__str_eq;
 pub use string::__str_from_f64;
 pub use string::__str_includes;
 pub use string::__str_indexOf;

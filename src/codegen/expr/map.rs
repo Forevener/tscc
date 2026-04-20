@@ -896,14 +896,42 @@ impl<'a> FuncContext<'a> {
 
     /// Emit the hash call for a key already held in `key_local`, pushing the
     /// raw i32 hash onto the stack. Routes to the appropriate
-    /// `__hash_fx_*` / `__hash_xxh3_*` helper based on the key type.
+    /// `__hash_fx_*` / `__hash_xxh3_*` helper based on the key type. For
+    /// helpers authored as L_splice (e.g. `__hash_fx_i32`), the body is
+    /// pasted inline via the splicer rather than emitted as a `Call`.
     fn emit_hash_for_local(&mut self, key_local: u32, key_ty: &BoundType) {
         self.push(Instruction::LocalGet(key_local));
         let name = map_builtins::hash_helper_for(key_ty);
+        self.emit_helper_invocation(name);
+    }
+
+    /// Emit a call to a runtime helper by name, splicing if it's L_splice and
+    /// falling back to `Call(idx)` otherwise. Args must already be on the
+    /// stack in the helper's parameter order. The result (if any) replaces
+    /// them on the stack — same convention either path.
+    pub(crate) fn emit_helper_invocation(&mut self, name: &str) {
+        if let Some(pf) = crate::codegen::precompiled::find_inline(name) {
+            let reg_borrow = self.module_ctx.helper_registration.borrow();
+            let reg = reg_borrow.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "helper_registration unset — register_string_helpers must run \
+                     before method codegen splices inline helper '{name}'"
+                )
+            });
+            let plan = crate::codegen::precompiled::RewritePlan {
+                func_index_map: &reg.func_index_map,
+                type_index_map: &reg.type_index_map,
+                global_index_map: &reg.global_index_map,
+                helper_table_index: reg.helper_table_index,
+            };
+            crate::codegen::splice::splice_inline_call(self, pf, &plan)
+                .unwrap_or_else(|e| panic!("splicing '{name}' failed: {e:?}"));
+            return;
+        }
         let (func_idx, _) = self
             .module_ctx
             .get_func(name)
-            .unwrap_or_else(|| panic!("hash helper '{name}' not registered"));
+            .unwrap_or_else(|| panic!("helper '{name}' not registered"));
         self.push(Instruction::Call(func_idx));
     }
 
@@ -923,14 +951,8 @@ impl<'a> FuncContext<'a> {
         self.push(load_key(&info.key_ty, info.bucket.key_offset));
         self.push(Instruction::LocalGet(key_local));
         match &info.key_ty {
-            BoundType::F64 => {
-                let (idx, _) = self.module_ctx.get_func("__key_eq_f64").unwrap();
-                self.push(Instruction::Call(idx));
-            }
-            BoundType::Str => {
-                let (idx, _) = self.module_ctx.get_func("__str_eq").unwrap();
-                self.push(Instruction::Call(idx));
-            }
+            BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
+            BoundType::Str => self.emit_helper_invocation("__str_eq"),
             _ => self.push(Instruction::I32Eq),
         }
     }

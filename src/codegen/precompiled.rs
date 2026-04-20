@@ -35,11 +35,13 @@ pub struct RewritePlan<'a> {
     pub helper_table_index: u32,
 }
 
-/// Find the bundle index of an exported helper by name.
+/// Find the bundle index of an exported L_helper by name. Skips L_splice
+/// (inline) helpers — those have no bundle slot of their own; `find_inline`
+/// is the only correct way to reach them.
 pub fn find_export(name: &str) -> Option<usize> {
     PRECOMPILED_FUNCS
         .iter()
-        .position(|f| f.name == Some(name))
+        .position(|f| !f.is_inline && f.name == Some(name))
 }
 
 /// Find an inline (L_splice) helper by name. Returns `None` for unknown names

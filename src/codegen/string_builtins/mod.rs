@@ -16,9 +16,10 @@ pub const STRING_HEADER_SIZE: i32 = 4;
 /// Note: `__str_concat` was removed in favor of inline fused allocation
 /// (see `emit_fused_string_chain` in codegen/expr.rs), which avoids the N-1
 /// intermediate allocations of the chained-call approach.
+/// Note: `__str_eq` and `__str_cmp` are not listed here — they're L_splice
+/// helpers living in `helpers/src/inline.rs`, and the splicer pastes their
+/// bodies at each call site rather than registering them as real functions.
 pub const STRING_HELPER_NAMES: &[&str] = &[
-    "__str_eq",
-    "__str_cmp",
     "__str_indexOf",
     "__str_slice",
     "__str_startsWith",
@@ -54,6 +55,12 @@ type HelperSig = (&'static str, Vec<(String, WasmType)>, WasmType);
 /// Output of helper registration, carrying the state needed by the matching
 /// body-emission pass (`compile_string_helpers`). Threads through `module.rs`
 /// because `compile_string_helpers` runs later, with immutable access to `ctx`.
+///
+/// `Clone` so a copy can be stashed on `ModuleContext` for method-body codegen
+/// (which needs the rewrite-plan slices to drive the L_splice splicer) while
+/// the original keeps flowing through `compile_string_helpers` /
+/// `assemble_module`. The fields are all `Vec<u32>` / primitives — cheap.
+#[derive(Clone)]
 pub struct HelperRegistration {
     /// Bundle indices that WERE registered, in registration (= emission) order.
     pub registered_bundle: Vec<usize>,
@@ -75,6 +82,23 @@ pub struct HelperRegistration {
     pub requires_data: bool,
     /// Destination table index for helper `call_indirect`s.
     pub helper_table_index: u32,
+    /// Inline (L_splice) helper names that the caller asked to expose via the
+    /// export table. Each gets a synthesized one-line wrapper function: take
+    /// the params, splice the inline body, return the result. The host can
+    /// then call them through wasmtime exactly like an L_helper export.
+    /// Used by `tests/hashers.rs` and similar — the wrapper is the only way
+    /// to make an inline helper observable from outside the splicer.
+    pub exposed_inline_wrappers: Vec<InlineWrapperReg>,
+}
+
+/// Registration metadata for one synthesized inline-helper wrapper. Used by
+/// `compile_string_helpers` to emit the matching body in the same order the
+/// names were registered (so func indices stay aligned).
+#[derive(Clone)]
+pub struct InlineWrapperReg {
+    pub name: &'static str,
+    pub params: Vec<(String, WasmType)>,
+    pub ret: WasmType,
 }
 
 pub fn register_string_helpers(
@@ -83,18 +107,13 @@ pub fn register_string_helpers(
     exposed: &HashSet<String>,
 ) -> HelperRegistration {
     let mut helpers: Vec<HelperSig> = vec![
-        // __str_eq(a: i32, b: i32) -> i32
-        (
-            "__str_eq",
-            vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
-            WasmType::I32,
-        ),
-        // __str_cmp(a: i32, b: i32) -> i32
-        (
-            "__str_cmp",
-            vec![("a".into(), WasmType::I32), ("b".into(), WasmType::I32)],
-            WasmType::I32,
-        ),
+        // Note: `__str_eq` and `__str_cmp` are omitted on purpose — they're
+        // L_splice helpers (see `helpers/src/inline.rs`). The splicer pastes
+        // their bodies at each call site. The only residual tscc-side wiring
+        // is ensuring memcmp (each body's slice-eq/slice-cmp Call target)
+        // stays seeded when either name is in `used` — handled in the Phase
+        // 2 seed walk below.
+        //
         // __str_indexOf(haystack: i32, needle: i32) -> i32
         (
             "__str_indexOf",
@@ -322,12 +341,29 @@ pub fn register_string_helpers(
     }
 
     // Phase 2: seed the bundle from used precompiled exports, walk the call
-    // graph, then expand with dynamic dispatch.
-    let seeds: Vec<usize> = super::precompiled::PRECOMPILED_FUNCS
-        .iter()
-        .enumerate()
-        .filter_map(|(i, pf)| pf.name.filter(|n| used.contains(*n)).map(|_| i))
-        .collect();
+    // graph, then expand with dynamic dispatch. Inline (L_splice) helpers are
+    // never registered as bundle functions (the splicer pastes their bodies
+    // at each call site), BUT when an inline helper's body has its own
+    // `call` instructions, those callees land in the spliced output and must
+    // still be registered in tscc's function space — otherwise the splicer's
+    // byte rewrite maps them to `u32::MAX`. So we seed each inline helper's
+    // call-site targets alongside the regular seeds and let
+    // `transitive_closure` do the rest.
+    let import_count = super::precompiled::PRECOMPILED_IMPORTS.len() as u32;
+    let mut seeds: Vec<usize> = Vec::new();
+    for (i, pf) in super::precompiled::PRECOMPILED_FUNCS.iter().enumerate() {
+        match (pf.is_inline, pf.name) {
+            (false, Some(name)) if used.contains(name) => seeds.push(i),
+            (true, Some(name)) if used.contains(name) => {
+                for cs in pf.call_sites {
+                    if cs.original_callee >= import_count {
+                        seeds.push((cs.original_callee - import_count) as usize);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     let direct_closure = super::precompiled::transitive_closure(&seeds);
     let (registered_bundle, requires_table) =
         super::precompiled::expand_with_dynamic_dispatch(direct_closure);
@@ -415,6 +451,37 @@ pub fn register_string_helpers(
     let requires_data =
         !registered_bundle.is_empty() && super::precompiled::has_data();
 
+    // Phase 6: synthesize a wrapper for each inline (L_splice) helper that
+    // the caller asked to expose via the export table. Inline helpers have no
+    // bundle slot of their own, so without a wrapper they're unreachable from
+    // outside the splicer. The wrapper body is emitted in
+    // `compile_string_helpers` once the rewrite plan is fully built.
+    //
+    // Iterate `exposed` in sorted order: `HashSet<String>::iter()` is seeded
+    // by `RandomState` and reshuffles across process instances, which would
+    // leak into wrapper registration order and thus into the emitted wasm's
+    // function-index space. Sorting the set before iterating is the only
+    // place this non-determinism can enter codegen — every other HashSet
+    // access is either `.contains()` or writes into another HashSet.
+    let mut exposed_sorted: Vec<&String> = exposed.iter().collect();
+    exposed_sorted.sort();
+    let mut exposed_inline_wrappers: Vec<InlineWrapperReg> = Vec::new();
+    for name in exposed_sorted {
+        if let Some(pf) = super::precompiled::find_inline(name) {
+            let helper_name = pf
+                .name
+                .expect("find_inline only returns named precompiled helpers");
+            let params = inline_wrapper_params(pf, helper_name);
+            let ret = inline_wrapper_ret(pf, helper_name);
+            ctx.register_func(helper_name, &params, ret, true).unwrap();
+            exposed_inline_wrappers.push(InlineWrapperReg {
+                name: helper_name,
+                params,
+                ret,
+            });
+        }
+    }
+
     HelperRegistration {
         registered_bundle,
         func_index_map,
@@ -423,6 +490,47 @@ pub fn register_string_helpers(
         requires_table,
         requires_data,
         helper_table_index,
+        exposed_inline_wrappers,
+    }
+}
+
+/// Convert a precompiled inline helper's `ValType` params into the
+/// `(name, WasmType)` shape `register_func` wants. Supports the same param
+/// types the splicer's `wasm_type_from_val_type` does (i32, f64).
+fn inline_wrapper_params(
+    pf: &super::precompiled::PrecompiledFunc,
+    helper_name: &str,
+) -> Vec<(String, WasmType)> {
+    pf.params
+        .iter()
+        .enumerate()
+        .map(|(i, vt)| (format!("p{i}"), val_type_to_wasm(*vt, helper_name)))
+        .collect()
+}
+
+/// Convert a precompiled inline helper's single result `ValType` to `WasmType`.
+/// Multi-result helpers are rejected — none currently exist in inline form.
+fn inline_wrapper_ret(
+    pf: &super::precompiled::PrecompiledFunc,
+    helper_name: &str,
+) -> WasmType {
+    match pf.results {
+        [] => WasmType::Void,
+        [vt] => val_type_to_wasm(*vt, helper_name),
+        _ => panic!(
+            "inline helper `{helper_name}` returns multiple values — \
+             splicer wrapper synthesis only supports 0 or 1 results"
+        ),
+    }
+}
+
+fn val_type_to_wasm(vt: wasm_encoder::ValType, helper_name: &str) -> WasmType {
+    match vt {
+        wasm_encoder::ValType::I32 => WasmType::I32,
+        wasm_encoder::ValType::F64 => WasmType::F64,
+        other => panic!(
+            "inline helper `{helper_name}` uses unsupported wrapper type {other:?}"
+        ),
     }
 }
 
@@ -547,7 +655,45 @@ pub fn compile_string_helpers(
         out.push(super::precompiled::build_function(bundle_idx, &plan));
     }
 
+    // Inline-helper exposure wrappers. Order matches the registration order
+    // in `register_string_helpers` Phase 6 — must stay aligned because the
+    // wasm function-index space is positional.
+    for wrapper in &reg.exposed_inline_wrappers {
+        out.push(compile_inline_wrapper(ctx, wrapper, &plan));
+    }
+
     out
+}
+
+/// Build the body of a synthesized inline-helper wrapper: load each param,
+/// splice the inline helper's body, return the result. Lives outside any TS
+/// source, so source map / error spans pass `""`.
+fn compile_inline_wrapper(
+    ctx: &ModuleContext,
+    wrapper: &InlineWrapperReg,
+    plan: &super::precompiled::RewritePlan<'_>,
+) -> Function {
+    use super::func::FuncContext;
+    use wasm_encoder::Instruction;
+
+    let pf = super::precompiled::find_inline(wrapper.name).unwrap_or_else(|| {
+        panic!(
+            "inline helper `{}` registered as wrapper but not found in PRECOMPILED_FUNCS",
+            wrapper.name
+        )
+    });
+    let mut fctx = FuncContext::new(ctx, &wrapper.params, wrapper.ret, "");
+    for i in 0..wrapper.params.len() as u32 {
+        fctx.push(Instruction::LocalGet(i));
+    }
+    super::splice::splice_inline_call(&mut fctx, pf, plan).unwrap_or_else(|e| {
+        panic!(
+            "splice failed for inline-helper wrapper `{}`: {e:?}",
+            wrapper.name
+        )
+    });
+    let (func, _source_map) = fctx.finish();
+    func
 }
 
 /// Pre-codegen AST scan that returns the set of string runtime helpers the program
