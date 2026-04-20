@@ -143,8 +143,17 @@ impl<'a> FuncContext<'a> {
                 self.emit_array_splice(&member.object, elem_ty, call)?;
                 Ok(Some(WasmType::I32))
             }
+            "shift" => {
+                self.expect_args(call, 0, "Array.shift")?;
+                self.emit_array_shift(&member.object, elem_ty)?;
+                Ok(Some(elem_ty))
+            }
+            "unshift" => {
+                self.emit_array_unshift(&member.object, elem_ty, call)?;
+                Ok(Some(WasmType::I32))
+            }
             _ => Err(CompileError::codegen(format!(
-                "Array has no method '{method_name}' — supported: push, pop, indexOf, lastIndexOf, includes, reverse, at, fill, slice, concat, join, splice, filter, map, forEach, reduce, sort, find, findIndex, findLast, findLastIndex, some, every"
+                "Array has no method '{method_name}' — supported: push, pop, shift, unshift, indexOf, lastIndexOf, includes, reverse, at, fill, slice, concat, join, splice, filter, map, forEach, reduce, reduceRight, sort, find, findIndex, findLast, findLastIndex, some, every"
             ))),
         }
     }
@@ -444,6 +453,299 @@ impl<'a> FuncContext<'a> {
         }
 
         self.push(Instruction::End);
+        Ok(())
+    }
+
+    /// Emit `arr.shift()` — returns arr[0] and shifts the tail down by one
+    /// via a single `memory.copy` (the WASM spec handles overlap). Empty
+    /// array returns the zero default, mirroring `pop`.
+    pub(crate) fn emit_array_shift(
+        &mut self,
+        arr_expr: &Expression<'a>,
+        elem_ty: WasmType,
+    ) -> Result<(), CompileError> {
+        let esize: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => return Err(CompileError::type_err("invalid array element type")),
+        };
+
+        let arr_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(arr_expr)?;
+        self.push(Instruction::LocalSet(arr_local));
+
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+
+        // if len == 0 → return default
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Eqz);
+        let bt = match elem_ty {
+            WasmType::F64 => wasm_encoder::BlockType::Result(ValType::F64),
+            _ => wasm_encoder::BlockType::Result(ValType::I32),
+        };
+        self.push(Instruction::If(bt));
+        match elem_ty {
+            WasmType::F64 => self.push(Instruction::F64Const(0.0)),
+            _ => self.push(Instruction::I32Const(0)),
+        }
+        self.push(Instruction::Else);
+
+        // result = arr[0]
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        match elem_ty {
+            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 3,
+                memory_index: 0,
+            })),
+            _ => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            })),
+        }
+        let result_local = self.alloc_local(elem_ty);
+        self.push(Instruction::LocalSet(result_local));
+
+        // memory.copy(dst=arr+HEADER, src=arr+HEADER+esize, n=(len-1)*esize)
+        // Overlap is handled by the WASM spec.
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32 + esize));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // arr.length = len - 1
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(result_local));
+        self.push(Instruction::End); // end of if/else
+        Ok(())
+    }
+
+    /// Emit `arr.unshift(a, b, …)` — insert args at the front and return the
+    /// new length. Mirrors `splice`'s grow/in-place fork: when new_len exceeds
+    /// capacity we copy-and-abandon (writing the new pointer back to the
+    /// source identifier), otherwise we memcpy the existing tail up by
+    /// insert_count and store the items. Items are pre-evaluated into locals
+    /// so any side-effects happen before mutation, matching JS spec order.
+    pub(crate) fn emit_array_unshift(
+        &mut self,
+        arr_expr: &Expression<'a>,
+        elem_ty: WasmType,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        let esize: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => return Err(CompileError::type_err("invalid array element type")),
+        };
+        let insert_count: i32 = call.arguments.len() as i32;
+
+        // Pre-evaluate insert items into locals (left-to-right per JS spec).
+        let mut item_locals: Vec<u32> = Vec::with_capacity(insert_count as usize);
+        for arg in &call.arguments {
+            let ty = self.emit_expr(arg.to_expression())?;
+            if ty != elem_ty {
+                if elem_ty == WasmType::F64 && ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                } else {
+                    return Err(CompileError::type_err(format!(
+                        "Array.unshift item has type {ty:?}, expected {elem_ty:?}"
+                    )));
+                }
+            }
+            let local = self.alloc_local(elem_ty);
+            self.push(Instruction::LocalSet(local));
+            item_locals.push(local);
+        }
+
+        let arr_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(arr_expr)?;
+        self.push(Instruction::LocalSet(arr_local));
+
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+        let cap_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(cap_local));
+
+        // new_len = len + insert_count
+        let new_len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(insert_count));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(new_len_local));
+
+        // if new_len > cap: copy-and-abandon reallocation, else: in-place shift.
+        self.push(Instruction::LocalGet(new_len_local));
+        self.push(Instruction::LocalGet(cap_local));
+        self.push(Instruction::I32GtU);
+        self.push(Instruction::If(wasm_encoder::BlockType::Empty));
+        {
+            // Allocate new buffer sized to new_len.
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::I32Add);
+            let new_ptr = self.emit_arena_alloc_to_local(true)?;
+
+            // new_ptr[0] = new_len, new_ptr[4] = new_len (capacity snaps tight)
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 4,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            // Copy existing tail: dst = new+HEADER+insert_count*esize,
+            // src = arr+HEADER, n = len*esize.
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32 + insert_count * esize));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(arr_local));
+            self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalGet(len_local));
+            self.push(Instruction::I32Const(esize));
+            self.push(Instruction::I32Mul);
+            self.push(Instruction::MemoryCopy {
+                src_mem: 0,
+                dst_mem: 0,
+            });
+
+            // Store inserted items at new+HEADER+i*esize.
+            for (i, &item_local) in item_locals.iter().enumerate() {
+                let item_offset = ARRAY_HEADER_SIZE as u64 + (i as u64) * (esize as u64);
+                self.push(Instruction::LocalGet(new_ptr));
+                self.push(Instruction::LocalGet(item_local));
+                match elem_ty {
+                    WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                        offset: item_offset,
+                        align: 3,
+                        memory_index: 0,
+                    })),
+                    _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: item_offset,
+                        align: 2,
+                        memory_index: 0,
+                    })),
+                }
+            }
+
+            // arr_local := new_ptr, and write back to the source variable if simple identifier.
+            self.push(Instruction::LocalGet(new_ptr));
+            self.push(Instruction::LocalSet(arr_local));
+            if let Expression::Identifier(ident) = arr_expr {
+                let name = ident.name.as_str();
+                if let Some(&(idx, _ty)) = self.locals.get(name) {
+                    self.push(Instruction::LocalGet(new_ptr));
+                    self.push(Instruction::LocalSet(idx));
+                }
+            }
+        }
+        self.push(Instruction::Else);
+        {
+            // In-place: memory.copy shifts the tail up by insert_count elements.
+            // Overlap is handled by the WASM spec (per-byte copy).
+            if insert_count > 0 {
+                // dst = arr+HEADER+insert_count*esize
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32 + insert_count * esize));
+                self.push(Instruction::I32Add);
+                // src = arr+HEADER
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+                self.push(Instruction::I32Add);
+                // n = len * esize
+                self.push(Instruction::LocalGet(len_local));
+                self.push(Instruction::I32Const(esize));
+                self.push(Instruction::I32Mul);
+                self.push(Instruction::MemoryCopy {
+                    src_mem: 0,
+                    dst_mem: 0,
+                });
+            }
+
+            // Store items at arr+HEADER+i*esize.
+            for (i, &item_local) in item_locals.iter().enumerate() {
+                let item_offset = ARRAY_HEADER_SIZE as u64 + (i as u64) * (esize as u64);
+                self.push(Instruction::LocalGet(arr_local));
+                self.push(Instruction::LocalGet(item_local));
+                match elem_ty {
+                    WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                        offset: item_offset,
+                        align: 3,
+                        memory_index: 0,
+                    })),
+                    _ => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                        offset: item_offset,
+                        align: 2,
+                        memory_index: 0,
+                    })),
+                }
+            }
+
+            // arr[0] = new_len
+            self.push(Instruction::LocalGet(arr_local));
+            self.push(Instruction::LocalGet(new_len_local));
+            self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+        }
+        self.push(Instruction::End);
+
+        // Result value: the new length.
+        self.push(Instruction::LocalGet(new_len_local));
         Ok(())
     }
 
@@ -1738,6 +2040,212 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
+    /// `Array.of<T>(...items)` — construct a new array containing the argument
+    /// list in order. Element type is taken from the explicit `<T>` when given,
+    /// otherwise inferred from the first argument (same rule as an array
+    /// literal). The empty `Array.of()` without `<T>` is a type error.
+    pub(crate) fn emit_array_of(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        // Resolve element type: explicit <T> wins, else infer from arg 0.
+        let elem_ty = if let Some(type_args) = call.type_arguments.as_ref()
+            && let Some(first) = type_args.params.first()
+        {
+            crate::types::resolve_ts_type(first, &self.module_ctx.class_names)?
+        } else if let Some(first) = call.arguments.first() {
+            let (ty, _) = self.infer_init_type(first.to_expression())?;
+            ty
+        } else {
+            return Err(CompileError::type_err(
+                "Array.of() requires at least one argument or an explicit type: Array.of<T>()",
+            ));
+        };
+        let esize: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => {
+                return Err(CompileError::type_err(
+                    "Array.of element type must be i32 or f64",
+                ));
+            }
+        };
+
+        let count = call.arguments.len() as i32;
+        let total = ARRAY_HEADER_SIZE as i32 + count * esize;
+        self.push(Instruction::I32Const(total));
+        let ptr_local = self.emit_arena_alloc_to_local(true)?;
+
+        // length = count
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(count));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        // capacity = count
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(count));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        for (i, arg) in call.arguments.iter().enumerate() {
+            self.push(Instruction::LocalGet(ptr_local));
+            let ty = self.emit_expr(arg.to_expression())?;
+            if ty != elem_ty {
+                if elem_ty == WasmType::F64 && ty == WasmType::I32 {
+                    self.push(Instruction::F64ConvertI32S);
+                } else {
+                    return Err(CompileError::type_err(format!(
+                        "Array.of argument {i} has type {ty:?}, expected {elem_ty:?}"
+                    )));
+                }
+            }
+            let offset = (ARRAY_HEADER_SIZE as i32 + (i as i32) * esize) as u64;
+            match elem_ty {
+                WasmType::F64 => self.push(Instruction::F64Store(wasm_encoder::MemArg {
+                    offset,
+                    align: 3,
+                    memory_index: 0,
+                })),
+                WasmType::I32 => self.push(Instruction::I32Store(wasm_encoder::MemArg {
+                    offset,
+                    align: 2,
+                    memory_index: 0,
+                })),
+                _ => unreachable!(),
+            }
+        }
+
+        self.push(Instruction::LocalGet(ptr_local));
+        Ok(())
+    }
+
+    /// `Array.from(src)` — shallow clone of an existing array (same shape as
+    /// `src.slice()`). `Array.from(src, mapFn)` — same shape as `src.map(fn)`.
+    /// The `{length: n}` form is not supported (the typed subset has no
+    /// arbitrary object literals); callers wanting sequence generation can
+    /// write `new Array<T>(n).fill(0).map((_, i) => …)` instead.
+    pub(crate) fn emit_array_from(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        if call.arguments.is_empty() || call.arguments.len() > 2 {
+            return Err(CompileError::codegen(
+                "Array.from expects 1 or 2 arguments: Array.from(src) or Array.from(src, mapFn)",
+            ));
+        }
+        let src_expr = call.arguments[0].to_expression();
+        let src_elem = self.resolve_expr_array_elem(src_expr).ok_or_else(|| {
+            CompileError::type_err(
+                "Array.from source must be an array — the {length: n} form is not supported in the typed subset",
+            )
+        })?;
+        let src_class = self.resolve_expr_array_elem_class(src_expr);
+
+        if call.arguments.len() == 1 {
+            self.emit_array_from_copy(src_expr, src_elem)
+        } else {
+            let map_fn = call.arguments[1].to_expression();
+            self.emit_array_from_map(src_expr, src_elem, src_class.as_deref(), map_fn)
+        }
+    }
+
+    /// Shallow clone of `src` via a single memory.copy of header + elements.
+    fn emit_array_from_copy(
+        &mut self,
+        src_expr: &Expression<'a>,
+        elem_ty: WasmType,
+    ) -> Result<(), CompileError> {
+        let esize: i32 = match elem_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => return Err(CompileError::type_err("invalid array element type")),
+        };
+        let arena_idx = self
+            .module_ctx
+            .arena_ptr_global
+            .ok_or_else(|| CompileError::codegen("arena not initialized"))?;
+
+        let src_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(src_expr)?;
+        self.push(Instruction::LocalSet(src_local));
+
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(src_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+
+        // Allocate header + len * esize; capacity = len.
+        let new_ptr = self.alloc_local(WasmType::I32);
+        self.push(Instruction::GlobalGet(arena_idx));
+        self.push(Instruction::LocalSet(new_ptr));
+        self.push(Instruction::GlobalGet(arena_idx));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        self.push(Instruction::I32Add);
+        self.push(Instruction::GlobalSet(arena_idx));
+
+        // Write header: length=len, capacity=len.
+        self.push(Instruction::LocalGet(new_ptr));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(new_ptr));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // memory.copy(dst=new_ptr+HEADER, src=src_ptr+HEADER, n=len*esize)
+        self.push(Instruction::LocalGet(new_ptr));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(src_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        self.push(Instruction::LocalGet(new_ptr));
+        Ok(())
+    }
+
+    /// `Array.from(src, mapFn)` form — same shape as `src.map(mapFn)`, so we
+    /// just delegate. The dispatcher already validated `src` is an array and
+    /// resolved the element type.
+    fn emit_array_from_map(
+        &mut self,
+        src_expr: &Expression<'a>,
+        elem_ty: WasmType,
+        elem_class: Option<&str>,
+        map_fn: &Expression<'a>,
+    ) -> Result<(), CompileError> {
+        self.emit_array_map(src_expr, elem_ty, elem_class, map_fn)?;
+        Ok(())
+    }
+
     pub(crate) fn emit_array_bounds_check(&mut self, arr_local: u32, idx_local: u32) {
         // if (index >= length) unreachable
         self.push(Instruction::LocalGet(idx_local));
@@ -1763,6 +2271,12 @@ impl<'a> FuncContext<'a> {
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     let method = member.property.name.as_str();
+                    // Static Array.of<T>(…) / Array.from(src[, mapFn]).
+                    if let Expression::Identifier(obj) = &member.object
+                        && obj.name.as_str() == "Array"
+                    {
+                        return self.resolve_array_static_call_elem(call, method);
+                    }
                     match method {
                         "filter" | "sort" | "splice" | "slice" | "concat" => {
                             self.resolve_expr_array_elem(&member.object)
@@ -1807,6 +2321,56 @@ impl<'a> FuncContext<'a> {
         }
     }
 
+    /// Element type resolution for `Array.of<T>(...)` / `Array.from(src[, mapFn])`.
+    /// Mirrors the rules used during emission so chained calls (e.g.
+    /// `Array.from(xs).filter(...)`) can carry element-type tracking through
+    /// the same call-expression dispatch path.
+    fn resolve_array_static_call_elem(
+        &self,
+        call: &CallExpression<'a>,
+        method: &str,
+    ) -> Option<WasmType> {
+        match method {
+            "of" => {
+                if let Some(type_args) = call.type_arguments.as_ref()
+                    && let Some(first) = type_args.params.first()
+                {
+                    return crate::types::resolve_ts_type(first, &self.module_ctx.class_names)
+                        .ok();
+                }
+                if let Some(first) = call.arguments.first() {
+                    return self.infer_init_type(first.to_expression()).ok().map(|t| t.0);
+                }
+                None
+            }
+            "from" => {
+                let src_expr = call.arguments.first()?.to_expression();
+                let src_elem = self.resolve_expr_array_elem(src_expr)?;
+                // Form 1 (src only): element type preserved.
+                // Form 2 (src, mapFn): inferred from the mapFn return type.
+                if call.arguments.len() < 2 {
+                    return Some(src_elem);
+                }
+                let src_class = self.resolve_expr_array_elem_class(src_expr);
+                let arrow = self.try_extract_arrow_expr(call.arguments[1].to_expression())?;
+                let params = arrow
+                    .params
+                    .items
+                    .iter()
+                    .filter_map(|p| match &p.pattern {
+                        BindingPattern::BindingIdentifier(id) => {
+                            Some(id.name.as_str().to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                self.infer_arrow_result_type(arrow, &params, src_elem, src_class.as_deref())
+                    .ok()
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve the array element class name for an expression (if elements are class instances).
     pub fn resolve_expr_array_elem_class(&self, expr: &Expression<'a>) -> Option<String> {
         match expr {
@@ -1814,10 +2378,20 @@ impl<'a> FuncContext<'a> {
                 .local_array_elem_classes
                 .get(ident.name.as_str())
                 .cloned(),
-            // Chained calls: filter/sort/splice/slice/concat preserve element class
+            // Chained calls: filter/sort/splice/slice/concat preserve element class.
+            // `Array.from(src)` also preserves it (shallow clone).
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     let method = member.property.name.as_str();
+                    if let Expression::Identifier(obj) = &member.object
+                        && obj.name.as_str() == "Array"
+                        && method == "from"
+                        && call.arguments.len() == 1
+                    {
+                        return self.resolve_expr_array_elem_class(
+                            call.arguments[0].to_expression(),
+                        );
+                    }
                     match method {
                         "filter" | "sort" | "splice" | "slice" | "concat" => {
                             self.resolve_expr_array_elem_class(&member.object)

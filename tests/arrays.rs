@@ -2052,3 +2052,181 @@ fn array_literal_empty_without_annotation_errors() {
     );
 }
 
+#[test]
+fn array_of_basic_and_explicit_type() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            // Inferred i32 element type from first arg.
+            const xs = Array.of(10, 20, 30);
+            sink(xs.length as f64);
+            sink(xs[0] as f64);
+            sink(xs[2] as f64);
+
+            // Explicit <f64> widens integer literals.
+            const ys = Array.of<f64>(1, 2, 3);
+            sink(ys.length as f64);
+            sink(ys[0]);
+            sink(ys[2]);
+
+            // Empty with explicit type.
+            const zs = Array.of<i32>();
+            sink(zs.length as f64);
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![3.0, 10.0, 30.0, 3.0, 1.0, 3.0, 0.0]
+    );
+}
+
+#[test]
+fn array_of_empty_without_type_errors() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const xs = Array.of();
+            return xs.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Array.of"),
+        "expected Array.of error, got: {msg}"
+    );
+}
+
+#[test]
+fn array_from_shallow_clone_and_map() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const src: Array<i32> = [1, 2, 3, 4];
+
+            // Form 1: shallow clone. Mutating the clone must not touch src.
+            const clone = Array.from(src);
+            clone.push(99);
+            sink(src.length as f64);   // 4
+            sink(clone.length as f64); // 5
+            sink(clone[4] as f64);     // 99
+
+            // Form 2: map. Keep element type i32 (arithmetic preserves type).
+            const doubled = Array.from(src, (x, i) => x * 2 + i);
+            sink(doubled.length as f64); // 4
+            sink(doubled[0] as f64);     // 2  = 1*2 + 0
+            sink(doubled[3] as f64);     // 11 = 4*2 + 3
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![4.0, 5.0, 99.0, 4.0, 2.0, 11.0]);
+}
+
+#[test]
+fn array_from_rejects_non_array_source() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const n: i32 = 5;
+            const xs = Array.from(n);
+            return xs.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Array.from") || msg.contains("array"),
+        "expected Array.from source error, got: {msg}"
+    );
+}
+
+#[test]
+fn array_shift_basic() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const a: Array<i32> = new Array<i32>(8);
+            a.push(10); a.push(20); a.push(30);
+            sink(a.shift() as f64);  // 10
+            sink(a.length as f64);   // 2
+            sink(a[0] as f64);       // 20
+            sink(a[1] as f64);       // 30
+            sink(a.shift() as f64);  // 20
+            sink(a.shift() as f64);  // 30
+            sink(a.length as f64);   // 0
+            // shift on empty returns 0 (like pop)
+            sink(a.shift() as f64);  // 0
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![10.0, 2.0, 20.0, 30.0, 20.0, 30.0, 0.0, 0.0]);
+}
+
+#[test]
+fn array_unshift_in_place_and_growth() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            // In-place path: capacity = 8, plenty of room.
+            const a: Array<i32> = new Array<i32>(8);
+            a.push(3); a.push(4); a.push(5);
+            const len1: i32 = a.unshift(1, 2); // insert two at front
+            sink(len1 as f64);   // 5
+            sink(a[0] as f64);   // 1
+            sink(a[1] as f64);   // 2
+            sink(a[2] as f64);   // 3
+            sink(a[4] as f64);   // 5
+
+            // Growth path: capacity tight, forces copy-and-abandon.
+            let b: Array<i32> = [10, 20, 30]; // cap = 3
+            const len2: i32 = b.unshift(7, 8, 9);
+            sink(len2 as f64);   // 6
+            sink(b.length as f64); // 6
+            sink(b[0] as f64);   // 7
+            sink(b[2] as f64);   // 9
+            sink(b[5] as f64);   // 30
+
+            // Zero-arg unshift is a no-op that returns the current length.
+            const len3: i32 = b.unshift();
+            sink(len3 as f64);   // 6
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![5.0, 1.0, 2.0, 3.0, 5.0, 6.0, 6.0, 7.0, 9.0, 30.0, 6.0]
+    );
+}
+
+#[test]
+fn array_reduce_right() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [1, 2, 3, 4];
+
+            // Build a right-to-left concatenation index string so we can
+            // tell reduce from reduceRight. Use numeric accumulator:
+            // ((((0*10 + 4)*10 + 3)*10 + 2)*10 + 1) = 4321
+            const rev: i32 = xs.reduceRight((acc, x) => acc * 10 + x, 0);
+            sink(rev as f64); // 4321
+
+            // Classic sum — same value from either direction.
+            const sum: i32 = xs.reduceRight((acc, x) => acc + x, 0);
+            sink(sum as f64); // 10
+
+            // Empty array yields the initial value.
+            const empty: Array<i32> = new Array<i32>(0);
+            sink(empty.reduceRight((acc, x) => acc + x, 42) as f64);
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![4321.0, 10.0, 42.0]);
+}
+

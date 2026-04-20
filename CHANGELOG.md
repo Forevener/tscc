@@ -6,6 +6,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ## [Unreleased]
 
+### Added
+
+- `Array.of(...items)` — construct an array from its argument list. Element type comes from an explicit `<T>` when given, otherwise inferred from the first argument (same rule as an array literal).
+- `Array.from(src)` / `Array.from(src, mapFn)` — shallow clone or mapped copy of an existing array. The `{length: n}` form is not supported in the typed subset; use `new Array<T>(n).fill(0).map((_, i) => …)` for sequence generation.
+- `Array.prototype.shift()` — remove and return the first element; shifts the tail down via a single `memory.copy`. Empty arrays return `0` / `0.0` (matching `pop`).
+- `Array.prototype.unshift(...items)` — insert items at the front and return the new length. Reuses `splice`'s grow/in-place fork: in-place when there's spare capacity, copy-and-abandon otherwise (writing the new pointer back to the source identifier).
+- `Array.prototype.reduceRight(callback, initialValue)` — mirror of `reduce`, iterating from the last element down to the first.
+
 ## [0.0.1] — unreleased
 
 Initial public release. Typed static subset of TypeScript, compiled AOT to deterministic WebAssembly with arena allocation. Pre-0.1: further built-in coverage is expected before 0.1.0.

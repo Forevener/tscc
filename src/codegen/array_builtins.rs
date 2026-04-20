@@ -412,18 +412,20 @@ impl<'a> FuncContext<'a> {
                 )?;
                 Ok(Some(WasmType::Void))
             }
-            "reduce" => {
+            "reduce" | "reduceRight" => {
                 if call.arguments.len() != 2 {
-                    return Err(CompileError::codegen(
-                        "Array.reduce() expects 2 arguments (callback, initialValue)",
-                    ));
+                    return Err(CompileError::codegen(format!(
+                        "Array.{method_name}() expects 2 arguments (callback, initialValue)"
+                    )));
                 }
+                let reverse = method_name == "reduceRight";
                 let result = self.emit_array_reduce(
                     &member.object,
                     elem_ty,
                     elem_class.as_deref(),
                     call.arguments[0].to_expression(),
                     call.arguments[1].to_expression(),
+                    reverse,
                 )?;
                 Ok(Some(result))
             }
@@ -767,7 +769,7 @@ impl<'a> FuncContext<'a> {
     }
 
     /// arr.map(e => expr) — returns a new array with transformed elements.
-    fn emit_array_map(
+    pub(crate) fn emit_array_map(
         &mut self,
         arr_expr: &Expression<'a>,
         elem_ty: WasmType,
@@ -943,13 +945,15 @@ impl<'a> FuncContext<'a> {
         elem_class: Option<&str>,
         callback: &Expression<'a>,
         init_expr: &Expression<'a>,
+        reverse: bool,
     ) -> Result<WasmType, CompileError> {
         let arrow = extract_arrow(callback)?;
         let params = extract_arrow_params(arrow)?;
         if params.len() != 2 {
-            return Err(CompileError::codegen(
-                "reduce callback must have exactly 2 parameters (acc, elem)",
-            ));
+            let name = if reverse { "reduceRight" } else { "reduce" };
+            return Err(CompileError::codegen(format!(
+                "{name} callback must have exactly 2 parameters (acc, elem)"
+            )));
         }
         let esize = elem_size(elem_ty)?;
 
@@ -969,16 +973,29 @@ impl<'a> FuncContext<'a> {
 
         let elem_local = self.alloc_local(elem_ty);
         let i_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::I32Const(0));
+        // i = reverse ? len - 1 : 0
+        if reverse {
+            self.push(Instruction::LocalGet(src_len));
+            self.push(Instruction::I32Const(1));
+            self.push(Instruction::I32Sub);
+        } else {
+            self.push(Instruction::I32Const(0));
+        }
         self.push(Instruction::LocalSet(i_local));
 
         self.push(Instruction::Block(wasm_encoder::BlockType::Empty));
         self.push(Instruction::Loop(wasm_encoder::BlockType::Empty));
 
-        // if i >= src_len, break
+        // Loop bound: forward i >= len, reverse i < 0. Use signed compare in
+        // reverse so that len==0 (i starts at -1) exits immediately.
         self.push(Instruction::LocalGet(i_local));
-        self.push(Instruction::LocalGet(src_len));
-        self.push(Instruction::I32GeU);
+        if reverse {
+            self.push(Instruction::I32Const(0));
+            self.push(Instruction::I32LtS);
+        } else {
+            self.push(Instruction::LocalGet(src_len));
+            self.push(Instruction::I32GeS);
+        }
         self.push(Instruction::BrIf(1));
 
         // Load element
@@ -997,8 +1014,9 @@ impl<'a> FuncContext<'a> {
         // Evaluate arrow body — result is the new accumulator
         let body_ty = eval_arrow_body(self, arrow)?;
         if body_ty != acc_ty {
+            let name = if reverse { "reduceRight" } else { "reduce" };
             return Err(CompileError::type_err(format!(
-                "reduce callback returns {body_ty:?} but accumulator is {acc_ty:?}"
+                "{name} callback returns {body_ty:?} but accumulator is {acc_ty:?}"
             )));
         }
 
@@ -1008,9 +1026,9 @@ impl<'a> FuncContext<'a> {
         // Update accumulator
         self.push(Instruction::LocalSet(acc_local));
 
-        // i++
+        // i += ±1
         self.push(Instruction::LocalGet(i_local));
-        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Const(if reverse { -1 } else { 1 }));
         self.push(Instruction::I32Add);
         self.push(Instruction::LocalSet(i_local));
         self.push(Instruction::Br(0));

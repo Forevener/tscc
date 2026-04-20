@@ -331,6 +331,14 @@ impl<'a> FuncContext<'a> {
                 self.push(Instruction::I32Const(if is_arr { 1 } else { 0 }));
                 Ok(Some(WasmType::I32))
             }
+            "of" => {
+                self.emit_array_of(call)?;
+                Ok(Some(WasmType::I32))
+            }
+            "from" => {
+                self.emit_array_from(call)?;
+                Ok(Some(WasmType::I32))
+            }
             _ => Err(CompileError::unsupported(format!(
                 "Array.{method_name} is not supported"
             ))),

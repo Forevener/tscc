@@ -289,6 +289,14 @@ impl<'a> FuncContext<'a> {
                 {
                     return Ok((WasmType::F64, None));
                 }
+                // Array.of / Array.from / Array.isArray — all return i32 (the
+                // array methods yield array pointers, isArray is a bool).
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && let Expression::Identifier(ident) = &member.object
+                    && ident.name.as_str() == "Array"
+                {
+                    return Ok((WasmType::I32, None));
+                }
                 Err(CompileError::type_err(
                     "cannot infer type from this expression — add a type annotation",
                 ))

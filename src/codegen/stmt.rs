@@ -168,6 +168,20 @@ impl<'a> FuncContext<'a> {
                     }
                 }
             }
+            // Infer array element type from an array-returning call expression
+            // (Array.of, Array.from, .slice/.filter/.map/...). The
+            // `resolve_expr_array_elem` path already knows the rules — if it
+            // can see an element type through the call, propagate it to the
+            // new variable.
+            if matches!(init, Expression::CallExpression(_))
+                && let Some(elem_ty) = self.resolve_expr_array_elem(init)
+            {
+                self.local_array_elem_types.insert(name.clone(), elem_ty);
+                if let Some(class_name) = self.resolve_expr_array_elem_class(init) {
+                    self.local_array_elem_classes
+                        .insert(name.clone(), class_name);
+                }
+            }
             let (inferred_ty, inferred_class) = self
                 .infer_init_type(init)
                 .map_err(|e| self.locate(e, decl.span.start))?;
