@@ -110,7 +110,22 @@ impl<'a> FuncContext<'a> {
         self.emit_expr(&member.object)?; // address
 
         if operator == AssignmentOperator::Assign {
-            self.emit_expr(value)?;
+            let expected = layout.field_class_types.get(field_name).cloned();
+            match value {
+                Expression::ObjectExpression(obj) => {
+                    self.emit_object_literal(obj, expected.as_deref())?;
+                }
+                Expression::ArrayExpression(arr)
+                    if expected
+                        .as_deref()
+                        .is_some_and(|e| self.is_tuple_shape(e)) =>
+                {
+                    self.emit_tuple_literal(arr, expected.as_deref().unwrap())?;
+                }
+                _ => {
+                    self.emit_expr(value)?;
+                }
+            }
         } else {
             // For compound assignment (+=, etc): load current, compute, then store
             // We need the address twice — use a temp local
@@ -190,6 +205,13 @@ impl<'a> FuncContext<'a> {
             return self.emit_string_index(member);
         }
 
+        // Tuple indexed access: `t[N]` with a literal N → load field `_N`.
+        // Non-literal indices on tuples are rejected — slots have per-position
+        // types, so a dynamic index can't be checked at compile time.
+        if let Some(ty) = self.try_emit_tuple_index(member)? {
+            return Ok(ty);
+        }
+
         let elem_ty = self
             .resolve_expr_array_elem(&member.object)
             .ok_or_else(|| {
@@ -245,6 +267,71 @@ impl<'a> FuncContext<'a> {
 
         Ok(elem_ty)
     }
+    /// If `t[N]` is a tuple access, emit it as a field load on `_N` and
+    /// return the slot type. Returns `Ok(None)` when the receiver is not a
+    /// tuple shape (so the caller can fall through to the array path).
+    /// Returns a clear error when the receiver is a tuple but the index is
+    /// non-literal or out of bounds.
+    fn try_emit_tuple_index(
+        &mut self,
+        member: &ComputedMemberExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
+        let Ok(class_name) = self.resolve_expr_class(&member.object) else {
+            return Ok(None);
+        };
+        let shape_idx = match self.module_ctx.shape_registry.by_name.get(&class_name) {
+            Some(&i) => i,
+            None => return Ok(None),
+        };
+        if !self.module_ctx.shape_registry.shapes[shape_idx].is_tuple {
+            return Ok(None);
+        }
+        let arity = self.module_ctx.shape_registry.shapes[shape_idx].fields.len();
+        let index = match tuple_literal_index(&member.expression) {
+            Some(n) => n,
+            None => {
+                return Err(self.locate(
+                    CompileError::type_err(format!(
+                        "tuple `{class_name}` requires a literal numeric index; dynamic `t[i]` is \
+                         not supported — use `Array<T>` if slots share a type"
+                    )),
+                    member.span.start,
+                ));
+            }
+        };
+        if index >= arity {
+            return Err(self.locate(
+                CompileError::type_err(format!(
+                    "tuple index {index} out of bounds for `{class_name}` (arity {arity})"
+                )),
+                member.span.start,
+            ));
+        }
+        let layout = self
+            .module_ctx
+            .class_registry
+            .get(&class_name)
+            .ok_or_else(|| CompileError::codegen(format!("tuple '{class_name}' not registered")))?
+            .clone();
+        let (_, offset, slot_ty) = layout.fields[index].clone();
+
+        self.emit_expr(&member.object)?;
+        match slot_ty {
+            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 3,
+                memory_index: 0,
+            })),
+            WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: offset as u64,
+                align: 2,
+                memory_index: 0,
+            })),
+            _ => return Err(CompileError::codegen("void tuple slot")),
+        }
+        Ok(Some(slot_ty))
+    }
+
     pub(crate) fn emit_computed_member_assign(
         &mut self,
         member: &ComputedMemberExpression<'a>,
@@ -601,5 +688,24 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End);
 
         Ok(field_ty)
+    }
+}
+
+/// Extract a non-negative integer literal from a tuple-index expression.
+/// Returns `None` for anything dynamic — the caller turns that into a clear
+/// "tuple requires literal index" error.
+fn tuple_literal_index(expr: &Expression<'_>) -> Option<usize> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => tuple_literal_index(&p.expression),
+        Expression::NumericLiteral(lit) => {
+            let v = lit.value;
+            if v.fract() != 0.0 || v < 0.0 {
+                return None;
+            }
+            // `v.fract() == 0.0` guarantees `v` fits cleanly in usize for any
+            // plausible arity; upper bound enforced by the arity check.
+            Some(v as usize)
+        }
+        _ => None,
     }
 }

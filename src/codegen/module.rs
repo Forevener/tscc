@@ -95,12 +95,31 @@ pub struct ModuleContext {
     /// in Pass 0a-iii. Dispatchers in `expr/map.rs` and `emit_new` read this
     /// to route per-monomorphization codegen.
     pub map_info: HashMap<String, super::map_builtins::MapInfo>,
+    /// Mangled Set<T> name -> (elem_ty, bucket layout). Populated alongside
+    /// `map_info` in Pass 0a-iii. Dispatchers in `expr/set.rs` and `emit_new`
+    /// read this to route per-monomorphization codegen.
+    pub set_info: HashMap<String, super::set_builtins::SetInfo>,
+    /// Structural object types discovered in Pass 0a-iv. Each entry describes
+    /// a named (`type`/`interface`) or anonymous (inline `TSTypeLiteral` /
+    /// `ObjectExpression`) shape, deduped by its sort-by-name fingerprint.
+    /// Phase A.2 consumes this to register synthetic class layouts.
+    pub shape_registry: super::shapes::ShapeRegistry,
     /// Output of `register_string_helpers`, stashed here so that method-body
     /// codegen can build a `RewritePlan` to feed the L_splice splicer.
     /// `None` until that pass has run; never observed `None` from method code
     /// (helper registration runs in Pass 2, before Pass 3 codegen).
     pub helper_registration:
         RefCell<Option<super::string_builtins::HelperRegistration>>,
+    /// For each free / monomorphized function, the class name of each
+    /// parameter (None for non-class params). Lets `emit_call` thread an
+    /// expected-type hint into `ObjectExpression` arguments so a `{...}` at a
+    /// callsite resolves against the declared shape parameter.
+    pub fn_param_classes: HashMap<String, Vec<Option<String>>>,
+    /// For each free / monomorphized function, the class name of the return
+    /// type (None for non-class returns). Consumed during body codegen to
+    /// populate `FuncContext::return_class` so `return {...};` can thread the
+    /// expected shape.
+    pub fn_return_classes: HashMap<String, String>,
 }
 
 /// A lifted closure function to be added to the WASM module's function table.
@@ -159,7 +178,11 @@ impl ModuleContext {
             fn_bindings: HashMap::new(),
             inferred_fn_calls: HashMap::new(),
             map_info: HashMap::new(),
+            set_info: HashMap::new(),
+            shape_registry: super::shapes::ShapeRegistry::default(),
             helper_registration: RefCell::new(None),
+            fn_param_classes: HashMap::new(),
+            fn_return_classes: HashMap::new(),
         }
     }
 
@@ -412,16 +435,27 @@ pub fn compile_module<'a>(
     // function bodies, top-level declarations/expressions — for any
     // TSTypeReference / NewExpression / CallExpression whose base identifier is
     // a generic template. Nested generics (Array<Box<i32>>) are expanded.
+    //
+    // Pre-seed named shape names into a *temporary* combined set for this
+    // walker only: `Map<string, Unit>` / `Array<Pos>` etc. need the shape
+    // name to resolve during generic walking even though shape registration
+    // itself happens later (Pass 0a-iv/v). Kept out of `ctx.class_names` so
+    // shape discovery's collision check doesn't mistake shapes for classes.
+    let mut generic_lookup_names = ctx.class_names.clone();
+    for name in super::shapes::prescan_shape_names(program) {
+        generic_lookup_names.insert(name);
+    }
     let super::generics::CollectResult {
         class_insts,
         fn_insts,
         inferred_call_sites,
         map_insts,
+        set_insts,
     } = super::generics::collect_instantiations(
         program,
         &class_templates,
         &fn_templates,
-        &ctx.class_names,
+        &generic_lookup_names,
     )?;
     ctx.inferred_fn_calls = inferred_call_sites;
 
@@ -473,6 +507,68 @@ pub fn compile_module<'a>(
             },
         );
     }
+    for inst in &set_insts {
+        ctx.class_names.insert(inst.mangled_name.clone());
+        super::set_builtins::register_set_layout(
+            &mut ctx.class_registry,
+            &inst.mangled_name,
+        )?;
+        let bucket = super::set_builtins::SetBucketLayout::compute(&inst.elem_ty);
+        ctx.set_info.insert(
+            inst.mangled_name.clone(),
+            super::set_builtins::SetInfo {
+                elem_ty: inst.elem_ty.clone(),
+                bucket,
+            },
+        );
+    }
+
+    // Pass 0a-iv: discover structural object shapes (`type`, `interface`,
+    // inline `{x: number}` annotations, and `ObjectExpression` literals).
+    // Shape registration as synthetic classes is Phase A.2 — this pass just
+    // populates the registry so later phases have a stable inventory. See
+    // `docs/plan-object-literals-tuples.md` Phase A.1.
+    ctx.shape_registry = super::shapes::discover_shapes(
+        program,
+        &ctx.class_names,
+        &class_templates,
+        &fn_templates,
+    )?;
+
+    // Pass 0a-v: register each discovered shape as a synthetic ClassLayout.
+    // Iteration follows shape-discovery order, so a nested shape that another
+    // shape's field references is already in `ctx.class_names` by the time the
+    // outer shape registers — no second pass needed.
+    let shape_count = ctx.shape_registry.shapes.len();
+    for i in 0..shape_count {
+        let (shape_name, shape_fields) = {
+            let s = &ctx.shape_registry.shapes[i];
+            (s.name.clone(), s.fields.clone())
+        };
+        ctx.class_names.insert(shape_name.clone());
+        let resolved: Vec<super::classes::LayoutField> = shape_fields
+            .iter()
+            .map(|f| super::classes::LayoutField {
+                name: f.name.clone(),
+                wasm_ty: f.ty.wasm_ty(),
+                class_ref: match &f.ty {
+                    crate::types::BoundType::Class(cn) => Some(cn.clone()),
+                    _ => None,
+                },
+                is_string: matches!(f.ty, crate::types::BoundType::Str),
+            })
+            .collect();
+        ctx.class_registry
+            .register_synthetic_layout(&shape_name, &resolved)?;
+    }
+    // Two distinct user names declaring the same shape (e.g.
+    // `interface Pair {...}` and `type PairAlias = {...}`) collapse to a
+    // single registry entry, but each name is recorded in `by_name` as an
+    // alias. Surface every alias in `class_names` so `let p: PairAlias = ...`
+    // resolves the same as `let p: Pair = ...`.
+    for alias in ctx.shape_registry.by_name.keys() {
+        ctx.class_names.insert(alias.clone());
+    }
 
     // Pass 0b: determine which classes are polymorphic and topological order
     let polymorphic = super::classes::find_polymorphic_classes(&class_info);
@@ -490,10 +586,16 @@ pub fn compile_module<'a>(
                 is_poly,
                 Some(name),
                 Some(&bindings),
+                Some(&ctx.shape_registry),
             )?;
         } else {
-            ctx.class_registry
-                .register_class(class, &ctx.class_names, parent.clone(), is_poly)?;
+            ctx.class_registry.register_class(
+                class,
+                &ctx.class_names,
+                parent.clone(),
+                is_poly,
+                Some(&ctx.shape_registry),
+            )?;
         }
     }
     ctx.class_registry.mark_polymorphic(&polymorphic);
@@ -745,6 +847,11 @@ pub fn compile_module<'a>(
     // collected instantiations so the tree-shaker pulls in only what this
     // program's Maps actually need.
     for name in super::map_builtins::required_runtime_helpers(&map_insts) {
+        used_string_helpers.insert(name);
+    }
+    // Set<T> methods share Map's hash + equality helper dispatch, gated on
+    // the element type. Seed the tree-shaker the same way.
+    for name in super::set_builtins::required_runtime_helpers(&set_insts) {
         used_string_helpers.insert(name);
     }
     if !used_string_helpers.is_empty() {
@@ -1000,6 +1107,26 @@ fn register_func_from_decl(
         if types::is_string_type_with_bindings(ann, bindings) {
             ctx.func_return_strings.insert(name.to_string());
         }
+        // Track class-typed returns so `return {...};` can resolve the shape.
+        if let Some(class_name) =
+            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+            && ctx.class_names.contains(&class_name)
+        {
+            ctx.fn_return_classes.insert(name.to_string(), class_name);
+        }
+    }
+    // Record each parameter's class name (if any) for call-site expected-type
+    // threading of `{...}` arguments.
+    let mut param_classes: Vec<Option<String>> = Vec::with_capacity(func_decl.params.items.len());
+    for param in &func_decl.params.items {
+        let class = param.type_annotation.as_ref().and_then(|ann| {
+            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+                .filter(|cn| ctx.class_names.contains(cn))
+        });
+        param_classes.push(class);
+    }
+    if param_classes.iter().any(|c| c.is_some()) {
+        ctx.fn_param_classes.insert(name.to_string(), param_classes);
     }
     ctx.register_func(name, &params, ret, is_export)?;
     Ok(())
@@ -1257,6 +1384,15 @@ fn codegen_method<'a>(
     // Mark `this` as referencing this class (mangled, for generic monomorphizations)
     func_ctx.this_class = Some(class_name.to_string());
     func_ctx.type_bindings = bindings.cloned();
+    // Thread declared return class so `return {...};` resolves to it.
+    if method.kind != MethodDefinitionKind::Constructor
+        && let Some(ann) = &func.return_type
+        && let Some(rc) =
+            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+        && ctx.class_names.contains(&rc)
+    {
+        func_ctx.return_class = Some(rc);
+    }
 
     // Track class types, array types, closure sigs, and string types for method parameters
     for param in &func.params.items {
@@ -1268,8 +1404,11 @@ fn codegen_method<'a>(
             if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
-            if let Some(param_class) = types::get_class_type_name_with_bindings(ann, bindings)
-                && ctx.class_names.contains(&param_class)
+            if let Some(param_class) = types::get_class_type_name_with_bindings(
+                ann,
+                bindings,
+                Some(&ctx.shape_registry),
+            ) && ctx.class_names.contains(&param_class)
             {
                 func_ctx
                     .local_class_types
@@ -1279,7 +1418,9 @@ fn codegen_method<'a>(
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
-                if let Some(elem_class) = types::get_array_element_class(ann) {
+                if let Some(elem_class) =
+                    types::get_array_element_class(ann, Some(&ctx.shape_registry))
+                {
                     func_ctx
                         .local_array_elem_classes
                         .insert(pname.clone(), elem_class);
@@ -1414,6 +1555,14 @@ fn codegen_function<'a>(
     let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, bindings)?;
     let mut func_ctx = FuncContext::new(ctx, &params, ret, source);
     func_ctx.type_bindings = bindings.cloned();
+    // Thread declared return class so `return {...};` resolves to it.
+    if let Some(ann) = &func_decl.return_type
+        && let Some(rc) =
+            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+        && ctx.class_names.contains(&rc)
+    {
+        func_ctx.return_class = Some(rc);
+    }
 
     // Track class types, array types, closure sigs, and string types for function parameters
     for param in &func_decl.params.items {
@@ -1425,8 +1574,11 @@ fn codegen_function<'a>(
             if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
-            if let Some(param_class) = types::get_class_type_name_with_bindings(ann, bindings)
-                && ctx.class_names.contains(&param_class)
+            if let Some(param_class) = types::get_class_type_name_with_bindings(
+                ann,
+                bindings,
+                Some(&ctx.shape_registry),
+            ) && ctx.class_names.contains(&param_class)
             {
                 func_ctx
                     .local_class_types
@@ -1436,7 +1588,9 @@ fn codegen_function<'a>(
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
-                if let Some(elem_class) = types::get_array_element_class(ann) {
+                if let Some(elem_class) =
+                    types::get_array_element_class(ann, Some(&ctx.shape_registry))
+                {
                     func_ctx
                         .local_array_elem_classes
                         .insert(pname.clone(), elem_class);

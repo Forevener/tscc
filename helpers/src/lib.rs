@@ -44,6 +44,7 @@ pub use hash::__hash_fx_bool;
 pub use hash::__hash_xxh3_str;
 pub use string::__str_endsWith;
 pub use string::__str_from_f64;
+pub use string::__str_from_f64_radix;
 pub use string::__str_includes;
 pub use string::__str_indexOf;
 pub use string::__str_lastIndexOf;
@@ -53,6 +54,7 @@ pub use string::__str_startsWith;
 pub use string::__str_toExponential;
 pub use string::__str_toFixed;
 pub use string::__str_toPrecision;
+pub use string::__utf8_encode_cp;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

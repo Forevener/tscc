@@ -162,6 +162,143 @@ pub extern "C" fn __str_from_f64(n: f64) -> u32 {
     alloc_str(buf.format(n).as_bytes())
 }
 
+/// Number.prototype.toString(radix) — base-R stringification for radix ∈
+/// [2, 36], radix ≠ 10. Codegen routes radix == 10 and radix-less calls
+/// straight to `__str_from_f64`, so this helper handles the non-decimal path.
+///
+/// ES § 21.1.3.6 throws RangeError when radix ∉ [2, 36]; tscc has no
+/// exception model, so we defensively fall back to base-10 on out-of-range
+/// radices reached at runtime (codegen rejects literal out-of-range radices
+/// at compile time).
+///
+/// Algorithm: split `|n|` into integer and fractional parts, emit integer
+/// digits via repeated division (u64 accumulator, lossless for `|n| < 2^63`),
+/// then emit fractional digits via repeated multiplication by the radix. The
+/// fractional-digit cap scales with radix — ~52 bits of f64 mantissa divided
+/// by `log2(R)` — so base 2 emits up to 52 digits, base 36 up to 11. Trailing
+/// zeros are stripped so `(0.5).toString(2)` is `"0.1"`, not `"0.10000...0"`.
+#[unsafe(no_mangle)]
+pub extern "C" fn __str_from_f64_radix(n: f64, radix: i32) -> u32 {
+    if radix == 10 || !(2..=36).contains(&radix) {
+        return __str_from_f64(n);
+    }
+    if n.is_nan() {
+        return alloc_str(b"NaN");
+    }
+    if n.is_infinite() {
+        return alloc_str(if n > 0.0 { b"Infinity" } else { b"-Infinity" });
+    }
+
+    let negative = n < 0.0;
+    let abs = if negative { -n } else { n };
+
+    // Beyond u64 range the integer-path accumulator would lose digits; no
+    // clean recovery without big-int math, so route these to shortest-repr
+    // base-10 as a pragmatic fallback.
+    if abs >= (u64::MAX as f64) {
+        return __str_from_f64(n);
+    }
+
+    let r32 = radix as u32;
+    let r64 = r32 as u64;
+    let rf = r32 as f64;
+
+    let mut out = StackBuf::<128>::new();
+    if negative {
+        out.push_byte(b'-');
+    }
+
+    // `as u64` on an f64 truncates toward zero, so `int_part <= abs` and
+    // `frac` stays in [0, 1). Subtracting with the widened u64 keeps the
+    // fraction in the f64's representable grid.
+    let int_part = abs as u64;
+    let frac = abs - (int_part as f64);
+
+    if int_part == 0 {
+        out.push_byte(b'0');
+    } else {
+        // Max 64 digits (u64 in base 2). Write digits backwards into a
+        // scratch buffer, then flip.
+        let mut scratch = [0u8; 64];
+        let mut i = 0usize;
+        let mut x = int_part;
+        while x > 0 {
+            let d = (x % r64) as u32;
+            scratch[i] = digit_char(d);
+            i += 1;
+            x /= r64;
+        }
+        while i > 0 {
+            i -= 1;
+            out.push_byte(scratch[i]);
+        }
+    }
+
+    if frac > 0.0 {
+        let frac_start = out.len;
+        out.push_byte(b'.');
+
+        // Digit budget ≈ ceil(52 / log2(R)) + a small margin so the 52-bit
+        // f64 mantissa fully expands even when the value is shifted by the
+        // binary exponent (e.g. `0.1` is a finite-bit fraction whose exact
+        // expansion has 56 base-2 digits — 3 leading zeros + 53 mantissa
+        // bits, because the exponent is -4). Hard-coded per radix to keep
+        // the helper libm-free.
+        let max_digits: usize = match r32 {
+            2 => 60,
+            3 => 40,
+            4 => 30,
+            5 => 27,
+            6 => 24,
+            7 => 22,
+            8 => 21,
+            9 => 20,
+            10..=11 => 19,
+            12..=14 => 18,
+            15..=18 => 17,
+            19..=24 => 16,
+            25..=31 => 15,
+            _ => 14,
+        };
+
+        let mut f = frac;
+        let mut emitted = 0usize;
+        while f > 0.0 && emitted < max_digits {
+            f *= rf;
+            // Floating-point drift can push a digit one unit past r-1;
+            // clamp to keep `digit_char` in range.
+            let mut d = f as u32;
+            if d >= r32 {
+                d = r32 - 1;
+            }
+            out.push_byte(digit_char(d));
+            f -= d as f64;
+            emitted += 1;
+        }
+
+        // Strip trailing zeros (only cosmetic — our fractional loop may have
+        // emitted precision-bounded trailing zeros that JS doesn't). If the
+        // whole fraction collapses to ".", drop the dot too.
+        while out.len > frac_start + 1 && out.buf[out.len - 1] == b'0' {
+            out.len -= 1;
+        }
+        if out.len == frac_start + 1 {
+            out.len -= 1;
+        }
+    }
+
+    alloc_str(out.as_bytes())
+}
+
+/// Map `d ∈ [0, 36)` to its ASCII base-36 digit. Lowercase a-z matches JS.
+fn digit_char(d: u32) -> u8 {
+    if d < 10 {
+        b'0' + d as u8
+    } else {
+        b'a' + (d - 10) as u8
+    }
+}
+
 /// Number.prototype.toFixed(digits) — fixed-point format with `digits`
 /// fractional digits. Caller passes `digits` in [0, 100] (the language layer
 /// would have rejected anything outside that range; we don't re-validate).
@@ -797,5 +934,41 @@ pub extern "C" fn __str_endsWith(s: u32, suffix: u32) -> i32 {
         let sp = core::slice::from_raw_parts((s + HEADER + offset as u32) as *const u8, sufl);
         let sufp = str_bytes(suffix, sufl);
         if sp == sufp { 1 } else { 0 }
+    }
+}
+
+/// Encode a Unicode code point as UTF-8 at `dst`. Returns the number of
+/// bytes written (1-4). Caller allocates worst-case (4 bytes per code
+/// point) and rewinds the arena by the unused tail after encoding.
+/// Out-of-range code points (outside [0, 0x10FFFF]) trap — the typed
+/// subset has no `RangeError`, so `fromCodePoint` fails loud and fast
+/// rather than producing mojibake.
+#[unsafe(no_mangle)]
+pub extern "C" fn __utf8_encode_cp(dst: u32, cp: i32) -> i32 {
+    if !(0..=0x10FFFF).contains(&cp) {
+        core::arch::wasm32::unreachable()
+    }
+    let cp = cp as u32;
+    unsafe {
+        let d = dst as *mut u8;
+        if cp < 0x80 {
+            *d = cp as u8;
+            1
+        } else if cp < 0x800 {
+            *d = (0xC0 | (cp >> 6)) as u8;
+            *d.add(1) = (0x80 | (cp & 0x3F)) as u8;
+            2
+        } else if cp < 0x10000 {
+            *d = (0xE0 | (cp >> 12)) as u8;
+            *d.add(1) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            *d.add(2) = (0x80 | (cp & 0x3F)) as u8;
+            3
+        } else {
+            *d = (0xF0 | (cp >> 18)) as u8;
+            *d.add(1) = (0x80 | ((cp >> 12) & 0x3F)) as u8;
+            *d.add(2) = (0x80 | ((cp >> 6) & 0x3F)) as u8;
+            *d.add(3) = (0x80 | (cp & 0x3F)) as u8;
+            4
+        }
     }
 }

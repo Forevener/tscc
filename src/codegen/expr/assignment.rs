@@ -66,7 +66,31 @@ impl<'a> FuncContext<'a> {
                 if is_boxed {
                     self.push(Instruction::LocalGet(idx)); // ptr
                 }
-                let expr_ty = self.emit_expr(&assign.right)?;
+                let expr_ty = match &assign.right {
+                    Expression::ObjectExpression(obj) => {
+                        let expected = self.local_class_types.get(target_name).cloned();
+                        let (t, _) = self.emit_object_literal(obj, expected.as_deref())?;
+                        t
+                    }
+                    Expression::ArrayExpression(arr) => {
+                        let target_class = self.local_class_types.get(target_name).cloned();
+                        if let Some(t) = target_class.as_deref()
+                            && self.is_tuple_shape(t)
+                        {
+                            let (et, _) = self.emit_tuple_literal(arr, t)?;
+                            et
+                        } else {
+                            self.emit_expr_coerced(
+                                &assign.right,
+                                target_class.as_deref(),
+                            )?
+                        }
+                    }
+                    _ => {
+                        let target_class = self.local_class_types.get(target_name).cloned();
+                        self.emit_expr_coerced(&assign.right, target_class.as_deref())?
+                    }
+                };
                 if expr_ty != ty {
                     return Err(CompileError::type_err(format!(
                         "cannot assign {expr_ty:?} to {ty:?} variable '{target_name}'"

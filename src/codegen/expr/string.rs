@@ -39,6 +39,37 @@ impl<'a> FuncContext<'a> {
         Ok(WasmType::I32)
     }
 
+    /// Emit a tagged template expression. Only `String.raw` is supported —
+    /// every other tag would need a user-callable function that takes a
+    /// `TemplateStringsArray` plus rest-substitutions, and the typed subset
+    /// doesn't have those shapes yet.
+    ///
+    /// `String.raw\`...\`` delegates straight to the regular template-literal
+    /// emitter. tscc's `emit_template_literal` already uses `quasi.value.raw`
+    /// (not `.cooked`), so the raw-vs-cooked distinction is invisible at the
+    /// moment — both paths emit the raw source text. When a future change
+    /// routes regular templates through `.cooked`, this path should stay on
+    /// `.raw` explicitly rather than inheriting whatever the regular emitter
+    /// does.
+    pub(crate) fn emit_tagged_template(
+        &mut self,
+        tagged: &TaggedTemplateExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        let is_string_raw = match &tagged.tag {
+            Expression::StaticMemberExpression(m) => {
+                matches!(&m.object, Expression::Identifier(id) if id.name.as_str() == "String")
+                    && m.property.name.as_str() == "raw"
+            }
+            _ => false,
+        };
+        if !is_string_raw {
+            return Err(CompileError::unsupported(
+                "only String.raw tagged templates are supported in the typed subset",
+            ));
+        }
+        self.emit_template_literal(&tagged.quasi)
+    }
+
     pub(crate) fn emit_template_literal(
         &mut self,
         tpl: &TemplateLiteral<'a>,
@@ -225,6 +256,7 @@ impl<'a> FuncContext<'a> {
         match expr {
             Expression::StringLiteral(_) => true,
             Expression::TemplateLiteral(_) => true,
+            Expression::TaggedTemplateExpression(_) => true,
             Expression::Identifier(ident) => self.local_string_vars.contains(ident.name.as_str()),
             Expression::BinaryExpression(bin) => {
                 // string + anything = string
@@ -237,10 +269,13 @@ impl<'a> FuncContext<'a> {
             }
             Expression::CallExpression(call) => {
                 if let Expression::StaticMemberExpression(member) = &call.callee {
-                    // String.fromCharCode(...)
+                    // String.fromCharCode(...) / String.fromCodePoint(...)
                     if let Expression::Identifier(obj) = &member.object
                         && obj.name.as_str() == "String"
-                        && member.property.name.as_str() == "fromCharCode"
+                        && matches!(
+                            member.property.name.as_str(),
+                            "fromCharCode" | "fromCodePoint"
+                        )
                     {
                         return true;
                     }
@@ -292,6 +327,26 @@ impl<'a> FuncContext<'a> {
                     return layout
                         .field_string_types
                         .contains(member.property.name.as_str());
+                }
+                false
+            }
+            Expression::ComputedMemberExpression(member) => {
+                // `t[N]` where t is a tuple and slot N is declared `string`.
+                if let Ok(class_name) = self.resolve_expr_class(&member.object)
+                    && let Some(&shape_idx) =
+                        self.module_ctx.shape_registry.by_name.get(&class_name)
+                    && self.module_ctx.shape_registry.shapes[shape_idx].is_tuple
+                    && let Some(layout) = self.module_ctx.class_registry.get(&class_name)
+                {
+                    let slot_idx = match &member.expression {
+                        Expression::NumericLiteral(lit) if lit.value.fract() == 0.0 && lit.value >= 0.0 => {
+                            lit.value as usize
+                        }
+                        _ => return false,
+                    };
+                    if let Some((slot_name, _, _)) = layout.fields.get(slot_idx) {
+                        return layout.field_string_types.contains(slot_name);
+                    }
                 }
                 false
             }
@@ -705,6 +760,23 @@ impl<'a> FuncContext<'a> {
                 }
                 let (func_idx, _) = self.module_ctx.get_func("__str_padEnd").unwrap();
                 self.push(Instruction::Call(func_idx));
+                Ok(Some(WasmType::I32))
+            }
+            "localeCompare" => {
+                // Byte-order lex compare returning -1 / 0 / 1. The `locales`
+                // and `options` arguments of ES § 22.1.3.10 are intentionally
+                // unsupported in the typed subset — we'd need ICU to honor
+                // them, and the public-release bar doesn't cover
+                // internationalization. Reuses `__str_cmp` (L_splice), the
+                // same helper that powers string `<` / `<=` / `>` / `>=`.
+                if call.arguments.len() != 1 {
+                    return Err(CompileError::codegen(
+                        "localeCompare expects exactly 1 argument (locales/options not supported)",
+                    ));
+                }
+                self.emit_expr(&member.object)?;
+                self.emit_expr(call.arguments[0].to_expression())?;
+                self.emit_helper_invocation("__str_cmp");
                 Ok(Some(WasmType::I32))
             }
             _ => Ok(None),

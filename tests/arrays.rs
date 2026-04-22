@@ -2144,6 +2144,87 @@ fn array_from_rejects_non_array_source() {
 }
 
 #[test]
+fn array_from_length_map() {
+    // Sequence-generation form: Array.from({length: n}, (_, i) => fn(i)).
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const squares = Array.from({length: 5}, (_, i) => i * i);
+            sink(squares.length as f64);
+            sink(squares[0] as f64);
+            sink(squares[4] as f64);
+
+            // f64 via arithmetic — mapFn return is f64.
+            const halves = Array.from({length: 4}, (_, i) => (i as f64) / 2.0);
+            sink(halves.length as f64);
+            sink(halves[0]);
+            sink(halves[3]);
+
+            // Empty length.
+            const empty = Array.from({length: 0}, (_, i) => i);
+            sink(empty.length as f64);
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![5.0, 0.0, 16.0, 4.0, 0.0, 1.5, 0.0]);
+}
+
+#[test]
+fn array_from_length_explicit_type() {
+    // Explicit <T> wins even if mapFn body would infer something else.
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs = Array.from<f64>({length: 3}, (_, i) => i + 1);
+            sink(xs.length as f64);
+            sink(xs[0]);
+            sink(xs[2]);
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 1.0, 3.0]);
+}
+
+#[test]
+fn array_from_length_requires_map_fn() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const xs = Array.from({length: 3});
+            return xs.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("mapping") || msg.contains("mapFn"),
+        "expected missing-mapFn error, got: {msg}"
+    );
+}
+
+#[test]
+fn array_from_length_rejects_extra_object_props() {
+    // Not the recognized `{length: n}` shape — extra properties disqualify
+    // the object-literal pattern, so we fall through to the array-source
+    // path and error there (general object literals aren't supported yet).
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            const xs = Array.from({length: 3, other: 1}, (_, i) => i);
+            return xs.length;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("Array.from") || msg.contains("object") || msg.contains("array"),
+        "expected rejection for extra properties, got: {msg}"
+    );
+}
+
+#[test]
 fn array_shift_basic() {
     let vals = run_sink_tick(
         r#"
@@ -2203,6 +2284,124 @@ fn array_unshift_in_place_and_growth() {
     );
 }
 
+/// Array.prototype.copyWithin — shallow in-place copy of a slice to a
+/// different position within the same array, mutating-and-returning. Covers
+/// forward overlap, backward overlap, negative indices, and the `count` cap
+/// kicking in when the requested copy would run past `len`.
+#[test]
+fn array_copy_within_basic() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            // Forward overlap: [1,2,3,4,5].copyWithin(0, 3) → [4,5,3,4,5]
+            const a: Array<i32> = [1, 2, 3, 4, 5];
+            a.copyWithin(0, 3);
+            sink(a[0] as f64); // 4
+            sink(a[1] as f64); // 5
+            sink(a[2] as f64); // 3
+            sink(a[3] as f64); // 4
+            sink(a[4] as f64); // 5
+            sink(a.length as f64); // 5 (length unchanged)
+
+            // Backward overlap: [1,2,3,4,5].copyWithin(1, 0, 3) → [1,1,2,3,5]
+            const b: Array<i32> = [1, 2, 3, 4, 5];
+            b.copyWithin(1, 0, 3);
+            sink(b[0] as f64); // 1
+            sink(b[1] as f64); // 1
+            sink(b[2] as f64); // 2
+            sink(b[3] as f64); // 3
+            sink(b[4] as f64); // 5
+
+            // Negative indices: [1,2,3,4,5].copyWithin(-2, 0, 2) → [1,2,3,1,2]
+            const c: Array<i32> = [1, 2, 3, 4, 5];
+            c.copyWithin(-2, 0, 2);
+            sink(c[3] as f64); // 1
+            sink(c[4] as f64); // 2
+            sink(c[0] as f64); // 1 (unchanged)
+
+            // count capped by len - target: target=3, start=0, end=5 would
+            // want to copy 5 elements, but only 2 fit (len=5, target=3).
+            const d: Array<i32> = [1, 2, 3, 4, 5];
+            d.copyWithin(3, 0, 5);
+            sink(d[3] as f64); // 1
+            sink(d[4] as f64); // 2
+            sink(d.length as f64); // 5 (still 5, not grown)
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![
+            4.0, 5.0, 3.0, 4.0, 5.0, 5.0, // forward
+            1.0, 1.0, 2.0, 3.0, 5.0, // backward
+            1.0, 2.0, 1.0, // negative
+            1.0, 2.0, 5.0, // count capped
+        ]
+    );
+}
+
+/// f64 arrays: same memcpy semantics, 8-byte element stride.
+#[test]
+fn array_copy_within_f64() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const a: Array<f64> = [1.5, 2.5, 3.5, 4.5, 5.5];
+            a.copyWithin(1, 3);
+            sink(a[0]); // 1.5
+            sink(a[1]); // 4.5
+            sink(a[2]); // 5.5
+            sink(a[3]); // 4.5 (unchanged)
+            sink(a[4]); // 5.5 (unchanged)
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.5, 4.5, 5.5, 4.5, 5.5]);
+}
+
+/// Edge cases — empty range (end ≤ start), target beyond len, end clamping.
+/// All are no-ops that still return the array.
+#[test]
+fn array_copy_within_empty_and_edge_cases() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            // end <= start → count = 0, no copy.
+            const a: Array<i32> = [1, 2, 3, 4, 5];
+            a.copyWithin(0, 4, 2);
+            sink(a[0] as f64); // 1 (unchanged)
+            sink(a[4] as f64); // 5 (unchanged)
+
+            // target beyond len → clamped to len, count = 0.
+            const b: Array<i32> = [1, 2, 3];
+            b.copyWithin(99, 0, 3);
+            sink(b[0] as f64); // 1 (unchanged)
+            sink(b[2] as f64); // 3 (unchanged)
+
+            // end clamped to len when too large.
+            const c: Array<i32> = [1, 2, 3, 4, 5];
+            c.copyWithin(0, 2, 999);
+            sink(c[0] as f64); // 3
+            sink(c[1] as f64); // 4
+            sink(c[2] as f64); // 5
+            sink(c[3] as f64); // 4 (unchanged from original)
+            sink(c[4] as f64); // 5 (unchanged from original)
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![
+            1.0, 5.0, // empty range
+            1.0, 3.0, // target past len
+            3.0, 4.0, 5.0, 4.0, 5.0, // end clamped
+        ]
+    );
+}
+
 #[test]
 fn array_reduce_right() {
     let vals = run_sink_tick(
@@ -2228,5 +2427,341 @@ fn array_reduce_right() {
     "#,
     );
     assert_eq!(vals, vec![4321.0, 10.0, 42.0]);
+}
+
+#[test]
+fn array_to_reversed_preserves_source() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [1, 2, 3, 4];
+            const rev: Array<i32> = xs.toReversed();
+            // Reversed result
+            sink(rev[0] as f64); // 4
+            sink(rev[1] as f64); // 3
+            sink(rev[2] as f64); // 2
+            sink(rev[3] as f64); // 1
+            sink(rev.length as f64); // 4
+            // Source untouched
+            sink(xs[0] as f64); // 1
+            sink(xs[3] as f64); // 4
+            sink(xs.length as f64); // 4
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![4.0, 3.0, 2.0, 1.0, 4.0, 1.0, 4.0, 4.0]);
+}
+
+#[test]
+fn array_to_reversed_f64_and_empty() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: number[] = [1.5, 2.5, 3.5];
+            const rev: number[] = xs.toReversed();
+            sink(rev[0]); // 3.5
+            sink(rev[1]); // 2.5
+            sink(rev[2]); // 1.5
+            // Empty array: returns a valid empty array.
+            const empty: Array<i32> = new Array<i32>(0);
+            const erev: Array<i32> = empty.toReversed();
+            sink(erev.length as f64); // 0
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.5, 2.5, 1.5, 0.0]);
+}
+
+#[test]
+fn array_to_sorted_preserves_source() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<f64> = [3.0, 1.0, 4.0, 1.5, 2.0];
+            const sorted: Array<f64> = xs.toSorted((a, b) => a - b);
+            sink(sorted[0]); // 1.0
+            sink(sorted[1]); // 1.5
+            sink(sorted[2]); // 2.0
+            sink(sorted[3]); // 3.0
+            sink(sorted[4]); // 4.0
+            // Source untouched
+            sink(xs[0]); // 3.0
+            sink(xs[1]); // 1.0
+            sink(xs[4]); // 2.0
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![1.0, 1.5, 2.0, 3.0, 4.0, 3.0, 1.0, 2.0]
+    );
+}
+
+#[test]
+fn array_to_sorted_descending_i32() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [5, 2, 8, 1, 9, 3];
+            const desc: Array<i32> = xs.toSorted((a, b) => b - a);
+            sink(desc[0] as f64); // 9
+            sink(desc[1] as f64); // 8
+            sink(desc[5] as f64); // 1
+            // Source still in original order
+            sink(xs[0] as f64); // 5
+            sink(xs[1] as f64); // 2
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![9.0, 8.0, 1.0, 5.0, 2.0]);
+}
+
+#[test]
+fn array_to_spliced_insert_and_remove() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [1, 2, 3, 4, 5];
+            // Remove 2 from index 1, insert 99, 88, 77.
+            const out: Array<i32> = xs.toSpliced(1, 2, 99, 88, 77);
+            sink(out.length as f64); // 6: [1, 99, 88, 77, 4, 5]
+            sink(out[0] as f64);     // 1
+            sink(out[1] as f64);     // 99
+            sink(out[2] as f64);     // 88
+            sink(out[3] as f64);     // 77
+            sink(out[4] as f64);     // 4
+            sink(out[5] as f64);     // 5
+            // Source untouched
+            sink(xs.length as f64);  // 5
+            sink(xs[1] as f64);      // 2
+            sink(xs[2] as f64);      // 3
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![6.0, 1.0, 99.0, 88.0, 77.0, 4.0, 5.0, 5.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn array_to_spliced_one_arg_and_negative_start() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [10, 20, 30, 40, 50];
+            // One arg: delete tail from index 2.
+            const a: Array<i32> = xs.toSpliced(2);
+            sink(a.length as f64); // 2
+            sink(a[0] as f64);     // 10
+            sink(a[1] as f64);     // 20
+            // Negative start: -2 → index len-2 = 3.
+            const b: Array<i32> = xs.toSpliced(-2, 1, 99);
+            sink(b.length as f64); // 5
+            sink(b[3] as f64);     // 99 (replaced 40)
+            sink(b[4] as f64);     // 50
+            // Source still intact.
+            sink(xs.length as f64); // 5
+            sink(xs[3] as f64);     // 40
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![2.0, 10.0, 20.0, 5.0, 99.0, 50.0, 5.0, 40.0]
+    );
+}
+
+#[test]
+fn array_with_positive_and_negative() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [10, 20, 30, 40];
+            const a: Array<i32> = xs.with(1, 99);
+            sink(a[0] as f64); // 10
+            sink(a[1] as f64); // 99
+            sink(a[2] as f64); // 30
+            sink(a[3] as f64); // 40
+            // Negative: -1 means last element.
+            const b: Array<i32> = xs.with(-1, 77);
+            sink(b[2] as f64); // 30
+            sink(b[3] as f64); // 77
+            // Source untouched.
+            sink(xs[1] as f64); // 20
+            sink(xs[3] as f64); // 40
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![10.0, 99.0, 30.0, 40.0, 30.0, 77.0, 20.0, 40.0]);
+}
+
+#[test]
+fn array_sort_default_comparator_i32() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [5, 2, 8, 1, 9, 3];
+            xs.sort();
+            sink(xs[0] as f64); // 1
+            sink(xs[1] as f64); // 2
+            sink(xs[2] as f64); // 3
+            sink(xs[3] as f64); // 5
+            sink(xs[4] as f64); // 8
+            sink(xs[5] as f64); // 9
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 2.0, 3.0, 5.0, 8.0, 9.0]);
+}
+
+#[test]
+fn array_to_sorted_default_comparator_f64() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<f64> = [3.5, 1.1, 4.2, 1.3, 2.7];
+            const sorted: Array<f64> = xs.toSorted();
+            sink(sorted[0]); // 1.1
+            sink(sorted[1]); // 1.3
+            sink(sorted[2]); // 2.7
+            sink(sorted[3]); // 3.5
+            sink(sorted[4]); // 4.2
+            // Source untouched.
+            sink(xs[0]); // 3.5
+            sink(xs[1]); // 1.1
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.1, 1.3, 2.7, 3.5, 4.2, 3.5, 1.1]);
+}
+
+#[test]
+fn array_index_of_from_index() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [1, 2, 3, 2, 5];
+            // Find next occurrence after an earlier hit.
+            sink(xs.indexOf(2) as f64);        // 1
+            sink(xs.indexOf(2, 2) as f64);     // 3
+            // fromIndex past end → -1.
+            sink(xs.indexOf(2, 10) as f64);    // -1
+            // Negative fromIndex: -2 → index 3.
+            sink(xs.indexOf(2, -2) as f64);    // 3
+            // Very negative wraps to 0.
+            sink(xs.indexOf(1, -99) as f64);   // 0
+            // Not found.
+            sink(xs.indexOf(99, 0) as f64);    // -1
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 3.0, -1.0, 3.0, 0.0, -1.0]);
+}
+
+#[test]
+fn array_last_index_of_from_index() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [1, 2, 3, 2, 1];
+            // Default: search from end.
+            sink(xs.lastIndexOf(2) as f64);     // 3
+            // Bound search region from end.
+            sink(xs.lastIndexOf(2, 2) as f64);  // 1
+            // fromIndex beyond end → clamped to len-1.
+            sink(xs.lastIndexOf(1, 99) as f64); // 4
+            // Negative: -3 → index 2.
+            sink(xs.lastIndexOf(2, -3) as f64); // 1
+            // fromIndex too negative → -1 (no search).
+            sink(xs.lastIndexOf(1, -99) as f64); // -1
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![3.0, 1.0, 4.0, 1.0, -1.0]);
+}
+
+#[test]
+fn array_includes_from_index() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: Array<i32> = [10, 20, 30, 40];
+            sink(xs.includes(20) ? 1.0 : 0.0);       // 1
+            sink(xs.includes(20, 2) ? 1.0 : 0.0);    // 0 (20 is at idx 1)
+            sink(xs.includes(30, 2) ? 1.0 : 0.0);    // 1
+            sink(xs.includes(10, -1) ? 1.0 : 0.0);   // 0
+            sink(xs.includes(40, -1) ? 1.0 : 0.0);   // 1
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![1.0, 0.0, 1.0, 0.0, 1.0]);
+}
+
+#[test]
+fn array_concat_variadic() {
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const a: Array<i32> = [1, 2];
+            const b: Array<i32> = [3, 4, 5];
+            const c: Array<i32> = [6];
+            const d: Array<i32> = new Array<i32>(0); // empty
+            const out: Array<i32> = a.concat(b, c, d);
+            sink(out.length as f64); // 6
+            sink(out[0] as f64); // 1
+            sink(out[1] as f64); // 2
+            sink(out[2] as f64); // 3
+            sink(out[3] as f64); // 4
+            sink(out[4] as f64); // 5
+            sink(out[5] as f64); // 6
+            // Source arrays untouched.
+            sink(a.length as f64); // 2
+            sink(b.length as f64); // 3
+        }
+    "#,
+    );
+    assert_eq!(
+        vals,
+        vec![6.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn array_with_f64_and_class_instance_chain() {
+    // Exercises both f64 elements and the element-type-resolution preservation
+    // across chained calls (`.toReversed().with(...)` must know the element
+    // type to pick f64 load/store).
+    let vals = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+        export function tick(me: i32): void {
+            const xs: number[] = [1.0, 2.0, 3.0, 4.0];
+            const out: number[] = xs.toReversed().with(0, 99.5);
+            sink(out[0]); // 99.5
+            sink(out[1]); // 3.0
+            sink(out[2]); // 2.0
+            sink(out[3]); // 1.0
+            // Confirm the chained result is length 4 and source is still 1..4.
+            sink(out.length as f64); // 4
+            sink(xs[0]); // 1.0
+            sink(xs[3]); // 4.0
+        }
+    "#,
+    );
+    assert_eq!(vals, vec![99.5, 3.0, 2.0, 1.0, 4.0, 1.0, 4.0]);
 }
 

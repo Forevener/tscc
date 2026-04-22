@@ -29,6 +29,11 @@ impl<'a> FuncContext<'a> {
             return self.emit_new_map(new_expr);
         }
 
+        // Handle new Set<T>() — compiler-owned, per-monomorphization layout.
+        if base_name == crate::codegen::set_builtins::SET_BASE {
+            return self.emit_new_set(new_expr);
+        }
+
         // Generic instantiation: `new Box<i32>(...)` → look up the mangled
         // monomorphization. Type args may themselves reference the enclosing
         // function's type parameters, so we thread through `type_bindings`.
@@ -192,6 +197,98 @@ impl<'a> FuncContext<'a> {
         Ok(WasmType::I32)
     }
 
+    /// Emit `new Set<T>()` — arena-allocate the 5-field header and an initial
+    /// bucket array of size `INITIAL_CAPACITY`, then initialize the header.
+    /// State bytes in the bucket array default to `BUCKET_EMPTY` (0) via the
+    /// arena's bump-over-fresh-memory property. `head_idx`/`tail_idx` are set
+    /// to `-1` so the first `add()` can detect an empty list.
+    pub(crate) fn emit_new_set(
+        &mut self,
+        new_expr: &NewExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        use crate::codegen::set_builtins::{self, INITIAL_CAPACITY};
+
+        if !new_expr.arguments.is_empty() {
+            return Err(CompileError::codegen(
+                "new Set<T>() takes no arguments",
+            ));
+        }
+        let type_args = new_expr.type_arguments.as_ref().ok_or_else(|| {
+            CompileError::type_err("new Set requires explicit <T> type argument")
+        })?;
+        if type_args.params.len() != set_builtins::SET_ARITY {
+            return Err(CompileError::type_err(format!(
+                "Set<T> expects 1 type argument, got {}",
+                type_args.params.len()
+            )));
+        }
+        let elem_ty = crate::codegen::generics::resolve_bound_type(
+            &type_args.params[0],
+            &self.module_ctx.class_names,
+            self.type_bindings.as_ref(),
+        )?;
+        let mangled = set_builtins::mangle_set_name(&elem_ty);
+        let info = self.module_ctx.set_info.get(&mangled).ok_or_else(|| {
+            CompileError::codegen(format!("set instantiation '{mangled}' not registered"))
+        })?;
+        let header_size = self
+            .module_ctx
+            .class_registry
+            .get(&mangled)
+            .expect("set layout registered alongside set_info")
+            .size;
+        let bucket_size = info.bucket.total_size;
+
+        // Allocate header.
+        self.push(Instruction::I32Const(header_size as i32));
+        let header_ptr = self.emit_arena_alloc_to_local(true)?;
+
+        // Allocate bucket array.
+        self.push(Instruction::I32Const(
+            (INITIAL_CAPACITY * bucket_size) as i32,
+        ));
+        let buckets_ptr = self.emit_arena_alloc_to_local(true)?;
+
+        let buckets_off = self.field_offset(&mangled, "buckets_ptr");
+        let capacity_off = self.field_offset(&mangled, "capacity");
+        let head_off = self.field_offset(&mangled, "head_idx");
+        let tail_off = self.field_offset(&mangled, "tail_idx");
+
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::LocalGet(buckets_ptr));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: buckets_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(INITIAL_CAPACITY as i32));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: capacity_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(set_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: head_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalGet(header_ptr));
+        self.push(Instruction::I32Const(set_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: tail_off as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(header_ptr));
+        Ok(WasmType::I32)
+    }
+
     /// Field offset lookup shared between Map codegen paths. Panics if the
     /// class or field is missing — callers stage the check earlier.
     fn field_offset(&self, class_name: &str, field_name: &str) -> u32 {
@@ -278,6 +375,21 @@ impl<'a> FuncContext<'a> {
         arr_expr: &ArrayExpression<'a>,
         expected_elem_ty: Option<WasmType>,
     ) -> Result<WasmType, CompileError> {
+        self.emit_array_literal_with_class(arr_expr, expected_elem_ty, None)
+    }
+
+    /// Variant of `emit_array_literal` that also carries the expected class
+    /// name of each element — used so `Array<[i32, i32]>` literals route
+    /// their inner `[a, b]` ArrayExpressions through `emit_tuple_literal`
+    /// (and `Array<Shape>` routes inner ObjectExpressions through
+    /// `emit_object_literal`). When `expected_elem_class` is `None` the
+    /// behavior is identical to `emit_array_literal`.
+    pub(crate) fn emit_array_literal_with_class(
+        &mut self,
+        arr_expr: &ArrayExpression<'a>,
+        expected_elem_ty: Option<WasmType>,
+        expected_elem_class: Option<&str>,
+    ) -> Result<WasmType, CompileError> {
         // Reject holes; spreads go through a runtime-length path.
         let mut has_spread = false;
         for el in &arr_expr.elements {
@@ -326,7 +438,12 @@ impl<'a> FuncContext<'a> {
         };
 
         if !has_spread {
-            return self.emit_array_literal_fixed(arr_expr, elem_ty, elem_size);
+            return self.emit_array_literal_fixed(
+                arr_expr,
+                elem_ty,
+                elem_size,
+                expected_elem_class,
+            );
         }
         self.emit_array_literal_with_spread(arr_expr, elem_ty, elem_size)
     }
@@ -338,6 +455,7 @@ impl<'a> FuncContext<'a> {
         arr_expr: &ArrayExpression<'a>,
         elem_ty: WasmType,
         elem_size: i32,
+        expected_elem_class: Option<&str>,
     ) -> Result<WasmType, CompileError> {
         let elem_count = arr_expr.elements.len() as i32;
         let total = ARRAY_HEADER_SIZE as i32 + elem_count * elem_size;
@@ -364,7 +482,7 @@ impl<'a> FuncContext<'a> {
                 CompileError::codegen("unsupported array literal element kind")
             })?;
             self.push(Instruction::LocalGet(ptr_local));
-            let ty = self.emit_expr(expr)?;
+            let ty = self.emit_element_with_class(expr, expected_elem_class)?;
             if ty != elem_ty {
                 if elem_ty == WasmType::F64 && ty == WasmType::I32 {
                     self.push(Instruction::F64ConvertI32S);
@@ -392,6 +510,33 @@ impl<'a> FuncContext<'a> {
 
         self.push(Instruction::LocalGet(ptr_local));
         Ok(WasmType::I32)
+    }
+
+    /// Emit a single array element, routing nested literal forms through
+    /// the shape-aware emitters when the element class is a registered
+    /// tuple or object shape. Falls back to `emit_expr` otherwise.
+    fn emit_element_with_class(
+        &mut self,
+        expr: &Expression<'a>,
+        expected_elem_class: Option<&str>,
+    ) -> Result<WasmType, CompileError> {
+        match (expr, expected_elem_class) {
+            (Expression::ArrayExpression(inner), Some(cn)) if self.is_tuple_shape(cn) => {
+                let (ty, _) = self.emit_tuple_literal(inner, cn)?;
+                Ok(ty)
+            }
+            (Expression::ObjectExpression(inner), Some(cn))
+                if self
+                    .module_ctx
+                    .shape_registry
+                    .by_name
+                    .contains_key(cn) =>
+            {
+                let (ty, _) = self.emit_object_literal(inner, Some(cn))?;
+                Ok(ty)
+            }
+            _ => self.emit_expr(expr),
+        }
     }
 
     /// Runtime-length path for array literals containing `...spread` elements.
@@ -642,6 +787,12 @@ impl<'a> FuncContext<'a> {
         let layout = self.module_ctx.class_registry.get(&class_name);
         let is_polymorphic = layout.is_some_and(|l| l.is_polymorphic);
 
+        // Pull the method signature once so we can thread expected-type hints
+        // into `ObjectExpression` arguments on both dispatch paths.
+        let param_classes: Option<Vec<Option<String>>> = layout
+            .and_then(|l| l.methods.get(method_name))
+            .map(|sig| sig.param_classes.clone());
+
         if is_polymorphic {
             // Vtable dispatch via call_indirect
             let vtable_slot = layout
@@ -665,8 +816,23 @@ impl<'a> FuncContext<'a> {
             self.push(Instruction::LocalTee(this_tmp));
 
             // Emit arguments
-            for arg in &call.arguments {
-                self.emit_expr(arg.to_expression())?;
+            for (i, arg) in call.arguments.iter().enumerate() {
+                let expr = arg.to_expression();
+                let expected = param_classes
+                    .as_ref()
+                    .and_then(|pc| pc.get(i))
+                    .and_then(|c| c.as_deref());
+                match (expr, expected) {
+                    (Expression::ObjectExpression(obj), Some(en)) => {
+                        self.emit_object_literal(obj, Some(en))?;
+                    }
+                    (Expression::ArrayExpression(arr), Some(en)) if self.is_tuple_shape(en) => {
+                        self.emit_tuple_literal(arr, en)?;
+                    }
+                    _ => {
+                        self.emit_expr_coerced(expr, expected)?;
+                    }
+                }
             }
 
             // Load vtable pointer from this (offset 0)
@@ -712,8 +878,23 @@ impl<'a> FuncContext<'a> {
             } else {
                 self.emit_expr(&member.object)?; // this
             }
-            for arg in &call.arguments {
-                self.emit_expr(arg.to_expression())?;
+            for (i, arg) in call.arguments.iter().enumerate() {
+                let expr = arg.to_expression();
+                let expected = param_classes
+                    .as_ref()
+                    .and_then(|pc| pc.get(i))
+                    .and_then(|c| c.as_deref());
+                match (expr, expected) {
+                    (Expression::ObjectExpression(obj), Some(en)) => {
+                        self.emit_object_literal(obj, Some(en))?;
+                    }
+                    (Expression::ArrayExpression(arr), Some(en)) if self.is_tuple_shape(en) => {
+                        self.emit_tuple_literal(arr, en)?;
+                    }
+                    _ => {
+                        self.emit_expr_coerced(expr, expected)?;
+                    }
+                }
             }
             self.push(Instruction::Call(func_idx));
 
@@ -891,8 +1072,7 @@ impl<'a> FuncContext<'a> {
                 // Try free function call: funcName()
                 if let Expression::Identifier(ident) = &call.callee {
                     let name = ident.name.as_str();
-                    // Check module-level function return class types
-                    if let Some(class_name) = self.module_ctx.var_class_types.get(name) {
+                    if let Some(class_name) = self.module_ctx.fn_return_classes.get(name) {
                         return Ok(class_name.clone());
                     }
                 }
@@ -903,11 +1083,56 @@ impl<'a> FuncContext<'a> {
             Expression::ParenthesizedExpression(paren) => {
                 self.resolve_expr_class(&paren.expression)
             }
+            // tuple[N] or arr[i] → resolve the slot / element class.
+            Expression::ComputedMemberExpression(member) => {
+                // Tuple: `t[0]` where t's class is a registered tuple shape
+                // and the index is a literal.
+                if let Ok(obj_class) = self.resolve_expr_class(&member.object)
+                    && let Some(&shape_idx) =
+                        self.module_ctx.shape_registry.by_name.get(&obj_class)
+                    && self.module_ctx.shape_registry.shapes[shape_idx].is_tuple
+                {
+                    let layout = self
+                        .module_ctx
+                        .class_registry
+                        .get(&obj_class)
+                        .ok_or_else(|| {
+                            CompileError::codegen(format!("tuple '{obj_class}' not registered"))
+                        })?;
+                    let index = tuple_index_from_literal(&member.expression).ok_or_else(|| {
+                        CompileError::type_err(format!(
+                            "tuple '{obj_class}' requires a literal numeric index"
+                        ))
+                    })?;
+                    if index >= layout.fields.len() {
+                        return Err(CompileError::type_err(format!(
+                            "tuple index {index} out of bounds for '{obj_class}'"
+                        )));
+                    }
+                    let slot_name = &layout.fields[index].0;
+                    if let Some(cn) = layout.field_class_types.get(slot_name) {
+                        return Ok(cn.clone());
+                    }
+                    return Err(CompileError::codegen(format!(
+                        "tuple '{obj_class}' slot {index} is not a class"
+                    )));
+                }
+                // Array of class-typed elements: `arr[i]` → element class.
+                if let Expression::Identifier(ident) = &member.object
+                    && let Some(cn) = self.local_array_elem_classes.get(ident.name.as_str())
+                {
+                    return Ok(cn.clone());
+                }
+                Err(CompileError::codegen(
+                    "cannot resolve class type of computed member access",
+                ))
+            }
             // (expr as ClassName) → target class
             Expression::TSAsExpression(as_expr) => {
-                if let Some(class_name) =
-                    crate::types::get_class_type_name_from_ts_type(&as_expr.type_annotation)
-                    && self.module_ctx.class_names.contains(&class_name)
+                if let Some(class_name) = crate::types::get_class_type_name_from_ts_type(
+                    &as_expr.type_annotation,
+                    Some(&self.module_ctx.shape_registry),
+                ) && self.module_ctx.class_names.contains(&class_name)
                 {
                     return Ok(class_name);
                 }
@@ -919,5 +1144,22 @@ impl<'a> FuncContext<'a> {
                 "cannot resolve class type of expression",
             )),
         }
+    }
+}
+
+/// Extract a non-negative integer literal from a tuple-index expression.
+/// Duplicated from `expr::member` because class-resolution runs in a `&self`
+/// path that pre-dates emit-time index extraction. Keep the two in sync.
+fn tuple_index_from_literal(expr: &Expression<'_>) -> Option<usize> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => tuple_index_from_literal(&p.expression),
+        Expression::NumericLiteral(lit) => {
+            let v = lit.value;
+            if v.fract() != 0.0 || v < 0.0 {
+                return None;
+            }
+            Some(v as usize)
+        }
+        _ => None,
     }
 }

@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_ast::ast::{TSType, TSTypeAnnotation};
 use wasm_encoder::ValType;
 
+use crate::codegen::shapes::ShapeRegistry;
 use crate::error::CompileError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +159,8 @@ pub fn resolve_ts_type_with_bindings(
             // T[] is equivalent to Array<T> — a pointer into linear memory (i32).
             Ok(WasmType::I32)
         }
+        TSType::TSTypeLiteral(_) => Ok(WasmType::I32),
+        TSType::TSTupleType(_) => Ok(WasmType::I32),
         _ => Err(CompileError::type_err(
             "unsupported type annotation".to_string(),
         )),
@@ -222,7 +225,10 @@ pub fn get_array_element_type(
 
 /// Extract the class name from an Array<ClassName> type annotation.
 /// Returns Some("ClassName") if element type is a class, None otherwise.
-pub fn get_array_element_class(annotation: &TSTypeAnnotation) -> Option<String> {
+pub fn get_array_element_class(
+    annotation: &TSTypeAnnotation,
+    shape_registry: Option<&ShapeRegistry>,
+) -> Option<String> {
     let first = match &annotation.type_annotation {
         TSType::TSTypeReference(type_ref) => {
             let name = type_ref
@@ -248,6 +254,14 @@ pub fn get_array_element_class(annotation: &TSTypeAnnotation) -> Option<String> 
             "i32" | "f64" | "bool" | "Array" | "string" | "int" | "number" => None,
             class_name => Some(class_name.to_string()),
         }
+    } else if let TSType::TSTypeLiteral(lit) = first {
+        shape_registry
+            .and_then(|r| r.get_by_annotation(lit))
+            .map(|s| s.name.clone())
+    } else if let TSType::TSTupleType(tuple) = first {
+        shape_registry
+            .and_then(|r| r.get_by_tuple_annotation(tuple))
+            .map(|s| s.name.clone())
     } else {
         None
     }
@@ -282,8 +296,11 @@ pub fn is_string_type_with_bindings(
 }
 
 /// Extract class type name from a TSType (used by both annotation and as-expression paths).
-pub fn get_class_type_name_from_ts_type(ts_type: &TSType) -> Option<String> {
-    get_class_type_name_from_ts_type_with_bindings(ts_type, None)
+pub fn get_class_type_name_from_ts_type(
+    ts_type: &TSType,
+    shape_registry: Option<&ShapeRegistry>,
+) -> Option<String> {
+    get_class_type_name_from_ts_type_with_bindings(ts_type, None, shape_registry)
 }
 
 /// Bindings-aware variant. A type parameter bound to `BoundType::Class(name)`
@@ -292,13 +309,19 @@ pub fn get_class_type_name_from_ts_type(ts_type: &TSType) -> Option<String> {
 pub fn get_class_type_name_with_bindings(
     annotation: &TSTypeAnnotation,
     bindings: Option<&TypeBindings>,
+    shape_registry: Option<&ShapeRegistry>,
 ) -> Option<String> {
-    get_class_type_name_from_ts_type_with_bindings(&annotation.type_annotation, bindings)
+    get_class_type_name_from_ts_type_with_bindings(
+        &annotation.type_annotation,
+        bindings,
+        shape_registry,
+    )
 }
 
 pub fn get_class_type_name_from_ts_type_with_bindings(
     ts_type: &TSType,
     bindings: Option<&TypeBindings>,
+    shape_registry: Option<&ShapeRegistry>,
 ) -> Option<String> {
     match ts_type {
         TSType::TSTypeReference(type_ref) => {
@@ -325,11 +348,25 @@ pub fn get_class_type_name_from_ts_type_with_bindings(
                         }
                         return Some(format!("{other}${}", tokens.join("$")));
                     }
+                    // Shape-alias canonicalization: when two distinct user
+                    // names declare the same shape (e.g. interface + type),
+                    // each name lives in `by_name` but the layout sits under
+                    // the canonical shape name. Always return the canonical
+                    // so downstream `class_registry.get(...)` succeeds.
+                    if let Some(shape) = shape_registry.and_then(|r| r.get_by_name(other)) {
+                        return Some(shape.name.clone());
+                    }
                     Some(other.to_string())
                 }
                 None => None,
             }
         }
+        TSType::TSTypeLiteral(lit) => {
+            shape_registry?.get_by_annotation(lit).map(|s| s.name.clone())
+        }
+        TSType::TSTupleType(tuple) => shape_registry?
+            .get_by_tuple_annotation(tuple)
+            .map(|s| s.name.clone()),
         _ => None,
     }
 }

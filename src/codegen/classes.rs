@@ -4,6 +4,7 @@ use oxc_ast::ast::*;
 
 use std::collections::HashSet;
 
+use super::shapes::ShapeRegistry;
 use crate::error::CompileError;
 use crate::types::{self, TypeBindings, WasmType};
 
@@ -43,6 +44,24 @@ pub struct MethodSig {
     pub return_type: WasmType,
     /// If the method returns a class instance, the class name
     pub return_class: Option<String>,
+    /// For each parameter, the class name if the param is class-typed. Lets
+    /// method-call sites thread an expected-type hint into `{...}` arguments.
+    pub param_classes: Vec<Option<String>>,
+}
+
+/// Resolved field info ready for synthetic-layout assembly. Used by Phase A.2
+/// shape registration; could later be reused if class registration is
+/// refactored to a similar shape.
+#[derive(Debug)]
+pub struct LayoutField {
+    pub name: String,
+    pub wasm_ty: WasmType,
+    /// Set when the field's type is a class or shape reference.
+    /// Recorded into `ClassLayout::field_class_types`.
+    pub class_ref: Option<String>,
+    /// Set when the field's type is `string`.
+    /// Recorded into `ClassLayout::field_string_types`.
+    pub is_string: bool,
 }
 
 /// Registry of all class layouts.
@@ -117,8 +136,17 @@ impl ClassRegistry {
         class_names: &HashSet<String>,
         parent_name: Option<String>,
         is_polymorphic: bool,
+        shape_registry: Option<&ShapeRegistry>,
     ) -> Result<(), CompileError> {
-        self.register_class_with_bindings(class, class_names, parent_name, is_polymorphic, None, None)
+        self.register_class_with_bindings(
+            class,
+            class_names,
+            parent_name,
+            is_polymorphic,
+            None,
+            None,
+            shape_registry,
+        )
     }
 
     /// Bindings-aware class registration: when `override_name` is supplied, the
@@ -138,6 +166,7 @@ impl ClassRegistry {
         is_polymorphic: bool,
         override_name: Option<&str>,
         bindings: Option<&TypeBindings>,
+        shape_registry: Option<&ShapeRegistry>,
     ) -> Result<(), CompileError> {
         let name = if let Some(n) = override_name {
             n.to_string()
@@ -212,7 +241,8 @@ impl ClassRegistry {
 
                     // Track field class type if it's a class reference
                     if let Some(ann) = &prop.type_annotation {
-                        if let Some(class_type) = types::get_class_type_name_with_bindings(ann, bindings)
+                        if let Some(class_type) =
+                            types::get_class_type_name_with_bindings(ann, bindings, shape_registry)
                             && class_names.contains(&class_type)
                         {
                             field_class_types.insert(field_name.clone(), class_type);
@@ -269,6 +299,7 @@ impl ClassRegistry {
                     } else {
                         // Regular method
                         let mut params = Vec::new();
+                        let mut param_classes: Vec<Option<String>> = Vec::new();
                         for param in &func.params.items {
                             let pname = match &param.pattern {
                                 BindingPattern::BindingIdentifier(ident) => {
@@ -287,7 +318,16 @@ impl ClassRegistry {
                                     "method parameter '{pname}' requires type annotation"
                                 )));
                             };
+                            let pclass = param.type_annotation.as_ref().and_then(|ann| {
+                                types::get_class_type_name_with_bindings(
+                                    ann,
+                                    bindings,
+                                    shape_registry,
+                                )
+                                .filter(|cn| class_names.contains(cn))
+                            });
                             params.push((pname, pty));
+                            param_classes.push(pclass);
                         }
                         let ret = if let Some(ann) = &func.return_type {
                             types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
@@ -298,7 +338,13 @@ impl ClassRegistry {
                         let return_class = func
                             .return_type
                             .as_ref()
-                            .and_then(|ann| types::get_class_type_name_with_bindings(ann, bindings))
+                            .and_then(|ann| {
+                                types::get_class_type_name_with_bindings(
+                                    ann,
+                                    bindings,
+                                    shape_registry,
+                                )
+                            })
                             .filter(|cn| class_names.contains(cn));
                         methods.insert(
                             method_name.clone(),
@@ -306,6 +352,7 @@ impl ClassRegistry {
                                 params,
                                 return_type: ret,
                                 return_class,
+                                param_classes,
                             },
                         );
 
@@ -367,6 +414,72 @@ impl ClassRegistry {
                 vtable_methods,
                 vtable_method_map,
                 vtable_offset: 0, // set later during vtable construction
+                own_field_names,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Build a methodless, vtable-less, parent-less `ClassLayout` from a
+    /// pre-resolved field list and insert it under `name`. Field offsets
+    /// follow the slice order; alignment + total-size formulas mirror
+    /// `register_class_with_bindings`.
+    pub fn register_synthetic_layout(
+        &mut self,
+        name: &str,
+        fields: &[LayoutField],
+    ) -> Result<(), CompileError> {
+        let mut field_vec: Vec<(String, u32, WasmType)> = Vec::with_capacity(fields.len());
+        let mut field_map: HashMap<String, (u32, WasmType)> = HashMap::with_capacity(fields.len());
+        let mut field_class_types: HashMap<String, String> = HashMap::new();
+        let mut field_string_types: HashSet<String> = HashSet::new();
+        let mut own_field_names: HashSet<String> = HashSet::with_capacity(fields.len());
+        let mut offset: u32 = 0;
+
+        for f in fields {
+            let align = match f.wasm_ty {
+                WasmType::F64 => 8,
+                WasmType::I32 => 4,
+                _ => 4,
+            };
+            offset = (offset + align - 1) & !(align - 1);
+
+            field_vec.push((f.name.clone(), offset, f.wasm_ty));
+            field_map.insert(f.name.clone(), (offset, f.wasm_ty));
+            own_field_names.insert(f.name.clone());
+
+            if let Some(cn) = &f.class_ref {
+                field_class_types.insert(f.name.clone(), cn.clone());
+            }
+            if f.is_string {
+                field_string_types.insert(f.name.clone());
+            }
+
+            offset += match f.wasm_ty {
+                WasmType::F64 => 8,
+                WasmType::I32 => 4,
+                _ => 4,
+            };
+        }
+
+        let size = if offset == 0 { 0 } else { (offset + 7) & !7 };
+
+        self.classes.insert(
+            name.to_string(),
+            ClassLayout {
+                name: name.to_string(),
+                size,
+                fields: field_vec,
+                field_map,
+                field_class_types,
+                field_string_types,
+                methods: HashMap::new(),
+                parent: None,
+                is_polymorphic: false,
+                vtable_methods: Vec::new(),
+                vtable_method_map: HashMap::new(),
+                vtable_offset: 0,
                 own_field_names,
             },
         );

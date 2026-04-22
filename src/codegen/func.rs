@@ -60,6 +60,11 @@ pub struct FuncContext<'a> {
     /// in this map, the binding substitutes for the annotation during type
     /// resolution. `None` for non-generic code.
     pub type_bindings: Option<TypeBindings>,
+    /// If the enclosing function/method has a declared class-typed return, the
+    /// class name. Consumed by `emit_return` to thread an expected-type hint
+    /// into `ObjectExpression` return arguments so a `{...}` literal can
+    /// resolve against the declared shape.
+    pub return_class: Option<String>,
 }
 
 pub(crate) struct LoopLabels {
@@ -100,6 +105,7 @@ impl<'a> FuncContext<'a> {
             source_map: Vec::new(),
             method_receiver_override: None,
             type_bindings: None,
+            return_class: None,
         }
     }
 
@@ -275,7 +281,8 @@ impl<'a> FuncContext<'a> {
                     }
                     // Look up function return type
                     if let Some((_, ret_ty)) = self.module_ctx.get_func(name) {
-                        return Ok((ret_ty, None));
+                        let class = self.module_ctx.fn_return_classes.get(name).cloned();
+                        return Ok((ret_ty, class));
                     }
                     // Look up closure variable return type
                     if let Some(sig) = self.local_closure_sigs.get(name) {
@@ -345,6 +352,42 @@ impl<'a> FuncContext<'a> {
                     "cannot infer type — add a type annotation",
                 ))
             }
+            Expression::ComputedMemberExpression(member) => {
+                // Tuple `t[N]` (literal N) → slot type + class (if any).
+                if let Ok(obj_class) = self.resolve_expr_class(&member.object)
+                    && let Some(&shape_idx) =
+                        self.module_ctx.shape_registry.by_name.get(&obj_class)
+                    && self.module_ctx.shape_registry.shapes[shape_idx].is_tuple
+                    && let Some(layout) = self.module_ctx.class_registry.get(&obj_class)
+                {
+                    let Some(idx) = tuple_init_literal_index(&member.expression) else {
+                        return Err(CompileError::type_err(format!(
+                            "tuple '{obj_class}' requires a literal numeric index; dynamic \
+                             `t[i]` is not supported — use `Array<T>` if slots share a type"
+                        )));
+                    };
+                    if idx >= layout.fields.len() {
+                        return Err(CompileError::type_err(format!(
+                            "tuple index {idx} out of bounds for '{obj_class}' (arity {})",
+                            layout.fields.len()
+                        )));
+                    }
+                    let (slot_name, _, slot_ty) = &layout.fields[idx];
+                    let class = layout.field_class_types.get(slot_name).cloned();
+                    return Ok((*slot_ty, class));
+                }
+                // Array<T> element: `arr[i]` → element type (+ optional class).
+                if let Expression::Identifier(ident) = &member.object {
+                    let name = ident.name.as_str();
+                    if let Some(&elem_ty) = self.local_array_elem_types.get(name) {
+                        let class = self.local_array_elem_classes.get(name).cloned();
+                        return Ok((elem_ty, class));
+                    }
+                }
+                Err(CompileError::type_err(
+                    "cannot infer type from computed member access — add a type annotation",
+                ))
+            }
             // Arrow functions are closure pointers (i32)
             Expression::ArrowFunctionExpression(_) => Ok((WasmType::I32, None)),
             // Array literals [a, b, c] are pointers into the arena. Element
@@ -359,6 +402,9 @@ impl<'a> FuncContext<'a> {
                     Ok((WasmType::I32, None))
                 }
             }
+            // Object literals are arena pointers; the declarator path resolves
+            // the class name post-emit from the returned fingerprint.
+            Expression::ObjectExpression(_) => Ok((WasmType::I32, None)),
             _ => Err(CompileError::type_err(
                 "cannot infer type from this expression — add a type annotation",
             )),
@@ -653,5 +699,22 @@ fn collect_local_decls(stmt: &Statement, out: &mut HashSet<String>) {
         Statement::WhileStatement(w) => collect_local_decls(&w.body, out),
         Statement::DoWhileStatement(d) => collect_local_decls(&d.body, out),
         _ => {}
+    }
+}
+
+/// Extract a non-negative integer literal from a tuple-index expression used
+/// in `infer_init_type`. Mirrors the helpers in `class.rs` and `member.rs`;
+/// if more sites need it, promote to a shared utility.
+fn tuple_init_literal_index(expr: &Expression<'_>) -> Option<usize> {
+    match expr {
+        Expression::ParenthesizedExpression(p) => tuple_init_literal_index(&p.expression),
+        Expression::NumericLiteral(lit) => {
+            let v = lit.value;
+            if v.fract() != 0.0 || v < 0.0 {
+                return None;
+            }
+            Some(v as usize)
+        }
+        _ => None,
     }
 }

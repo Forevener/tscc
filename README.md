@@ -1,6 +1,6 @@
 # tscc — TypeScript → WebAssembly AOT compiler
 
-**Status:** pre-release (0.0.1). 384 tests, 0 clippy warnings.
+**Status:** pre-release (0.0.1). 571 tests, 0 clippy warnings.
 
 A standalone TypeScript-to-WebAssembly ahead-of-time compiler. Compiles a typed static subset of TypeScript to deterministic, GC-free WebAssembly suitable for game scripting, plugins, sandboxed user code, and replay- or consensus-style systems where same-input-same-output is load-bearing.
 
@@ -63,6 +63,9 @@ tscc has: full closures, arena allocation (no GC), deterministic output, complet
 - **Const enums.**
 - **Generics (Phase A):** explicit type-arg form — `class Box<T>`, `class Pair<K, V>`, `function identity<T>(x: T): T`. Monomorphized per instantiation.
 - **Maps:** `Map<K, V>` with open-addressing hash tables, specialized per concrete `(K, V)` pair.
+- **Object literals / structural types:** `type P = { x: number; y: number }`, `interface` (with single `extends`), inline `{x: number}` annotations, shorthand `{ x, y }`, spread `{ ...a, x: 1 }`, destructuring. Anonymous and named shapes share one synthetic-class registry — `{x, y}` and `{y, x}` are the same shape. Structural width-coercion on assignment (zero-copy when layouts align, field-pick copy otherwise). `readonly` accepted as a no-op; `?:` optional fields deferred with union types.
+- **Tuples:** `[string, number]`, `t[0]` / `t[1]` literal-indexed access, destructuring `const [a, b] = t`, named-member syntax `[x: number, y: number]` (labels discarded). Dynamic `t[i]` is rejected — use `Array<T>` when slots share a type.
+- **Generic shapes:** `type Pair<T, U> = { first: T; second: U }` monomorphizes alongside generic classes. `Pair<i32, f64>`, `Pair<Box<i32>, string>`, etc.
 
 ### Syntax
 

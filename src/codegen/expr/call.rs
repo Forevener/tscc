@@ -5,6 +5,21 @@ use crate::codegen::func::FuncContext;
 use crate::error::CompileError;
 use crate::types::WasmType;
 
+/// Best-effort compile-time integer extraction for validating constant
+/// arguments (e.g. `toString(16)`'s radix). Returns `None` when the expression
+/// is non-literal or non-integer; callers should defer validation to the
+/// runtime helper for those cases.
+fn const_int_arg(expr: &Expression<'_>) -> Option<i64> {
+    match expr {
+        Expression::NumericLiteral(lit) if lit.value.fract() == 0.0 => Some(lit.value as i64),
+        Expression::UnaryExpression(u) if matches!(u.operator, UnaryOperator::UnaryNegation) => {
+            const_int_arg(&u.argument).map(|v| -v)
+        }
+        Expression::ParenthesizedExpression(p) => const_int_arg(&p.expression),
+        _ => None,
+    }
+}
+
 impl<'a> FuncContext<'a> {
     pub(crate) fn emit_call(
         &mut self,
@@ -42,17 +57,9 @@ impl<'a> FuncContext<'a> {
             return Ok(result);
         }
 
-        // Check for String.fromCharCode(code)
-        if let Expression::StaticMemberExpression(member) = &call.callee
-            && let Expression::Identifier(obj) = &member.object
-            && obj.name.as_str() == "String"
-            && member.property.name.as_str() == "fromCharCode"
-            && call.arguments.len() == 1
-        {
-            self.emit_expr(call.arguments[0].to_expression())?;
-            let (func_idx, _) = self.module_ctx.get_func("__str_fromCharCode").unwrap();
-            self.push(Instruction::Call(func_idx));
-            return Ok(WasmType::I32);
+        // Check for String.<static> calls (fromCharCode, fromCodePoint)
+        if let Some(result) = self.try_emit_string_static_call(call)? {
+            return Ok(result);
         }
 
         // Check for string method calls (str.indexOf, str.slice, etc.)
@@ -69,6 +76,11 @@ impl<'a> FuncContext<'a> {
         // before the generic class-method dispatch — Map's layout is
         // synthesized and has no registered methods to fall through to.
         if let Some(result) = self.try_emit_map_method_call(call)? {
+            return Ok(result);
+        }
+
+        // Same story for Set<T> — synthesized layout, no registered methods.
+        if let Some(result) = self.try_emit_set_method_call(call)? {
             return Ok(result);
         }
 
@@ -217,9 +229,28 @@ impl<'a> FuncContext<'a> {
             )
         })?;
 
-        // Emit arguments
-        for arg in &call.arguments {
-            self.emit_expr(arg.to_expression())?;
+        // Emit arguments, threading callee parameter class names into
+        // ObjectExpression and tuple-typed ArrayExpression arguments.
+        let param_classes = self.module_ctx.fn_param_classes.get(callee_name).cloned();
+        for (i, arg) in call.arguments.iter().enumerate() {
+            let expr = arg.to_expression();
+            let expected = param_classes
+                .as_ref()
+                .and_then(|pc| pc.get(i))
+                .and_then(|c| c.as_deref());
+            match (expr, expected) {
+                (Expression::ObjectExpression(obj), Some(expected_name)) => {
+                    self.emit_object_literal(obj, Some(expected_name))?;
+                }
+                (Expression::ArrayExpression(arr), Some(expected_name))
+                    if self.is_tuple_shape(expected_name) =>
+                {
+                    self.emit_tuple_literal(arr, expected_name)?;
+                }
+                _ => {
+                    self.emit_expr_coerced(expr, expected)?;
+                }
+            }
         }
 
         self.push(Instruction::Call(func_idx));
@@ -343,6 +374,163 @@ impl<'a> FuncContext<'a> {
                 "Array.{method_name} is not supported"
             ))),
         }
+    }
+
+    /// Dispatch `String.<static>(...)` calls. Returns `Some` if recognized.
+    ///
+    /// - `String.fromCharCode(...codes)` — variadic; each code is stored as a
+    ///   single byte (low 8 bits). tscc strings are UTF-8 byte sequences, so
+    ///   codes above 0xFF are truncated — matching existing behavior for
+    ///   1-arg calls, just lifted to N args.
+    /// - `String.fromCodePoint(...cps)` — variadic; each code point is
+    ///   UTF-8-encoded (1-4 bytes) via `__utf8_encode_cp`. Allocates the
+    ///   worst-case `N*4 + 4` bytes and rewinds the arena by the unused tail
+    ///   after encoding — single allocation, no waste.
+    pub(crate) fn try_emit_string_static_call(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
+        let (obj_name, method_name) = match &call.callee {
+            Expression::StaticMemberExpression(member) => {
+                let obj = match &member.object {
+                    Expression::Identifier(ident) => ident.name.as_str(),
+                    _ => return Ok(None),
+                };
+                (obj, member.property.name.as_str())
+            }
+            _ => return Ok(None),
+        };
+        if obj_name != "String" {
+            return Ok(None);
+        }
+        match method_name {
+            "fromCharCode" => {
+                self.emit_string_from_char_code(call)?;
+                Ok(Some(WasmType::I32))
+            }
+            "fromCodePoint" => {
+                self.emit_string_from_code_point(call)?;
+                Ok(Some(WasmType::I32))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Emit `String.fromCharCode(...codes)` inline — allocate 4+N bytes,
+    /// write length=N, then store each code as a single byte. Empty-arg form
+    /// returns the deduplicated empty-string static.
+    fn emit_string_from_char_code(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        let n = call.arguments.len() as i32;
+        if n == 0 {
+            let offset = self.module_ctx.alloc_static_string("");
+            self.push(Instruction::I32Const(offset as i32));
+            return Ok(());
+        }
+
+        let total = 4 + n;
+        self.push(Instruction::I32Const(total));
+        let ptr_local = self.emit_arena_alloc_to_local(true)?;
+
+        // length header
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(n));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // bytes
+        for (i, arg) in call.arguments.iter().enumerate() {
+            self.push(Instruction::LocalGet(ptr_local));
+            self.emit_expr(arg.to_expression())?;
+            self.push(Instruction::I32Store8(wasm_encoder::MemArg {
+                offset: (4 + i as u64),
+                align: 0,
+                memory_index: 0,
+            }));
+        }
+
+        self.push(Instruction::LocalGet(ptr_local));
+        Ok(())
+    }
+
+    /// Emit `String.fromCodePoint(...cps)` inline — allocate `4 + N*4` bytes
+    /// (worst case), encode each code point via `__utf8_encode_cp`, then
+    /// write the length header and rewind the arena to the actual end. The
+    /// helper traps on code points outside [0, 0x10FFFF].
+    fn emit_string_from_code_point(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<(), CompileError> {
+        let n = call.arguments.len() as i32;
+        if n == 0 {
+            let offset = self.module_ctx.alloc_static_string("");
+            self.push(Instruction::I32Const(offset as i32));
+            return Ok(());
+        }
+
+        // Evaluate each argument once into an i32 local to preserve JS
+        // left-to-right evaluation order before any allocation / encoding
+        // side effects.
+        let mut arg_locals = Vec::with_capacity(call.arguments.len());
+        for arg in &call.arguments {
+            let local = self.alloc_local(WasmType::I32);
+            self.emit_expr(arg.to_expression())?;
+            self.push(Instruction::LocalSet(local));
+            arg_locals.push(local);
+        }
+
+        let arena_idx = self
+            .module_ctx
+            .arena_ptr_global
+            .ok_or_else(|| CompileError::codegen("arena not initialized"))?;
+
+        // Worst-case alloc: 4 (header) + N * 4 bytes.
+        self.push(Instruction::I32Const(4 + n * 4));
+        let ptr_local = self.emit_arena_alloc_to_local(true)?;
+
+        // cursor = ptr + 4
+        let cursor = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Const(4));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(cursor));
+
+        let (encode_idx, _) = self.module_ctx.get_func("__utf8_encode_cp").unwrap();
+        for cp_local in &arg_locals {
+            // cursor += __utf8_encode_cp(cursor, cp)
+            self.push(Instruction::LocalGet(cursor));
+            self.push(Instruction::LocalGet(cursor));
+            self.push(Instruction::LocalGet(*cp_local));
+            self.push(Instruction::Call(encode_idx));
+            self.push(Instruction::I32Add);
+            self.push(Instruction::LocalSet(cursor));
+        }
+
+        // length header = cursor - (ptr + 4)
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::LocalGet(cursor));
+        self.push(Instruction::LocalGet(ptr_local));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::I32Const(4));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // Rewind arena to the end of the actually-encoded bytes. Safe because
+        // we control the entire sequence — nothing else allocated in between.
+        self.push(Instruction::LocalGet(cursor));
+        self.push(Instruction::GlobalSet(arena_idx));
+
+        self.push(Instruction::LocalGet(ptr_local));
+        Ok(())
     }
 
     pub(crate) fn expr_is_array(&self, expr: &Expression<'a>) -> bool {
@@ -561,28 +749,71 @@ impl<'a> FuncContext<'a> {
 
         match method {
             "toString" => {
-                if !call.arguments.is_empty() {
+                if call.arguments.len() > 1 {
                     return Err(CompileError::codegen(
-                        "Number.prototype.toString() does not accept arguments in tscc",
+                        "Number.prototype.toString() takes 0 or 1 arguments (radix)",
                     ));
                 }
+                // Literal-radix validation: compile-time error for out-of-range
+                // constants so users catch typos (e.g. `.toString(1)`) without
+                // a runtime silent-fallback. Non-literal radices skip this and
+                // rely on the helper's runtime check.
+                if let Some(arg0) = call.arguments.first()
+                    && let Some(r) = const_int_arg(arg0.to_expression())
+                    && !(2..=36).contains(&r)
+                {
+                    return Err(CompileError::codegen(format!(
+                        "toString() radix must be between 2 and 36, got {r}"
+                    )));
+                }
                 let ty = self.emit_expr(&member.object)?;
-                match ty {
-                    WasmType::I32 => {
-                        let (func_idx, _) =
-                            self.module_ctx.get_func("__str_from_i32").unwrap();
-                        self.push(Instruction::Call(func_idx));
+                if call.arguments.is_empty() {
+                    match ty {
+                        WasmType::I32 => {
+                            let (func_idx, _) =
+                                self.module_ctx.get_func("__str_from_i32").unwrap();
+                            self.push(Instruction::Call(func_idx));
+                        }
+                        WasmType::F64 => {
+                            let (func_idx, _) =
+                                self.module_ctx.get_func("__str_from_f64").unwrap();
+                            self.push(Instruction::Call(func_idx));
+                        }
+                        _ => {
+                            return Err(CompileError::type_err(
+                                "toString() requires a numeric receiver",
+                            ));
+                        }
                     }
-                    WasmType::F64 => {
-                        let (func_idx, _) =
-                            self.module_ctx.get_func("__str_from_f64").unwrap();
-                        self.push(Instruction::Call(func_idx));
+                } else {
+                    // Widen i32 receivers to f64 so a single helper handles
+                    // both — i32 → f64 is lossless and saves authoring a
+                    // separate `__str_from_i32_radix`.
+                    match ty {
+                        WasmType::I32 => self.push(Instruction::F64ConvertI32S),
+                        WasmType::F64 => {}
+                        _ => {
+                            return Err(CompileError::type_err(
+                                "toString() requires a numeric receiver",
+                            ));
+                        }
                     }
-                    _ => {
+                    let radix_ty =
+                        self.emit_expr(call.arguments[0].to_expression())?;
+                    if radix_ty == WasmType::F64 {
+                        self.push(Instruction::I32TruncSatF64S);
+                    } else if radix_ty != WasmType::I32 {
                         return Err(CompileError::type_err(
-                            "toString() requires a numeric receiver",
+                            "toString() radix must be a number",
                         ));
                     }
+                    let (func_idx, _) = self
+                        .module_ctx
+                        .get_func("__str_from_f64_radix")
+                        .ok_or_else(|| {
+                            CompileError::codegen("__str_from_f64_radix not registered")
+                        })?;
+                    self.push(Instruction::Call(func_idx));
                 }
                 Ok(Some(WasmType::I32))
             }

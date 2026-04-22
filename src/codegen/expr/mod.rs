@@ -6,7 +6,10 @@ mod class;
 mod closure;
 mod map;
 mod member;
+mod object;
+mod set;
 mod string;
+mod tuple;
 
 use oxc_ast::ast::*;
 use wasm_encoder::Instruction;
@@ -50,21 +53,72 @@ impl<'a> FuncContext<'a> {
             Expression::ArrowFunctionExpression(arrow) => self.emit_arrow_closure(arrow),
             Expression::StringLiteral(s) => self.emit_string_literal(s),
             Expression::TemplateLiteral(tpl) => self.emit_template_literal(tpl),
+            Expression::TaggedTemplateExpression(tagged) => {
+                self.emit_tagged_template(tagged)
+            }
             Expression::ArrayExpression(arr) => self.emit_array_literal(arr, None),
+            Expression::ObjectExpression(obj) => {
+                let (ty, _) = self.emit_object_literal(obj, None)?;
+                Ok(ty)
+            }
             _ => {
-                let span_start = match expr {
-                    Expression::ObjectExpression(o) => o.span.start,
-                    _ => 0,
-                };
                 let err =
                     CompileError::unsupported(format!("expression type: {}", expr_kind_name(expr)));
-                if span_start > 0 {
-                    Err(self.locate(err, span_start))
-                } else {
-                    Err(err)
-                }
+                Err(err)
             }
         }
+    }
+
+    /// Like `emit_expr` but forwards an `expected` class-name hint to literal
+    /// emitters that can consume one: object literals and tuple literals.
+    /// For any other expression, `expected` is ignored — this is a
+    /// semantic-free pass-through except at the literal sites.
+    ///
+    /// Direct callers (declarator, assignment, return, call-arg) usually
+    /// reach `emit_object_literal` / `emit_tuple_literal` directly to get
+    /// the resolved class back. This wrapper is the generic entry point
+    /// and handles paren-wrapped forwarding.
+    #[allow(
+        dead_code,
+        reason = "entry point for future literal-kind hints; Phase D sites reach tuple / object emitters directly"
+    )]
+    pub fn emit_expr_with_expected(
+        &mut self,
+        expr: &Expression<'a>,
+        expected: Option<&str>,
+    ) -> Result<WasmType, CompileError> {
+        match expr {
+            Expression::ObjectExpression(obj) => {
+                let (ty, _) = self.emit_object_literal(obj, expected)?;
+                Ok(ty)
+            }
+            Expression::ArrayExpression(arr) => {
+                // Route tuple-typed array literals to the tuple emitter.
+                if let Some(target) = expected
+                    && self.is_tuple_shape(target)
+                {
+                    let (ty, _) = self.emit_tuple_literal(arr, target)?;
+                    return Ok(ty);
+                }
+                self.emit_array_literal(arr, None)
+            }
+            Expression::ParenthesizedExpression(p) => {
+                self.emit_expr_with_expected(&p.expression, expected)
+            }
+            _ => self.emit_expr(expr),
+        }
+    }
+
+    /// True iff `name` is a registered tuple shape. Used at each
+    /// expected-type hook point to decide whether an `ArrayExpression`
+    /// routes through `emit_tuple_literal` or through the regular
+    /// `emit_array_literal` path.
+    pub(crate) fn is_tuple_shape(&self, name: &str) -> bool {
+        self.module_ctx
+            .shape_registry
+            .by_name
+            .get(name)
+            .is_some_and(|&i| self.module_ctx.shape_registry.shapes[i].is_tuple)
     }
 
     fn emit_numeric_literal(&mut self, lit: &NumericLiteral) -> Result<WasmType, CompileError> {
@@ -87,7 +141,10 @@ impl<'a> FuncContext<'a> {
     }
     fn emit_as_cast(&mut self, as_expr: &TSAsExpression<'a>) -> Result<WasmType, CompileError> {
         // Check for class downcast/upcast first
-        let target_class = crate::types::get_class_type_name_from_ts_type(&as_expr.type_annotation);
+        let target_class = crate::types::get_class_type_name_from_ts_type(
+            &as_expr.type_annotation,
+            Some(&self.module_ctx.shape_registry),
+        );
         if let Some(ref target_name) = target_class
             && self.module_ctx.class_names.contains(target_name)
         {

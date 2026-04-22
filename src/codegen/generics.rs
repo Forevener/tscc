@@ -35,6 +35,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, TypeBindings};
 
 use super::map_builtins::{self, MapInstantiation};
+use super::set_builtins::{self, SetInstantiation};
 
 /// A generic class declaration captured for later monomorphization.
 #[derive(Debug)]
@@ -83,12 +84,14 @@ pub type LocalTypeEnv = HashMap<String, BoundType>;
 /// this up at codegen time to route through the right function.
 /// `map_insts` carries the compiler-owned `Map<K, V>` instantiations seen in
 /// user source; they travel alongside user classes but go through a separate
-/// registration path (no AST).
+/// registration path (no AST). `set_insts` is the analogous channel for
+/// `Set<T>`.
 pub struct CollectResult {
     pub class_insts: Vec<ClassInstantiation>,
     pub fn_insts: Vec<FnInstantiation>,
     pub inferred_call_sites: HashMap<u32, String>,
     pub map_insts: Vec<MapInstantiation>,
+    pub set_insts: Vec<SetInstantiation>,
 }
 
 /// Walk the program body and collect all generic class/function templates.
@@ -302,6 +305,8 @@ pub fn collect_instantiations<'a>(
         inferred_sites: HashMap::new(),
         maps: Vec::new(),
         maps_seen: HashSet::new(),
+        sets: Vec::new(),
+        sets_seen: HashSet::new(),
     };
 
     let empty_locals = LocalTypeEnv::new();
@@ -345,6 +350,7 @@ pub fn collect_instantiations<'a>(
         fn_insts: walker.fns.into_vec_fn(),
         inferred_call_sites: walker.inferred_sites,
         map_insts: walker.maps,
+        set_insts: walker.sets,
     })
 }
 
@@ -419,6 +425,9 @@ struct Walker<'a, 'ctx> {
     /// on the mangled name.
     maps: Vec<MapInstantiation>,
     maps_seen: HashSet<String>,
+    /// Set<T> instantiations — same dedup discipline as `maps`.
+    sets: Vec<SetInstantiation>,
+    sets_seen: HashSet<String>,
 }
 
 impl Walker<'_, '_> {
@@ -429,6 +438,16 @@ impl Walker<'_, '_> {
                 mangled_name: mangled,
                 key_ty,
                 value_ty,
+            });
+        }
+    }
+
+    fn record_set_inst(&mut self, elem_ty: BoundType) {
+        let mangled = set_builtins::mangle_set_name(&elem_ty);
+        if self.sets_seen.insert(mangled.clone()) {
+            self.sets.push(SetInstantiation {
+                mangled_name: mangled,
+                elem_ty,
             });
         }
     }
@@ -702,6 +721,20 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                     }
                     return Ok(());
                 }
+                if set_builtins::is_set_base(name) {
+                    if args.params.len() != set_builtins::SET_ARITY {
+                        return Err(CompileError::type_err(format!(
+                            "Set<T> expects 1 type argument, got {}",
+                            args.params.len()
+                        )));
+                    }
+                    let elem_ty = resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                    self.record_set_inst(elem_ty);
+                    for arg in &args.params {
+                        self.walk_ts_type(arg, bindings)?;
+                    }
+                    return Ok(());
+                }
                 if let Some(template) = self.class_templates.get(name) {
                     if args.params.len() != template.type_params.len() {
                         return Err(CompileError::type_err(format!(
@@ -758,6 +791,22 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                         let value_ty =
                             resolve_bound_type(&args.params[1], self.class_names, bindings)?;
                         self.record_map_inst(key_ty, value_ty);
+                        for arg in &args.params {
+                            self.walk_ts_type(arg, bindings)?;
+                        }
+                    }
+                    if set_builtins::is_set_base(name)
+                        && let Some(args) = new_expr.type_arguments.as_ref()
+                    {
+                        if args.params.len() != set_builtins::SET_ARITY {
+                            return Err(CompileError::type_err(format!(
+                                "Set<T> expects 1 type argument, got {}",
+                                args.params.len()
+                            )));
+                        }
+                        let elem_ty =
+                            resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                        self.record_set_inst(elem_ty);
                         for arg in &args.params {
                             self.walk_ts_type(arg, bindings)?;
                         }

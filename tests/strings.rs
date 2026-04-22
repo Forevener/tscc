@@ -2,7 +2,7 @@ mod common;
 
 use wasmtime::*;
 
-use common::{compile, read_wasm_string};
+use common::{compile, compile_err, read_wasm_string};
 
 #[test]
 fn string_concat_method() {
@@ -312,6 +312,63 @@ fn string_comparison() {
         .get_typed_func::<(), i32>(&mut store, "test")
         .unwrap();
     assert_eq!(test.call(&mut store, ()).unwrap(), 1111);
+}
+
+/// String.prototype.localeCompare — byte-order lex compare. No locales or
+/// options: ICU would be required for those, outside the typed-subset bar.
+/// Returns -1 / 0 / 1 (the `Ordering as i32` from `__str_cmp`).
+#[test]
+fn string_locale_compare_basic() {
+    let wasm = compile(
+        r#"
+        export function less(): i32    { return "apple".localeCompare("banana"); }
+        export function greater(): i32 { return "banana".localeCompare("apple"); }
+        export function equal(): i32   { return "cherry".localeCompare("cherry"); }
+        export function prefix(): i32  { return "app".localeCompare("apple"); }
+        export function suffix(): i32  { return "apple".localeCompare("app"); }
+        export function empty_rhs(): i32 { return "x".localeCompare(""); }
+        export function empty_lhs(): i32 { return "".localeCompare("x"); }
+        export function empty_both(): i32 { return "".localeCompare(""); }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    for (name, expected) in [
+        ("less", -1),
+        ("greater", 1),
+        ("equal", 0),
+        ("prefix", -1),
+        ("suffix", 1),
+        ("empty_rhs", 1),
+        ("empty_lhs", -1),
+        ("empty_both", 0),
+    ] {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, name)
+            .unwrap();
+        assert_eq!(f.call(&mut store, ()).unwrap(), expected, "{name}");
+    }
+}
+
+/// localeCompare accepts exactly one argument — the locales/options forms
+/// are rejected at compile time so users don't silently get byte compares
+/// when they thought they were getting collation.
+#[test]
+fn string_locale_compare_rejects_extra_args() {
+    let err = compile_err(
+        r#"
+        export function test(): i32 {
+            return "a".localeCompare("b", "en-US");
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("localeCompare expects exactly 1 argument"),
+        "unexpected error: {msg}"
+    );
 }
 
 #[test]
@@ -1548,6 +1605,117 @@ fn number_to_string_f64_js_conformance() {
     }
 }
 
+/// Number.prototype.toString(radix) — integer and fractional values in
+/// non-decimal bases. Radix 10 short-circuits to __str_from_f64 at codegen
+/// time, so the interesting paths are hex/binary/base-36 on both integer
+/// and float receivers.
+#[test]
+fn number_to_string_radix_basic() {
+    let wasm = compile(
+        r#"
+        export function i32_hex(): i32   { let x: i32 = 255; return x.toString(16); }
+        export function i32_binary(): i32 { let x: i32 = 10; return x.toString(2); }
+        export function i32_base36(): i32 { let x: i32 = 35; return x.toString(36); }
+        export function i32_negative(): i32 { let x: i32 = -255; return x.toString(16); }
+        export function f64_int_hex(): i32 { let x: f64 = 255.0; return x.toString(16); }
+        export function f64_half_binary(): i32 { let x: f64 = 0.5; return x.toString(2); }
+        export function f64_tenth_binary(): i32 {
+            // (0.1).toString(2) emits the bounded repeating binary expansion.
+            // V8 produces "0.0001100110011001100110011001100110011001100110011001101".
+            let x: f64 = 0.1; return x.toString(2);
+        }
+        export function zero(): i32 { let x: i32 = 0; return x.toString(2); }
+        export function negative_f64(): i32 { let x: f64 = -10.5; return x.toString(2); }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+    for (func_name, expected) in [
+        ("i32_hex", "ff"),
+        ("i32_binary", "1010"),
+        ("i32_base36", "z"),
+        ("i32_negative", "-ff"),
+        ("f64_int_hex", "ff"),
+        ("f64_half_binary", "0.1"),
+        (
+            "f64_tenth_binary",
+            "0.0001100110011001100110011001100110011001100110011001101",
+        ),
+        ("zero", "0"),
+        ("negative_f64", "-1010.1"),
+    ] {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, func_name)
+            .unwrap();
+        let ptr = f.call(&mut store, ()).unwrap();
+        assert_eq!(
+            read_wasm_string(&store, &memory, ptr),
+            expected,
+            "toString({func_name})"
+        );
+    }
+}
+
+/// Radix 10 and out-of-range radices: radix 10 routes through __str_from_f64
+/// (same output as the no-arg form); radix literal outside [2, 36] is a
+/// compile-time error.
+#[test]
+fn number_to_string_radix_edge_cases() {
+    let wasm = compile(
+        r#"
+        export function radix_10(): i32  { let x: f64 = 3.14; return x.toString(10); }
+        export function nan_hex(): i32   { let x: f64 = 0.0 / 0.0; return x.toString(16); }
+        export function inf_hex(): i32   { let x: f64 = 1.0 / 0.0; return x.toString(16); }
+        export function neg_inf_hex(): i32 { let x: f64 = -1.0 / 0.0; return x.toString(16); }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+    for (func_name, expected) in [
+        ("radix_10", "3.14"),
+        ("nan_hex", "NaN"),
+        ("inf_hex", "Infinity"),
+        ("neg_inf_hex", "-Infinity"),
+    ] {
+        let f = instance
+            .get_typed_func::<(), i32>(&mut store, func_name)
+            .unwrap();
+        let ptr = f.call(&mut store, ()).unwrap();
+        assert_eq!(
+            read_wasm_string(&store, &memory, ptr),
+            expected,
+            "toString({func_name})"
+        );
+    }
+}
+
+/// Radix literal outside [2, 36] is rejected at compile time so typos like
+/// `.toString(1)` fail loudly instead of silently falling back to base 10.
+#[test]
+fn number_to_string_radix_out_of_range_rejected() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            let x: i32 = 10;
+            return x.toString(1);
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("radix must be between 2 and 36"),
+        "unexpected error: {msg}"
+    );
+}
+
 /// Correctly-rounded parseFloat via `f64::from_str`. Includes cases where
 /// the hand-written parser's naïve `int + frac/div` accumulator was wrong
 /// (long fractional strings near an ULP boundary) and JS-specific prefix
@@ -2535,3 +2703,200 @@ fn number_to_precision_one_digit_carry_to_exp() {
     assert_eq!(read_wasm_string(&store, &memory, ptr), "1e+1");
 }
 
+#[test]
+fn string_from_char_code_variadic() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.fromCharCode(72, 101, 108, 108, 111);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "Hello");
+}
+
+#[test]
+fn string_from_char_code_empty() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.fromCharCode();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "");
+}
+
+#[test]
+fn string_from_code_point_ascii_and_emoji() {
+    // Covers all four UTF-8 encoding widths: 1-byte ASCII, 2-byte Latin,
+    // 3-byte BMP, and 4-byte supplementary.
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            // "Aé€😀" — 1 + 2 + 3 + 4 bytes.
+            return String.fromCodePoint(65, 233, 8364, 128512);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "Aé€😀");
+}
+
+#[test]
+fn string_from_code_point_single() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.fromCodePoint(128640);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "🚀");
+}
+
+#[test]
+fn string_from_code_point_empty() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.fromCodePoint();
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "");
+}
+
+#[test]
+fn string_from_code_point_traps_out_of_range() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.fromCodePoint(0x110000);
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let err = test.call(&mut store, ()).unwrap_err();
+    // wasmtime surfaces the trap via the helper's stack frame; the concrete
+    // message varies by runtime version, so just assert the helper is on the
+    // backtrace.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("__utf8_encode_cp") || msg.contains("unreachable"),
+        "expected trap for out-of-range code point, got: {msg}"
+    );
+}
+
+#[test]
+fn string_raw_no_interpolation() {
+    // String.raw preserves raw source — escapes stay as literal backslash+char.
+    // (tscc's regular template literal currently also uses `.raw`, so both
+    // forms happen to match today; String.raw is a dedicated path so the
+    // future cooked-string fix doesn't break raw's semantics.)
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            return String.raw`Hello\nWorld`;
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "Hello\\nWorld");
+}
+
+#[test]
+fn string_raw_with_interpolation() {
+    let wasm = compile(
+        r#"
+        export function test(): i32 {
+            const n: i32 = 42;
+            return String.raw`answer=${n}`;
+        }
+    "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Instance::new(&mut store, &module, &[]).unwrap();
+    let test = instance
+        .get_typed_func::<(), i32>(&mut store, "test")
+        .unwrap();
+    let ptr = test.call(&mut store, ()).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, ptr), "answer=42");
+}
+
+#[test]
+fn string_raw_rejects_unknown_tag() {
+    let err = compile_err(
+        r#"
+        export function bad(): i32 {
+            return String.notRaw`hi`;
+        }
+    "#,
+    );
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("String.raw"),
+        "expected String.raw error, got: {msg}"
+    );
+}

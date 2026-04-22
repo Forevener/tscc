@@ -1,49 +1,31 @@
-//! Per-monomorphization method dispatch for compiler-owned `Map<K, V>`.
+//! Per-monomorphization method dispatch for compiler-owned `Set<T>`.
 //!
-//! Map methods are emitted inline at each call site rather than registered as
-//! real WASM functions — this lets us specialize hashing + key equality per
-//! (K, V) without paying the call overhead. The dispatcher returns `Ok(None)`
-//! when the call's receiver is not a Map, so upstream dispatchers keep their
-//! normal fall-through behavior.
+//! Set methods are emitted inline at each call site, mirroring the Map path:
+//! per-(T) specialization avoids a call boundary and lets us pick the right
+//! hash + equality helpers without generic dispatch overhead. Returns
+//! `Ok(None)` when the call's receiver isn't a Set so upstream dispatchers
+//! keep their normal fall-through behavior.
 //!
-//! ## Probing & insertion order
+//! Shares semantics with `expr/map.rs` (same probing, same insertion-chain
+//! bookkeeping, same rebuild-on-grow policy). The differences from Map:
 //!
-//! Open-addressing linear probing: `slot = (hash(k) + i) & (capacity - 1)`
-//! where `capacity` is always a power of two. A bucket's `state` byte is
-//! `EMPTY` / `OCCUPIED` / `TOMBSTONE`; a probe walking a key stops as soon as
-//! it hits an `EMPTY` slot (definite miss). Tombstones are skipped on find
-//! and reused on insert, so delete+reinsert never wastes a slot.
-//!
-//! Iteration order matches JS spec (insertion order). Each occupied bucket
-//! stores `prev_insert` / `next_insert` pointers forming a doubly-linked list
-//! threaded through the bucket array; `head_idx` / `tail_idx` on the header
-//! mark its ends. `forEach` walks the chain from `head`. `set` appends a
-//! fresh entry to the tail; `delete` unlinks in place. Rebuild-on-grow (C.4)
-//! walks the old chain to preserve order into the new array.
-//!
-//! ## Load factor & growth
-//!
-//! `set` checks `size * 4 >= capacity * 3` **before** probing for an
-//! insertion slot, so the probe always runs on a ≥25%-empty array and always
-//! terminates. When the check trips, `emit_map_rebuild` doubles capacity,
-//! walks the old insertion chain, and re-inserts each entry into fresh
-//! buckets — tombstones get collected out and the chain is rewoven with new
-//! indices.
+//! - Bucket has no value slot — `add(v)` writes only the element.
+//! - `forEach((v) => ...)` takes exactly one parameter.
+//! - Methods use element-centric names: `add` instead of `set`, a single
+//!   argument throughout.
 
 use oxc_ast::ast::*;
 use wasm_encoder::{BlockType, Instruction, MemArg};
 
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
-use crate::codegen::map_builtins::{
-    self, BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, MapInfo,
+use crate::codegen::set_builtins::{
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, SetInfo,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
 
-/// WASM alignment hint (log2 of byte alignment) for a key/value slot. Matches
-/// the natural alignment of each type. Keeping this here so every load/store
-/// against a bucket speaks the same hint.
+/// WASM alignment hint (log2 of byte alignment) for an element slot.
 fn mem_align(ty: &BoundType) -> u32 {
     match ty {
         BoundType::F64 => 3,
@@ -52,10 +34,10 @@ fn mem_align(ty: &BoundType) -> u32 {
 }
 
 impl<'a> FuncContext<'a> {
-    /// Entry point invoked from `emit_call`. Peeks at the call's callee; if
-    /// it's `<mapExpr>.<method>(...)` and the receiver resolves to a known
-    /// Map monomorphization, emits the method inline and returns its type.
-    pub(crate) fn try_emit_map_method_call(
+    /// Entry point invoked from `emit_call`. If the call is
+    /// `<setExpr>.<method>(...)` and the receiver resolves to a known Set
+    /// monomorphization, emits the method inline and returns its type.
+    pub(crate) fn try_emit_set_method_call(
         &mut self,
         call: &CallExpression<'a>,
     ) -> Result<Option<WasmType>, CompileError> {
@@ -67,70 +49,61 @@ impl<'a> FuncContext<'a> {
             Ok(name) => name,
             Err(_) => return Ok(None),
         };
-        if !self.module_ctx.map_info.contains_key(&class_name) {
+        if !self.module_ctx.set_info.contains_key(&class_name) {
             return Ok(None);
         }
         let method_name = member.property.name.as_str();
         match method_name {
             "clear" => {
-                self.expect_args(call, 0, "Map.clear")?;
-                self.emit_map_clear(&member.object, &class_name)?;
+                self.expect_args(call, 0, "Set.clear")?;
+                self.emit_set_clear(&member.object, &class_name)?;
                 Ok(Some(WasmType::Void))
             }
             "has" => {
-                self.expect_args(call, 1, "Map.has")?;
+                self.expect_args(call, 1, "Set.has")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_map_has(&member.object, &class_name, arg)?;
+                self.emit_set_has(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::I32))
             }
-            "get" => {
-                self.expect_args(call, 1, "Map.get")?;
+            "add" => {
+                self.expect_args(call, 1, "Set.add")?;
                 let arg = call.arguments[0].to_expression();
-                let ret = self.emit_map_get(&member.object, &class_name, arg)?;
-                Ok(Some(ret))
-            }
-            "set" => {
-                self.expect_args(call, 2, "Map.set")?;
-                let k_arg = call.arguments[0].to_expression();
-                let v_arg = call.arguments[1].to_expression();
-                self.emit_map_set(&member.object, &class_name, k_arg, v_arg)?;
+                self.emit_set_add(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::Void))
             }
             "delete" => {
-                self.expect_args(call, 1, "Map.delete")?;
+                self.expect_args(call, 1, "Set.delete")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_map_delete(&member.object, &class_name, arg)?;
+                self.emit_set_delete(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::I32))
             }
             "forEach" => {
-                self.expect_args(call, 1, "Map.forEach")?;
+                self.expect_args(call, 1, "Set.forEach")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_map_foreach(&member.object, &class_name, arg)?;
+                self.emit_set_foreach(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::Void))
             }
             other => Err(CompileError::codegen(format!(
-                "Map has no method '{other}' — supported: clear, has, get, set, delete, forEach"
+                "Set has no method '{other}' — supported: clear, has, add, delete, forEach"
             ))),
         }
     }
 
-    /// `m.clear()` — reset size=0, head/tail=-1, and zero every state byte in
+    /// `s.clear()` — reset size=0, head/tail=-1, and zero every state byte in
     /// the bucket array via a single `memory.fill`. `buckets_ptr` + `capacity`
-    /// stay as-is so the map is reusable without re-allocating.
-    fn emit_map_clear(
+    /// stay as-is so the set is reusable without re-allocating.
+    fn emit_set_clear(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
     ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let size_off = self.field_offset_for(class_name, "size");
-        let head_off = self.field_offset_for(class_name, "head_idx");
-        let tail_off = self.field_offset_for(class_name, "tail_idx");
-        let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
-        let capacity_off = self.field_offset_for(class_name, "capacity");
+        let info = self.set_info(class_name);
+        let size_off = self.set_field_offset_for(class_name, "size");
+        let head_off = self.set_field_offset_for(class_name, "head_idx");
+        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
+        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
+        let capacity_off = self.set_field_offset_for(class_name, "capacity");
 
-        // Evaluate receiver once into a local so we can reuse the pointer
-        // without re-emitting side-effecting sub-expressions.
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
@@ -161,102 +134,46 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
-    /// `m.has(k)` — returns `1` on hit, `0` on miss. Probes linearly until an
-    /// EMPTY slot is seen (definite miss) or an OCCUPIED slot matches the
-    /// key. Tombstones are skipped.
-    fn emit_map_has(
+    /// `s.has(v)` — returns `1` on hit, `0` on miss.
+    fn emit_set_has(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
-        key_arg: &Expression<'a>,
+        elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let ctx = self.begin_find(receiver, class_name, key_arg, &info)?;
-        // Leaves 1 (hit) / 0 (miss) on the stack.
+        let info = self.set_info(class_name);
+        let ctx = self.begin_set_find(receiver, class_name, elem_arg, &info)?;
         self.push(Instruction::LocalGet(ctx.found_local));
         Ok(())
     }
 
-    /// `m.get(k)` — returns the stored value on hit, or the zero value of V
-    /// on miss (`0` for i32/bool/pointers, `0.0` for f64). Call `.has(k)`
-    /// first when disambiguation matters — tscc has no optional type to model
-    /// "absent" directly.
-    fn emit_map_get(
+    /// `s.add(v)` — insert if absent, no-op if already present. Triggers a 2×
+    /// rebuild before probing if the load factor would exceed 75% with one
+    /// more entry.
+    fn emit_set_add(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
-        key_arg: &Expression<'a>,
-    ) -> Result<WasmType, CompileError> {
-        let info = self.map_info(class_name);
-        let value_wasm = info.value_ty.wasm_ty();
-        let ctx = self.begin_find(receiver, class_name, key_arg, &info)?;
-
-        // `found` is 1 on hit and `slot` points to the matching bucket.
-        // Branch on it: if hit, load value; otherwise push zero of V type.
-        self.push(Instruction::LocalGet(ctx.found_local));
-        let result_block_ty = match value_wasm {
-            WasmType::F64 => BlockType::Result(wasm_encoder::ValType::F64),
-            _ => BlockType::Result(wasm_encoder::ValType::I32),
-        };
-        self.push(Instruction::If(result_block_ty));
-        // Load: addr = buckets + slot * bucket_size; value = *(addr + value_offset)
-        self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
-        match &info.value_ty {
-            BoundType::F64 => self.push(Instruction::F64Load(MemArg {
-                offset: info.bucket.value_offset as u64,
-                align: 3,
-                memory_index: 0,
-            })),
-            _ => self.push(load_i32(info.bucket.value_offset)),
-        }
-        self.push(Instruction::Else);
-        // Zero value of V as miss sentinel.
-        match value_wasm {
-            WasmType::F64 => self.push(Instruction::F64Const(0.0)),
-            _ => self.push(Instruction::I32Const(0)),
-        }
-        self.push(Instruction::End);
-        Ok(value_wasm)
-    }
-
-    /// `m.set(k, v)` — insert or overwrite. Triggers a 2× rebuild before
-    /// probing if the load factor would exceed 75% with one more entry.
-    fn emit_map_set(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        key_arg: &Expression<'a>,
-        value_arg: &Expression<'a>,
+        elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let size_off = self.field_offset_for(class_name, "size");
-        let cap_off = self.field_offset_for(class_name, "capacity");
-        let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
-        let head_off = self.field_offset_for(class_name, "head_idx");
-        let tail_off = self.field_offset_for(class_name, "tail_idx");
+        let info = self.set_info(class_name);
+        let size_off = self.set_field_offset_for(class_name, "size");
+        let cap_off = self.set_field_offset_for(class_name, "capacity");
+        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
+        let head_off = self.set_field_offset_for(class_name, "head_idx");
+        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
 
-        // Evaluate receiver, key, value into locals up front — this pins the
-        // map pointer for the duration of the set, even if evaluating the
-        // value expression itself allocates into the arena (which could move
-        // the bucket array's neighbor but NOT the buckets' own base pointer;
-        // the header stores it by index). Still cheapest to cache once.
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
 
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
-        let ty = self.emit_expr(key_arg)?;
-        self.check_key_type(&info, ty)?;
-        self.push(Instruction::LocalSet(key_local));
+        let elem_local = self.alloc_local(info.elem_ty.wasm_ty());
+        let ty = self.emit_expr(elem_arg)?;
+        self.check_elem_type(&info, ty)?;
+        self.push(Instruction::LocalSet(elem_local));
 
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
-        let vty = self.emit_expr(value_arg)?;
-        self.check_value_type(&info, vty)?;
-        self.push(Instruction::LocalSet(value_local));
-
-        // Load-factor check: if size * 4 >= capacity * 3, grow first. The
-        // rebuild rewrites buckets_ptr + capacity on `this_local`, so we
-        // re-read both below.
+        // Load-factor check — if `size*4 >= cap*3`, grow before probing so the
+        // probe always runs on a ≥25%-empty array and always terminates.
         self.push(Instruction::LocalGet(this_local));
         self.push(load_i32(size_off));
         self.push(Instruction::I32Const(4));
@@ -267,11 +184,11 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Mul);
         self.push(Instruction::I32GeU);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_map_rebuild(this_local, class_name, &info)?;
+        self.emit_set_rebuild(this_local, class_name, &info)?;
         self.push(Instruction::End);
 
         // Probe. Tracks first tombstone for insert reuse; if an OCCUPIED
-        // bucket matches the key, overwrite its value and finish.
+        // bucket matches the element, finish without changing anything.
         let buckets_local = self.alloc_local(WasmType::I32);
         let cap_local = self.alloc_local(WasmType::I32);
         let mask_local = self.alloc_local(WasmType::I32);
@@ -286,7 +203,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        self.emit_set_hash_for_local(elem_local, &info.elem_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -295,25 +212,23 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::LocalSet(first_tomb));
 
-        // is_update = 1 when we overwrote an existing key; 0 means we landed
-        // on an EMPTY/TOMBSTONE slot and should link a fresh entry in.
-        let is_update = self.alloc_local(WasmType::I32);
+        // already_present = 1 when we found a matching OCCUPIED slot; skip
+        // the insert path in that case.
+        let already_present = self.alloc_local(WasmType::I32);
         self.push(Instruction::I32Const(0));
-        self.push(Instruction::LocalSet(is_update));
+        self.push(Instruction::LocalSet(already_present));
 
-        // Probe loop — exits via br to the surrounding block.
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
         let state_local = self.alloc_local(WasmType::I32);
-        // Load state
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
             memory_index: 0,
         }));
         self.push(Instruction::LocalTee(state_local));
-        // EMPTY → break (insertion target is first_tomb if set, else this slot)
+        // EMPTY → break; insertion target is first_tomb if set, else this slot
         self.push(Instruction::I32Eqz);
         self.push(Instruction::BrIf(1));
 
@@ -330,11 +245,11 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(first_tomb));
         self.push(Instruction::End);
         self.push(Instruction::Else);
-        // OCCUPIED → compare keys; if match, overwrite and exit
-        self.emit_key_equals_stored(buckets_local, slot_local, key_local, &info);
+        // OCCUPIED → compare elements; on match, flag and exit
+        self.emit_elem_equals_stored(buckets_local, slot_local, elem_local, &info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
-        self.push(Instruction::LocalSet(is_update));
+        self.push(Instruction::LocalSet(already_present));
         self.push(Instruction::Br(3)); // exit outer block
         self.push(Instruction::End);
         self.push(Instruction::End);
@@ -350,14 +265,14 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End); // loop
         self.push(Instruction::End); // block
 
-        // After probe: `slot_local` is either the hit slot (is_update=1) or
-        // the first EMPTY slot (is_update=0). Prefer `first_tomb` over the
-        // EMPTY slot for insert to keep probe chains short.
+        // If `already_present`, nothing more to do.
+        self.push(Instruction::LocalGet(already_present));
+        self.push(Instruction::I32Eqz);
+        self.push(Instruction::If(BlockType::Empty));
+
+        // Pick insert slot: prefer first tombstone over the terminating EMPTY
+        // to keep probe chains short.
         let insert_slot = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(is_update));
-        self.push(Instruction::If(BlockType::Result(wasm_encoder::ValType::I32)));
-        self.push(Instruction::LocalGet(slot_local));
-        self.push(Instruction::Else);
         self.push(Instruction::LocalGet(first_tomb));
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
@@ -366,23 +281,12 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Else);
         self.push(Instruction::LocalGet(slot_local));
         self.push(Instruction::End);
-        self.push(Instruction::End);
         self.push(Instruction::LocalSet(insert_slot));
 
-        // Compute the target bucket address once and reuse it.
         let target_addr = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(buckets_local, insert_slot, info.bucket.total_size);
+        self.emit_set_bucket_addr(buckets_local, insert_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(target_addr));
 
-        // Always write the value (overwrite or fresh insert).
-        self.push(Instruction::LocalGet(target_addr));
-        self.push(Instruction::LocalGet(value_local));
-        self.push(store_value(&info.value_ty, info.bucket.value_offset));
-
-        // Insert-only path: state → OCCUPIED, write key, link into chain, bump size.
-        self.push(Instruction::LocalGet(is_update));
-        self.push(Instruction::I32Eqz);
-        self.push(Instruction::If(BlockType::Empty));
         // state = OCCUPIED
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
@@ -391,10 +295,10 @@ impl<'a> FuncContext<'a> {
             align: 0,
             memory_index: 0,
         }));
-        // key = k
+        // elem = v
         self.push(Instruction::LocalGet(target_addr));
-        self.push(Instruction::LocalGet(key_local));
-        self.push(store_key(&info.key_ty, info.bucket.key_offset));
+        self.push(Instruction::LocalGet(elem_local));
+        self.push(store_elem(&info.elem_ty, info.bucket.elem_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -414,7 +318,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(buckets_local, old_tail, info.bucket.total_size);
+        self.emit_set_bucket_addr(buckets_local, old_tail, info.bucket.total_size);
         self.push(Instruction::LocalGet(insert_slot));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -436,37 +340,33 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Add);
         self.push(store_i32(size_off));
 
-        self.push(Instruction::End); // end insert-only if
+        self.push(Instruction::End); // end "if !already_present"
 
         Ok(())
     }
 
-    /// `m.delete(k)` — probe; on hit set state=TOMBSTONE, unlink from the
+    /// `s.delete(v)` — probe; on hit set state=TOMBSTONE, unlink from the
     /// insertion chain, decrement size, return `1`. Miss returns `0`.
-    fn emit_map_delete(
+    fn emit_set_delete(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
-        key_arg: &Expression<'a>,
+        elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let size_off = self.field_offset_for(class_name, "size");
-        let head_off = self.field_offset_for(class_name, "head_idx");
-        let tail_off = self.field_offset_for(class_name, "tail_idx");
+        let info = self.set_info(class_name);
+        let size_off = self.set_field_offset_for(class_name, "size");
+        let head_off = self.set_field_offset_for(class_name, "head_idx");
+        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
 
-        let ctx = self.begin_find(receiver, class_name, key_arg, &info)?;
+        let ctx = self.begin_set_find(receiver, class_name, elem_arg, &info)?;
 
-        // if found: unlink + tombstone + decrement. Leaves `found` on stack.
         self.push(Instruction::LocalGet(ctx.found_local));
         self.push(Instruction::If(BlockType::Empty));
 
         let target_addr = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
+        self.emit_set_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
         self.push(Instruction::LocalSet(target_addr));
 
-        // Read prev/next before stomping state — they are the only fields we
-        // need to preserve; the key slot may hold a stale pointer after, but
-        // that's fine because state=TOMBSTONE gates every future read.
         let prev_idx = self.alloc_local(WasmType::I32);
         let next_idx = self.alloc_local(WasmType::I32);
         self.push(Instruction::LocalGet(target_addr));
@@ -481,7 +381,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
+        self.emit_set_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
         self.push(Instruction::LocalGet(next_idx));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -495,7 +395,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
+        self.emit_set_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
         self.push(Instruction::LocalGet(prev_idx));
         self.push(store_i32(info.bucket.prev_offset));
         self.push(Instruction::Else);
@@ -523,24 +423,22 @@ impl<'a> FuncContext<'a> {
 
         self.push(Instruction::End); // end "if found"
 
-        // Leave `found` on the stack as the return value.
         self.push(Instruction::LocalGet(ctx.found_local));
         Ok(())
     }
 
-    /// `m.forEach((v, k) => { ... })` — walk the insertion chain from head
-    /// via each bucket's `next_insert` pointer, binding the 1 or 2 arrow
-    /// params to `(value, key)` per iteration. Mirrors `arr.forEach`'s arrow
-    /// scope management so captured outer vars resolve correctly.
-    fn emit_map_foreach(
+    /// `s.forEach((v) => { ... })` — walk the insertion chain from head via
+    /// each bucket's `next_insert` pointer, binding the arrow's single param
+    /// to the element per iteration.
+    fn emit_set_foreach(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
         callback: &Expression<'a>,
     ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
-        let head_off = self.field_offset_for(class_name, "head_idx");
+        let info = self.set_info(class_name);
+        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
+        let head_off = self.set_field_offset_for(class_name, "head_idx");
 
         let arrow = extract_arrow(callback)?;
         let params: Vec<String> = arrow
@@ -554,13 +452,12 @@ impl<'a> FuncContext<'a> {
                 )),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if params.is_empty() || params.len() > 2 {
+        if params.len() != 1 {
             return Err(CompileError::codegen(
-                "Map.forEach callback must take 1 or 2 parameters: (value) or (value, key)",
+                "Set.forEach callback must take exactly 1 parameter: (value)",
             ));
         }
 
-        // Cache receiver, buckets_ptr into locals.
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
@@ -575,15 +472,9 @@ impl<'a> FuncContext<'a> {
         self.push(load_i32(head_off));
         self.push(Instruction::LocalSet(slot_local));
 
-        // Per-iteration locals: current value + key. The arrow body reads them
-        // through the arrow-scope bindings below.
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
+        let elem_local = self.alloc_local(info.elem_ty.wasm_ty());
 
-        // The iteration contract matches JS — arrow params are (value, key).
-        // If the arrow only takes one param, bind it to value. Two params
-        // bind (value, key). Saved scope is restored after the loop.
-        let saved = self.push_map_arrow_scope(&params, &[(value_local, &info.value_ty), (key_local, &info.key_ty)]);
+        let saved = self.push_set_arrow_scope(&params, &[(elem_local, &info.elem_ty)]);
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
@@ -593,25 +484,18 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Eq);
         self.push(Instruction::BrIf(1));
 
-        // Load value, key, next from bucket BEFORE calling the body — the
-        // callback could in principle mutate the map, but that's not
-        // supported semantics and we don't guard against it. Reading fields
-        // up front keeps the memory accesses contiguous.
+        // Load elem + next from bucket before calling the body.
         let addr_local = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_value(&info.value_ty, info.bucket.value_offset));
-        self.push(Instruction::LocalSet(value_local));
-        self.push(Instruction::LocalGet(addr_local));
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
-        self.push(Instruction::LocalSet(key_local));
+        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(Instruction::LocalSet(elem_local));
 
         let next_local = self.alloc_local(WasmType::I32);
         self.push(Instruction::LocalGet(addr_local));
         self.push(load_i32(info.bucket.next_offset));
         self.push(Instruction::LocalSet(next_local));
 
-        // Evaluate arrow body; drop any return value.
         let body_ty = crate::codegen::array_builtins::eval_arrow_body(self, arrow)?;
         if body_ty != WasmType::Void {
             self.push(Instruction::Drop);
@@ -624,33 +508,31 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End); // loop
         self.push(Instruction::End); // block
 
-        self.pop_map_arrow_scope(&params, saved);
+        self.pop_set_arrow_scope(&params, saved);
         Ok(())
     }
 
-    /// Probe for `has`/`get`/`delete`. Evaluates the receiver and key once,
+    /// Probe for `has` / `delete`. Evaluates the receiver and element once,
     /// then walks the probe chain until it hits an EMPTY slot (miss) or an
-    /// OCCUPIED slot matching the key (hit). Returns the locals that hold
-    /// the result so callers can branch on `found_local` and reuse
-    /// `slot_local`/`buckets_local` without re-deriving them.
-    fn begin_find(
+    /// OCCUPIED slot matching the element (hit).
+    fn begin_set_find(
         &mut self,
         receiver: &Expression<'a>,
         class_name: &str,
-        key_arg: &Expression<'a>,
-        info: &MapInfo,
-    ) -> Result<FindContext, CompileError> {
-        let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
-        let cap_off = self.field_offset_for(class_name, "capacity");
+        elem_arg: &Expression<'a>,
+        info: &SetInfo,
+    ) -> Result<SetFindContext, CompileError> {
+        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
+        let cap_off = self.set_field_offset_for(class_name, "capacity");
 
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
 
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
-        let ty = self.emit_expr(key_arg)?;
-        self.check_key_type(info, ty)?;
-        self.push(Instruction::LocalSet(key_local));
+        let elem_local = self.alloc_local(info.elem_ty.wasm_ty());
+        let ty = self.emit_expr(elem_arg)?;
+        self.check_elem_type(info, ty)?;
+        self.push(Instruction::LocalSet(elem_local));
 
         let buckets_local = self.alloc_local(WasmType::I32);
         let mask_local = self.alloc_local(WasmType::I32);
@@ -664,7 +546,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        self.emit_set_hash_for_local(elem_local, &info.elem_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -673,26 +555,23 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(0));
         self.push(Instruction::LocalSet(found_local));
 
-        // Probe.
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
         let state_local = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
             memory_index: 0,
         }));
         self.push(Instruction::LocalTee(state_local));
-        // EMPTY → miss, break.
         self.push(Instruction::I32Eqz);
         self.push(Instruction::BrIf(1));
-        // OCCUPIED → compare; on match, set found and break.
         self.push(Instruction::LocalGet(state_local));
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
         self.push(Instruction::I32Eq);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_key_equals_stored(buckets_local, slot_local, key_local, info);
+        self.emit_elem_equals_stored(buckets_local, slot_local, elem_local, info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::LocalSet(found_local));
@@ -711,7 +590,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End); // loop
         self.push(Instruction::End); // block
 
-        Ok(FindContext {
+        Ok(SetFindContext {
             this_local,
             buckets_local,
             slot_local,
@@ -719,23 +598,22 @@ impl<'a> FuncContext<'a> {
         })
     }
 
-    /// 2× capacity rebuild. Called from inside `set()` when the load factor
-    /// would exceed 75% with one more entry. Walks the old insertion chain
-    /// (head → next) into freshly-allocated buckets, preserving order and
-    /// collecting tombstones out as a side effect.
-    fn emit_map_rebuild(
+    /// 2× capacity rebuild. Called from `add()` when the load factor would
+    /// exceed 75% with one more entry. Walks the old insertion chain into
+    /// freshly-allocated buckets, preserving order and collecting tombstones
+    /// out.
+    fn emit_set_rebuild(
         &mut self,
         this_local: u32,
         class_name: &str,
-        info: &MapInfo,
+        info: &SetInfo,
     ) -> Result<(), CompileError> {
-        let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
-        let cap_off = self.field_offset_for(class_name, "capacity");
-        let head_off = self.field_offset_for(class_name, "head_idx");
-        let tail_off = self.field_offset_for(class_name, "tail_idx");
+        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
+        let cap_off = self.set_field_offset_for(class_name, "capacity");
+        let head_off = self.set_field_offset_for(class_name, "head_idx");
+        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
         let bucket_size = info.bucket.total_size as i32;
 
-        // old_buckets / old_capacity / old_head
         let old_buckets = self.alloc_local(WasmType::I32);
         let new_cap = self.alloc_local(WasmType::I32);
         let new_mask = self.alloc_local(WasmType::I32);
@@ -755,14 +633,12 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Sub);
         self.push(Instruction::LocalSet(new_mask));
 
-        // Allocate new bucket array: new_cap * bucket_size (zero-init via arena bump).
+        // Allocate new bucket array.
         self.push(Instruction::LocalGet(new_cap));
         self.push(Instruction::I32Const(bucket_size));
         self.push(Instruction::I32Mul);
         let new_buckets = self.emit_arena_alloc_to_local(true)?;
 
-        // Snapshot old head (first entry to re-insert), then clear header's
-        // chain + point it at the new array.
         self.push(Instruction::LocalGet(this_local));
         self.push(load_i32(head_off));
         self.push(Instruction::LocalSet(old_slot));
@@ -780,44 +656,35 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(store_i32(tail_off));
 
-        // Walk old chain, re-inserting into new array while maintaining order.
-        // Re-using insertion-link append gives us the source-order chain for free.
         let old_addr = self.alloc_local(WasmType::I32);
         let hash_slot = self.alloc_local(WasmType::I32);
         let new_addr = self.alloc_local(WasmType::I32);
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
+        let elem_local = self.alloc_local(info.elem_ty.wasm_ty());
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
-        // if old_slot == -1: break
         self.push(Instruction::LocalGet(old_slot));
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Eq);
         self.push(Instruction::BrIf(1));
 
-        // addr = old_buckets + old_slot * bucket_size
-        self.emit_bucket_addr(old_buckets, old_slot, info.bucket.total_size);
+        self.emit_set_bucket_addr(old_buckets, old_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(old_addr));
 
-        // Load key + value.
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
-        self.push(Instruction::LocalSet(key_local));
-        self.push(Instruction::LocalGet(old_addr));
-        self.push(load_value(&info.value_ty, info.bucket.value_offset));
-        self.push(Instruction::LocalSet(value_local));
+        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(Instruction::LocalSet(elem_local));
 
-        // Probe in the new array: no duplicates and no tombstones, so we
-        // only need to scan for the first EMPTY slot.
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        // Probe in the new array: no duplicates, no tombstones, so just find
+        // the first EMPTY slot.
+        self.emit_set_hash_for_local(elem_local, &info.elem_ty);
         self.push(Instruction::LocalGet(new_mask));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(hash_slot));
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
-        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
+        self.emit_set_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
@@ -825,7 +692,6 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::I32Eqz);
         self.push(Instruction::BrIf(1));
-        // advance
         self.push(Instruction::LocalGet(hash_slot));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::I32Add);
@@ -836,8 +702,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End);
         self.push(Instruction::End);
 
-        // Write to new bucket at hash_slot.
-        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
+        self.emit_set_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(new_addr));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
@@ -847,15 +712,9 @@ impl<'a> FuncContext<'a> {
             memory_index: 0,
         }));
         self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::LocalGet(key_local));
-        self.push(store_key(&info.key_ty, info.bucket.key_offset));
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::LocalGet(value_local));
-        self.push(store_value(&info.value_ty, info.bucket.value_offset));
+        self.push(Instruction::LocalGet(elem_local));
+        self.push(store_elem(&info.elem_ty, info.bucket.elem_offset));
 
-        // Link into chain: new_prev = header.tail, new_next = -1.
-        // If header.tail == -1: header.head = hash_slot. Else: tail_bucket.next = hash_slot.
-        // Then header.tail = hash_slot.
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(store_i32(info.bucket.next_offset));
@@ -871,7 +730,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(new_buckets, prev_tail, info.bucket.total_size);
+        self.emit_set_bucket_addr(new_buckets, prev_tail, info.bucket.total_size);
         self.push(Instruction::LocalGet(hash_slot));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -894,63 +753,28 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
-    /// Emit the hash call for a key already held in `key_local`, pushing the
-    /// raw i32 hash onto the stack. Routes to the appropriate
-    /// `__hash_fx_*` / `__hash_xxh3_*` helper based on the key type. For
-    /// helpers authored as L_splice (e.g. `__hash_fx_i32`), the body is
-    /// pasted inline via the splicer rather than emitted as a `Call`.
-    fn emit_hash_for_local(&mut self, key_local: u32, key_ty: &BoundType) {
-        self.push(Instruction::LocalGet(key_local));
-        let name = map_builtins::hash_helper_for(key_ty);
+    /// Emit the hash call for an element already held in `elem_local`, pushing
+    /// the raw i32 hash onto the stack. Dispatches via the same helpers Map
+    /// uses — same bundled precompiled functions.
+    fn emit_set_hash_for_local(&mut self, elem_local: u32, elem_ty: &BoundType) {
+        self.push(Instruction::LocalGet(elem_local));
+        let name = crate::codegen::map_builtins::hash_helper_for(elem_ty);
         self.emit_helper_invocation(name);
     }
 
-    /// Emit a call to a runtime helper by name, splicing if it's L_splice and
-    /// falling back to `Call(idx)` otherwise. Args must already be on the
-    /// stack in the helper's parameter order. The result (if any) replaces
-    /// them on the stack — same convention either path.
-    pub(crate) fn emit_helper_invocation(&mut self, name: &str) {
-        if let Some(pf) = crate::codegen::precompiled::find_inline(name) {
-            let reg_borrow = self.module_ctx.helper_registration.borrow();
-            let reg = reg_borrow.as_ref().unwrap_or_else(|| {
-                panic!(
-                    "helper_registration unset — register_string_helpers must run \
-                     before method codegen splices inline helper '{name}'"
-                )
-            });
-            let plan = crate::codegen::precompiled::RewritePlan {
-                func_index_map: &reg.func_index_map,
-                type_index_map: &reg.type_index_map,
-                global_index_map: &reg.global_index_map,
-                helper_table_index: reg.helper_table_index,
-            };
-            crate::codegen::splice::splice_inline_call(self, pf, &plan)
-                .unwrap_or_else(|e| panic!("splicing '{name}' failed: {e:?}"));
-            return;
-        }
-        let (func_idx, _) = self
-            .module_ctx
-            .get_func(name)
-            .unwrap_or_else(|| panic!("helper '{name}' not registered"));
-        self.push(Instruction::Call(func_idx));
-    }
-
-    /// Compare the key stored at `buckets[slot]` against `key_local`, pushing
-    /// `1` (equal) or `0` onto the stack. Assumes the bucket is OCCUPIED —
-    /// calling this on EMPTY/TOMBSTONE slots is undefined because the stored
-    /// key bytes may be stale (matters for string keys whose comparison
-    /// dereferences a pointer).
-    fn emit_key_equals_stored(
+    /// Compare the element stored at `buckets[slot]` against `elem_local`,
+    /// pushing `1` (equal) or `0`. Assumes the bucket is OCCUPIED.
+    fn emit_elem_equals_stored(
         &mut self,
         buckets_local: u32,
         slot_local: u32,
-        key_local: u32,
-        info: &MapInfo,
+        elem_local: u32,
+        info: &SetInfo,
     ) {
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
-        self.push(Instruction::LocalGet(key_local));
-        match &info.key_ty {
+        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(Instruction::LocalGet(elem_local));
+        match &info.elem_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
             BoundType::Str => self.emit_helper_invocation("__str_eq"),
             _ => self.push(Instruction::I32Eq),
@@ -958,7 +782,7 @@ impl<'a> FuncContext<'a> {
     }
 
     /// Push `buckets_ptr + slot * bucket_size` onto the stack.
-    fn emit_bucket_addr(&mut self, buckets_local: u32, slot_local: u32, bucket_size: u32) {
+    fn emit_set_bucket_addr(&mut self, buckets_local: u32, slot_local: u32, bucket_size: u32) {
         self.push(Instruction::LocalGet(buckets_local));
         self.push(Instruction::LocalGet(slot_local));
         self.push(Instruction::I32Const(bucket_size as i32));
@@ -966,43 +790,27 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Add);
     }
 
-    /// Copy of `MapInfo` — dispatcher wants a long-lived view while emitting
-    /// method bodies that need a borrowed `&mut self`. Cheap (two enums + a
-    /// small BucketLayout struct).
-    fn map_info(&self, class_name: &str) -> MapInfo {
+    fn set_info(&self, class_name: &str) -> SetInfo {
         self.module_ctx
-            .map_info
+            .set_info
             .get(class_name)
-            .expect("caller verified map_info membership")
+            .expect("caller verified set_info membership")
             .clone()
     }
 
-    /// Byte offset of a header field. Panics if the class or field is absent —
-    /// callers stage the membership check earlier.
-    fn field_offset_for(&self, class_name: &str, field_name: &str) -> u32 {
+    fn set_field_offset_for(&self, class_name: &str, field_name: &str) -> u32 {
         self.module_ctx
             .class_registry
             .get(class_name)
             .and_then(|l| l.field_map.get(field_name).map(|(off, _)| *off))
-            .unwrap_or_else(|| panic!("map class '{class_name}' missing field '{field_name}'"))
+            .unwrap_or_else(|| panic!("set class '{class_name}' missing field '{field_name}'"))
     }
 
-    /// Validate the type of a user-provided key argument against the map's
-    /// declared `K`. Numeric widening mirrors the rules used elsewhere in
-    /// tscc — an i32 literal passes for an f64-keyed map.
-    fn check_key_type(&mut self, info: &MapInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric(info.key_ty.wasm_ty(), ty, "Map key")
+    fn check_elem_type(&mut self, info: &SetInfo, ty: WasmType) -> Result<(), CompileError> {
+        self.coerce_numeric_set(info.elem_ty.wasm_ty(), ty, "Set element")
     }
 
-    /// Like `check_key_type`, but for the value slot.
-    fn check_value_type(&mut self, info: &MapInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric(info.value_ty.wasm_ty(), ty, "Map value")
-    }
-
-    /// If `actual` can be losslessly promoted to `expected` (i32 → f64),
-    /// emit the conversion; otherwise accept only exact matches. `slot` names
-    /// the argument in errors.
-    fn coerce_numeric(
+    fn coerce_numeric_set(
         &mut self,
         expected: WasmType,
         actual: WasmType,
@@ -1020,21 +828,17 @@ impl<'a> FuncContext<'a> {
         )))
     }
 
-    /// Stash a set of arrow-param bindings so the callback body sees each
-    /// param resolved to its per-iteration local. Mirrors
-    /// `array_builtins::setup_arrow_scope` (that fn is private; we reimplement
-    /// the subset we need rather than exporting it).
-    fn push_map_arrow_scope(
+    fn push_set_arrow_scope(
         &mut self,
         param_names: &[String],
         locals: &[(u32, &BoundType)],
-    ) -> MapArrowScope {
-        let mut saved = MapArrowScope {
+    ) -> SetArrowScope {
+        let mut saved = SetArrowScope {
             entries: Vec::with_capacity(param_names.len()),
         };
         for (i, name) in param_names.iter().enumerate() {
             let (local_idx, ty) = locals[i];
-            saved.entries.push(MapScopeEntry {
+            saved.entries.push(SetScopeEntry {
                 name: name.clone(),
                 saved_local: self.locals.get(name).copied(),
                 saved_class: self.local_class_types.get(name).cloned(),
@@ -1061,7 +865,7 @@ impl<'a> FuncContext<'a> {
         saved
     }
 
-    fn pop_map_arrow_scope(&mut self, _param_names: &[String], saved: MapArrowScope) {
+    fn pop_set_arrow_scope(&mut self, _param_names: &[String], saved: SetArrowScope) {
         for entry in saved.entries.into_iter().rev() {
             match entry.saved_local {
                 Some(prev) => {
@@ -1096,21 +900,18 @@ impl<'a> FuncContext<'a> {
     }
 }
 
-/// Locals returned from `begin_find` so branches can reuse the probe result.
-struct FindContext {
+struct SetFindContext {
     this_local: u32,
     buckets_local: u32,
     slot_local: u32,
     found_local: u32,
 }
 
-/// Per-param save for `push_arrow_scope` — mirrors the subset of FuncContext
-/// state that arrow-binding mutation needs to restore.
-struct MapArrowScope {
-    entries: Vec<MapScopeEntry>,
+struct SetArrowScope {
+    entries: Vec<SetScopeEntry>,
 }
 
-struct MapScopeEntry {
+struct SetScopeEntry {
     name: String,
     saved_local: Option<(u32, WasmType)>,
     saved_class: Option<String>,
@@ -1136,7 +937,7 @@ fn store_i32(offset: u32) -> Instruction<'static> {
     })
 }
 
-fn load_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
+fn load_elem(ty: &BoundType, offset: u32) -> Instruction<'static> {
     match ty {
         BoundType::F64 => Instruction::F64Load(MemArg {
             offset: offset as u64,
@@ -1151,7 +952,7 @@ fn load_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
     }
 }
 
-fn store_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
+fn store_elem(ty: &BoundType, offset: u32) -> Instruction<'static> {
     match ty {
         BoundType::F64 => Instruction::F64Store(MemArg {
             offset: offset as u64,
@@ -1164,12 +965,4 @@ fn store_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
             memory_index: 0,
         }),
     }
-}
-
-fn load_value(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    load_key(ty, offset)
-}
-
-fn store_value(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    store_key(ty, offset)
 }

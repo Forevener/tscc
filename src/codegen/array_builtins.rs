@@ -257,7 +257,7 @@ pub(crate) fn eval_arrow_body<'a>(
 
 /// Set up a temporary local for an arrow parameter and bind it to a value local.
 /// Returns the previous binding (if any) so it can be restored after the arrow body.
-struct ArrowScope {
+pub(crate) struct ArrowScope {
     param_names: Vec<String>,
     saved_locals: Vec<Option<(u32, WasmType)>>,
     saved_class_types: Vec<Option<String>>,
@@ -266,7 +266,7 @@ struct ArrowScope {
 }
 
 /// Set up arrow parameter bindings, returning scope info to restore later.
-fn setup_arrow_scope<'a>(
+pub(crate) fn setup_arrow_scope<'a>(
     func_ctx: &mut FuncContext<'a>,
     params: &[String],
     param_locals: &[(u32, WasmType)],
@@ -315,7 +315,7 @@ fn setup_arrow_scope<'a>(
 }
 
 /// Restore the previous variable bindings after arrow body evaluation.
-fn restore_arrow_scope(func_ctx: &mut FuncContext, scope: ArrowScope) {
+pub(crate) fn restore_arrow_scope(func_ctx: &mut FuncContext, scope: ArrowScope) {
     for (i, name) in scope.param_names.iter().enumerate() {
         // Restore locals
         if let Some(prev) = scope.saved_locals[i] {
@@ -464,19 +464,30 @@ impl<'a> FuncContext<'a> {
                 Ok(Some(result))
             }
             "sort" => {
-                if call.arguments.len() != 1 {
+                if call.arguments.len() > 1 {
                     return Err(CompileError::codegen(
-                        "Array.sort() expects 1 argument (comparator)",
+                        "Array.sort() expects 0 or 1 arguments (optional comparator)",
                     ));
                 }
-                self.emit_array_sort(
+                let callback = call.arguments.first().map(|a| a.to_expression());
+                self.emit_array_sort(&member.object, elem_ty, elem_class.as_deref(), callback)?;
+                // sort returns the same array (mutates in place)
+                self.emit_expr(&member.object)?;
+                Ok(Some(WasmType::I32))
+            }
+            "toSorted" => {
+                if call.arguments.len() > 1 {
+                    return Err(CompileError::codegen(
+                        "Array.toSorted() expects 0 or 1 arguments (optional comparator)",
+                    ));
+                }
+                let callback = call.arguments.first().map(|a| a.to_expression());
+                self.emit_array_to_sorted(
                     &member.object,
                     elem_ty,
                     elem_class.as_deref(),
-                    call.arguments[0].to_expression(),
+                    callback,
                 )?;
-                // sort returns the same array (mutates in place)
-                self.emit_expr(&member.object)?;
                 Ok(Some(WasmType::I32))
             }
             _ => Ok(None),
@@ -1041,33 +1052,129 @@ impl<'a> FuncContext<'a> {
         Ok(acc_ty)
     }
 
-    /// arr.sort((a, b) => a - b) — in-place bottom-up iterative merge sort using comparator.
-    /// O(n log n) via arena-allocated temp buffer.
+    /// arr.sort() / arr.sort((a, b) => ...) — in-place bottom-up iterative
+    /// merge sort. Without a comparator, elements are compared by numeric
+    /// natural order (ascending) — this diverges from ES (which stringifies
+    /// and lexicographically compares) but matches what typed-subset users
+    /// expect and avoids the cost of a ToString per comparison.
     fn emit_array_sort(
         &mut self,
         arr_expr: &Expression<'a>,
         elem_ty: WasmType,
         elem_class: Option<&str>,
-        callback: &Expression<'a>,
+        callback: Option<&Expression<'a>>,
     ) -> Result<(), CompileError> {
-        let arrow = extract_arrow(callback)?;
-        let params = extract_arrow_params(arrow)?;
-        if params.len() != 2 {
-            return Err(CompileError::codegen(
-                "sort comparator must have exactly 2 parameters",
-            ));
-        }
-        let esize = elem_size(elem_ty)?;
+        let comparator = Self::extract_sort_comparator(callback, "sort")?;
 
-        // Evaluate array pointer
+        // Evaluate array pointer, load length.
         let arr_local = self.alloc_local(WasmType::I32);
         self.emit_expr(arr_expr)?;
         self.push(Instruction::LocalSet(arr_local));
-
-        // Load length
         let len_local = self.alloc_local(WasmType::I32);
         emit_arr_length(self, arr_local);
         self.push(Instruction::LocalSet(len_local));
+
+        self.emit_merge_sort_in_place(
+            arr_local,
+            len_local,
+            elem_ty,
+            elem_class,
+            comparator.as_ref().map(|(p, a)| (p.as_slice(), *a)),
+        )
+    }
+
+    /// arr.toSorted() / arr.toSorted((a, b) => ...) — ES2023 immutable sort.
+    /// Clones the source array into a fresh arena allocation and sorts the
+    /// clone, returning it. The source is untouched. Comparator semantics
+    /// match `sort` (optional; numeric natural-order default).
+    pub(crate) fn emit_array_to_sorted(
+        &mut self,
+        arr_expr: &Expression<'a>,
+        elem_ty: WasmType,
+        elem_class: Option<&str>,
+        callback: Option<&Expression<'a>>,
+    ) -> Result<(), CompileError> {
+        let comparator = Self::extract_sort_comparator(callback, "toSorted")?;
+        let esize = elem_size(elem_ty)?;
+
+        // Evaluate source pointer, load length.
+        let src_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(arr_expr)?;
+        self.push(Instruction::LocalSet(src_local));
+        let len_local = self.alloc_local(WasmType::I32);
+        emit_arr_length(self, src_local);
+        self.push(Instruction::LocalSet(len_local));
+
+        // Allocate the result array (header written by helper with length=0),
+        // then set length=len and copy source body into it.
+        let new_ptr = emit_alloc_array(self, len_local, elem_ty)?;
+        self.push(Instruction::LocalGet(new_ptr));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Store(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        // memory.copy(new+HEADER, src+HEADER, len*esize)
+        self.push(Instruction::LocalGet(new_ptr));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(src_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::MemoryCopy {
+            src_mem: 0,
+            dst_mem: 0,
+        });
+
+        // Sort the clone in place, then return it.
+        self.emit_merge_sort_in_place(
+            new_ptr,
+            len_local,
+            elem_ty,
+            elem_class,
+            comparator.as_ref().map(|(p, a)| (p.as_slice(), *a)),
+        )?;
+        self.push(Instruction::LocalGet(new_ptr));
+        Ok(())
+    }
+
+    /// Pull the arrow + param names out of an optional comparator callback.
+    /// Returns `None` when the caller passed no argument (the default
+    /// numeric-order comparator is emitted inline by `emit_merge_sort_in_place`).
+    fn extract_sort_comparator<'b>(
+        callback: Option<&'b Expression<'a>>,
+        method: &str,
+    ) -> Result<Option<(Vec<String>, &'b ArrowFunctionExpression<'a>)>, CompileError> {
+        let Some(cb) = callback else {
+            return Ok(None);
+        };
+        let arrow = extract_arrow(cb)?;
+        let params = extract_arrow_params(arrow)?;
+        if params.len() != 2 {
+            return Err(CompileError::codegen(format!(
+                "{method} comparator must have exactly 2 parameters"
+            )));
+        }
+        Ok(Some((params, arrow)))
+    }
+
+    /// Bottom-up iterative merge sort over `arr_local[0..len_local)`.
+    /// Assumes the caller has already loaded the array pointer and length into
+    /// locals. Allocates a same-sized temp buffer via the arena. After the final
+    /// pass, the sorted data lives in `arr_local`.
+    fn emit_merge_sort_in_place(
+        &mut self,
+        arr_local: u32,
+        len_local: u32,
+        elem_ty: WasmType,
+        elem_class: Option<&str>,
+        comparator: Option<(&[String], &ArrowFunctionExpression<'a>)>,
+    ) -> Result<(), CompileError> {
+        let esize = elem_size(elem_ty)?;
 
         // Allocate temp buffer via arena (same capacity as arr)
         let tmp_local = emit_alloc_array(self, len_local, elem_ty)?;
@@ -1196,20 +1303,47 @@ impl<'a> FuncContext<'a> {
         emit_elem_load(self, elem_ty);
         self.push(Instruction::LocalSet(b_local));
 
-        // Evaluate compare(a, b) via inline arrow body
-        let scope = setup_arrow_scope(
-            self,
-            &params,
-            &[(a_local, elem_ty), (b_local, elem_ty)],
-            &[
-                elem_class.map(|s| s.to_string()),
-                elem_class.map(|s| s.to_string()),
-            ],
-        );
-
-        let cmp_ty = eval_arrow_body(self, arrow)?;
-
-        restore_arrow_scope(self, scope);
+        // Evaluate compare(a, b). With a user-supplied comparator we inline its
+        // arrow body; without one we emit `(a > b) - (a < b)` so the result is
+        // -1 / 0 / +1 and the existing `<= 0 → take left` branch is correct.
+        let cmp_ty = match comparator {
+            Some((params, arrow)) => {
+                let scope = setup_arrow_scope(
+                    self,
+                    params,
+                    &[(a_local, elem_ty), (b_local, elem_ty)],
+                    &[
+                        elem_class.map(|s| s.to_string()),
+                        elem_class.map(|s| s.to_string()),
+                    ],
+                );
+                let ty = eval_arrow_body(self, arrow)?;
+                restore_arrow_scope(self, scope);
+                ty
+            }
+            None => {
+                self.push(Instruction::LocalGet(a_local));
+                self.push(Instruction::LocalGet(b_local));
+                match elem_ty {
+                    WasmType::I32 => self.push(Instruction::I32GtS),
+                    WasmType::F64 => self.push(Instruction::F64Gt),
+                    _ => {
+                        return Err(CompileError::type_err(
+                            "sort elements must be i32 or f64 for default comparator",
+                        ));
+                    }
+                }
+                self.push(Instruction::LocalGet(a_local));
+                self.push(Instruction::LocalGet(b_local));
+                match elem_ty {
+                    WasmType::I32 => self.push(Instruction::I32LtS),
+                    WasmType::F64 => self.push(Instruction::F64Lt),
+                    _ => unreachable!(),
+                }
+                self.push(Instruction::I32Sub);
+                WasmType::I32
+            }
+        };
 
         // if compare(a, b) <= 0: copy arr[l] to tmp[k], l++
         // else: copy arr[r] to tmp[k], r++
@@ -1476,6 +1610,18 @@ impl<'a> FuncContext<'a> {
             },
             Expression::ParenthesizedExpression(paren) => {
                 self.infer_expr_type(&paren.expression, arrow_params, elem_ty, elem_class)
+            }
+            Expression::TSAsExpression(as_expr) => {
+                // `x as f64` / `x as i32` resolves to the annotated type
+                // regardless of the source expression. Falls back to recursing
+                // into the source if the target annotation doesn't resolve.
+                crate::types::resolve_ts_type(
+                    &as_expr.type_annotation,
+                    &self.module_ctx.class_names,
+                )
+                .or_else(|_| {
+                    self.infer_expr_type(&as_expr.expression, arrow_params, elem_ty, elem_class)
+                })
             }
             Expression::CallExpression(call) => {
                 // Check for method calls that have known return types

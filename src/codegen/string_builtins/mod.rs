@@ -32,6 +32,7 @@ pub const STRING_HELPER_NAMES: &[&str] = &[
     "__str_trimEnd",
     "__str_from_i32",
     "__str_from_f64",
+    "__str_from_f64_radix",
     "__str_split",
     "__str_replace",
     "__str_parseInt",
@@ -46,6 +47,7 @@ pub const STRING_HELPER_NAMES: &[&str] = &[
     "__str_toPrecision",
     "__str_toExponential",
     "__str_lastIndexOf",
+    "__utf8_encode_cp",
 ];
 
 /// Register all string runtime helper functions in the module.
@@ -211,6 +213,12 @@ pub fn register_string_helpers(
             vec![("n".into(), WasmType::F64)],
             WasmType::I32,
         ),
+        // __str_from_f64_radix(n: f64, radix: i32) -> i32
+        (
+            "__str_from_f64_radix",
+            vec![("n".into(), WasmType::F64), ("radix".into(), WasmType::I32)],
+            WasmType::I32,
+        ),
         // __str_split(s: i32, delim: i32) -> i32 (returns Array<string> pointer)
         (
             "__str_split",
@@ -310,6 +318,16 @@ pub fn register_string_helpers(
             vec![
                 ("n".into(), WasmType::F64),
                 ("digits".into(), WasmType::I32),
+            ],
+            WasmType::I32,
+        ),
+        // __utf8_encode_cp(dst: i32, cp: i32) -> i32 — writes up to 4 UTF-8
+        // bytes at `dst`, returns byte count. Drives `String.fromCodePoint`.
+        (
+            "__utf8_encode_cp",
+            vec![
+                ("dst".into(), WasmType::I32),
+                ("cp".into(), WasmType::I32),
             ],
             WasmType::I32,
         ),
@@ -722,6 +740,11 @@ struct Scanner {
     method_names: HashSet<String>,
     identifier_calls: HashSet<String>,
     has_string_from_char_code: bool,
+    has_string_from_code_point: bool,
+    /// True if any call site passes arguments to `.toString(...)`. Lets us
+    /// pull in `__str_from_f64_radix` only for programs that actually use
+    /// the radix form, not every program that stringifies a number.
+    has_to_string_with_args: bool,
 }
 
 impl Scanner {
@@ -776,9 +799,19 @@ impl Scanner {
         if has_string_source && self.has_cmp_op {
             add("__str_cmp", &mut used);
         }
+        // `localeCompare` routes to `__str_cmp` at codegen time (byte-order
+        // lex compare — no ICU). Pull it in regardless of `has_string_source`
+        // because the receiver is always a string when this method is called.
+        if self.method_names.contains("localeCompare") {
+            add("__str_cmp", &mut used);
+        }
 
         if self.has_string_from_char_code {
             add("__str_fromCharCode", &mut used);
+        }
+
+        if self.has_string_from_code_point {
+            add("__utf8_encode_cp", &mut used);
         }
 
         let method_map: &[(&str, &str)] = &[
@@ -811,6 +844,9 @@ impl Scanner {
         if self.method_names.contains("toString") {
             add("__str_from_i32", &mut used);
             add("__str_from_f64", &mut used);
+            if self.has_to_string_with_args {
+                add("__str_from_f64_radix", &mut used);
+            }
         }
 
         // Number.prototype.toFixed(digits) needs the dedicated helper.
@@ -1009,6 +1045,16 @@ impl Scanner {
                     self.walk_expr(e);
                 }
             }
+            Expression::TaggedTemplateExpression(t) => {
+                self.has_string_literal = true;
+                if !t.quasi.expressions.is_empty() {
+                    self.has_template_with_expr = true;
+                }
+                self.walk_expr(&t.tag);
+                for e in &t.quasi.expressions {
+                    self.walk_expr(e);
+                }
+            }
             Expression::BinaryExpression(b) => {
                 use oxc_ast::ast::BinaryOperator as Op;
                 match b.operator {
@@ -1097,9 +1143,15 @@ impl Scanner {
                 self.method_names.insert(method.to_string());
                 if let Expression::Identifier(obj) = &m.object
                     && obj.name.as_str() == "String"
-                    && method == "fromCharCode"
                 {
-                    self.has_string_from_char_code = true;
+                    match method {
+                        "fromCharCode" => self.has_string_from_char_code = true,
+                        "fromCodePoint" => self.has_string_from_code_point = true,
+                        _ => {}
+                    }
+                }
+                if method == "toString" && !call.arguments.is_empty() {
+                    self.has_to_string_with_args = true;
                 }
                 self.walk_expr(&m.object);
             }

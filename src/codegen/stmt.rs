@@ -92,9 +92,11 @@ impl<'a> FuncContext<'a> {
             // Track class type for property access resolution (threading
             // type_bindings so generic-param annotations inside monomorphized
             // methods resolve to the mangled instantiation).
-            if let Some(class_name) =
-                types::get_class_type_name_with_bindings(ann, self.type_bindings.as_ref())
-            {
+            if let Some(class_name) = types::get_class_type_name_with_bindings(
+                ann,
+                self.type_bindings.as_ref(),
+                Some(&self.module_ctx.shape_registry),
+            ) {
                 self.local_class_types.insert(name.clone(), class_name);
             }
             // Track array element type
@@ -103,7 +105,9 @@ impl<'a> FuncContext<'a> {
                 self.local_array_elem_types.insert(name.clone(), elem_ty);
                 annotated_array_elem_ty = Some(elem_ty);
                 // Track array element class if applicable
-                if let Some(elem_class) = types::get_array_element_class(ann) {
+                if let Some(elem_class) =
+                    types::get_array_element_class(ann, Some(&self.module_ctx.shape_registry))
+                {
                     self.local_array_elem_classes
                         .insert(name.clone(), elem_class);
                 }
@@ -254,12 +258,47 @@ impl<'a> FuncContext<'a> {
         // Emit initializer if present
         if let Some(init) = &decl.init {
             // Array literals get the annotation's element type threaded in so
-            // empty `[]` can be typed purely from the declaration.
+            // empty `[]` can be typed purely from the declaration. When the
+            // annotation targets a tuple shape, route to the tuple emitter
+            // instead — tuples are stored as synthetic-class pointers, not
+            // Array<T>.
             let init_ty = match init {
-                Expression::ArrayExpression(arr) if annotated_array_elem_ty.is_some() => {
-                    self.emit_array_literal(arr, annotated_array_elem_ty)?
+                Expression::ArrayExpression(arr) => {
+                    let target_class = self.local_class_types.get(&name).cloned();
+                    if let Some(target) = target_class.as_deref()
+                        && self.is_tuple_shape(target)
+                    {
+                        let (ty, _) = self.emit_tuple_literal(arr, target)?;
+                        ty
+                    } else if annotated_array_elem_ty.is_some() {
+                        // `Array<[T, U]>` / `Array<Shape>`: thread the
+                        // element class so inner literal forms route to
+                        // `emit_tuple_literal` / `emit_object_literal`.
+                        let elem_class =
+                            self.local_array_elem_classes.get(&name).cloned();
+                        self.emit_array_literal_with_class(
+                            arr,
+                            annotated_array_elem_ty,
+                            elem_class.as_deref(),
+                        )?
+                    } else {
+                        self.emit_array_literal(arr, None)?
+                    }
                 }
-                _ => self.emit_expr(init)?,
+                Expression::ObjectExpression(obj) => {
+                    let expected = self.local_class_types.get(&name).cloned();
+                    let (ty, resolved) = self.emit_object_literal(obj, expected.as_deref())?;
+                    // Populate tracking for the fingerprint-fallback path where
+                    // no annotation pre-seeded local_class_types.
+                    self.local_class_types
+                        .entry(name.clone())
+                        .or_insert(resolved);
+                    ty
+                }
+                _ => {
+                    let target_class = self.local_class_types.get(&name).cloned();
+                    self.emit_expr_coerced(init, target_class.as_deref())?
+                }
             };
             if init_ty != ty {
                 return Err(CompileError::type_err(format!(
@@ -283,24 +322,27 @@ impl<'a> FuncContext<'a> {
             .as_ref()
             .ok_or_else(|| CompileError::codegen("destructuring requires an initializer"))?;
 
-        // Resolve the class type of the initializer
+        // Resolve the class name of the initializer. ObjectExpression is
+        // special-cased so the literal emits exactly once; everything else
+        // routes through `resolve_expr_class` (identifier, `this`, member
+        // access on a class field, free/method call returning a class, ...).
+        let obj_local = self.alloc_local(WasmType::I32);
         let class_name = match init {
-            Expression::Identifier(ident) => {
-                let name = ident.name.as_str();
-                self.local_class_types.get(name).cloned().ok_or_else(|| {
-                    CompileError::codegen(format!(
-                        "cannot destructure '{name}' — not a known class instance"
-                    ))
-                })?
+            Expression::ObjectExpression(obj) => {
+                let (_, name) = self.emit_object_literal(obj, None)?;
+                self.push(Instruction::LocalSet(obj_local));
+                name
             }
-            Expression::ThisExpression(_) => self
-                .this_class
-                .clone()
-                .ok_or_else(|| CompileError::codegen("`this` used outside of a method"))?,
             _ => {
-                return Err(CompileError::unsupported(
-                    "object destructuring only supported on class instances",
-                ));
+                let name = self.resolve_expr_class(init).map_err(|_| {
+                    CompileError::codegen(
+                        "object destructuring requires a class instance — annotate the source \
+                         variable with its type, or assign to a typed local first",
+                    )
+                })?;
+                self.emit_expr(init)?;
+                self.push(Instruction::LocalSet(obj_local));
+                name
             }
         };
 
@@ -310,11 +352,6 @@ impl<'a> FuncContext<'a> {
             .get(&class_name)
             .ok_or_else(|| CompileError::codegen(format!("unknown class '{class_name}'")))?
             .clone();
-
-        // Evaluate the source object once, store in a temp local
-        let obj_local = self.alloc_local(WasmType::I32);
-        self.emit_expr(init)?;
-        self.push(Instruction::LocalSet(obj_local));
 
         // For each property in the pattern, load the field
         for prop in &obj_pat.properties {
@@ -330,7 +367,11 @@ impl<'a> FuncContext<'a> {
             // Get the local variable name (may differ from field name in non-shorthand)
             let var_name = match &prop.value {
                 BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
-                _ => return Err(CompileError::unsupported("nested destructuring")),
+                _ => {
+                    return Err(CompileError::unsupported(
+                        "nested destructuring in object pattern — not yet supported (Phase E)",
+                    ));
+                }
             };
 
             // Declare local and load the field value
@@ -372,7 +413,84 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
-    /// `const [first, second] = arr;` → desugar to indexed loads from the array.
+    /// `const [a, b] = t;` where `t` is a tuple → per-slot field loads.
+    /// Pattern arity must match tuple arity (with holes allowed for the
+    /// "skip this slot" form `const [, b] = t`). Rest elements `...r` are
+    /// rejected — tuples have a fixed shape.
+    fn emit_tuple_destructuring(
+        &mut self,
+        arr_pat: &ArrayPattern<'a>,
+        init: &Expression<'a>,
+        class_name: &str,
+    ) -> Result<(), CompileError> {
+        if arr_pat.rest.is_some() {
+            return Err(CompileError::unsupported(
+                "rest element in tuple destructuring — tuples have fixed arity",
+            ));
+        }
+        let layout = self
+            .module_ctx
+            .class_registry
+            .get(class_name)
+            .ok_or_else(|| CompileError::codegen(format!("tuple '{class_name}' not registered")))?
+            .clone();
+        if arr_pat.elements.len() > layout.fields.len() {
+            return Err(CompileError::type_err(format!(
+                "tuple destructuring pattern has {} element(s), tuple type '{class_name}' has {}",
+                arr_pat.elements.len(),
+                layout.fields.len()
+            )));
+        }
+
+        // Evaluate the source once into a temp; all field loads read from it.
+        let src_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(init)?;
+        self.push(Instruction::LocalSet(src_local));
+
+        for (i, element) in arr_pat.elements.iter().enumerate() {
+            let Some(binding) = element else {
+                continue; // hole: const [, b] = t
+            };
+            let var_name = match binding {
+                BindingPattern::BindingIdentifier(ident) => ident.name.as_str().to_string(),
+                _ => {
+                    return Err(CompileError::unsupported(
+                        "nested destructuring in tuple pattern — not yet supported",
+                    ));
+                }
+            };
+            let (field_name, offset, slot_ty) = layout.fields[i].clone();
+            let local_idx = self.declare_local(&var_name, slot_ty);
+            if let Some(cn) = layout.field_class_types.get(&field_name) {
+                self.local_class_types.insert(var_name.clone(), cn.clone());
+            }
+            if layout.field_string_types.contains(&field_name) {
+                self.local_string_vars.insert(var_name.clone());
+            }
+            self.push(Instruction::LocalGet(src_local));
+            match slot_ty {
+                WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                })),
+                WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                })),
+                _ => return Err(CompileError::codegen("void tuple slot")),
+            }
+            self.push(Instruction::LocalSet(local_idx));
+        }
+
+        Ok(())
+    }
+
+    /// `const [first, second] = arr;` → desugar to indexed loads from the
+    /// array. When the source is a tuple value (identifier / call / field /
+    /// etc.) each position maps to the tuple's `_N` field instead — so
+    /// heterogeneous slot types work.
     fn emit_array_destructuring(
         &mut self,
         arr_pat: &ArrayPattern<'a>,
@@ -382,6 +500,19 @@ impl<'a> FuncContext<'a> {
             .init
             .as_ref()
             .ok_or_else(|| CompileError::codegen("destructuring requires an initializer"))?;
+
+        // Tuple destructuring: when the source resolves to a tuple shape,
+        // walk per-slot layout (`_0`, `_1`, …) instead of the uniform
+        // `Array<T>` stride. Pick this branch before the Array<T> path so
+        // `const [a, b] = t` works even when `t` is also an Array-like
+        // identifier (it wouldn't be, but the ordering keeps the error
+        // message clean).
+        if let Ok(class_name) = self.resolve_expr_class(init)
+            && let Some(&i) = self.module_ctx.shape_registry.by_name.get(&class_name)
+            && self.module_ctx.shape_registry.shapes[i].is_tuple
+        {
+            return self.emit_tuple_destructuring(arr_pat, init, &class_name);
+        }
 
         // Resolve the array element type
         let elem_ty = match init {
@@ -559,7 +690,28 @@ impl<'a> FuncContext<'a> {
 
     fn emit_return(&mut self, ret: &ReturnStatement<'a>) -> Result<(), CompileError> {
         if let Some(arg) = &ret.argument {
-            self.emit_expr(arg)?;
+            match arg {
+                Expression::ObjectExpression(obj) => {
+                    let expected = self.return_class.clone();
+                    self.emit_object_literal(obj, expected.as_deref())?;
+                }
+                Expression::ArrayExpression(arr) => {
+                    // Tuple-typed return routes the literal to the tuple
+                    // emitter; otherwise falls back to the regular array path.
+                    let target = self.return_class.clone();
+                    if let Some(t) = target.as_deref()
+                        && self.is_tuple_shape(t)
+                    {
+                        self.emit_tuple_literal(arr, t)?;
+                    } else {
+                        self.emit_array_literal(arr, None)?;
+                    }
+                }
+                _ => {
+                    let target = self.return_class.clone();
+                    self.emit_expr_coerced(arg, target.as_deref())?;
+                }
+            }
         }
         self.push(Instruction::Return);
         Ok(())

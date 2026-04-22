@@ -1,5 +1,6 @@
 pub(crate) mod array_builtins;
 pub(crate) mod classes;
+pub(crate) mod coerce;
 pub(crate) mod dwarf;
 pub(crate) mod expr;
 pub(crate) mod func;
@@ -10,6 +11,8 @@ pub(crate) mod math_builtins;
 pub(crate) mod module;
 pub(crate) mod precompiled;
 mod sections;
+pub(crate) mod set_builtins;
+pub(crate) mod shapes;
 pub(crate) mod splice;
 mod stmt;
 pub(crate) mod string_builtins;
