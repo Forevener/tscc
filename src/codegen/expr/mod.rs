@@ -4,6 +4,7 @@ mod binary;
 mod call;
 mod class;
 mod closure;
+mod hash_table;
 mod map;
 mod member;
 mod object;

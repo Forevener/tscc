@@ -36,8 +36,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, hash_helper_for,
-    load_i32, load_typed, store_i32, store_typed,
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32,
+    load_typed, store_i32, store_typed,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
@@ -237,7 +237,7 @@ impl<'a> FuncContext<'a> {
 
         let key_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(key_arg)?;
-        self.check_key_type(&info, ty)?;
+        self.check_slot_type(&info, ty, "Map key")?;
         self.push(Instruction::LocalSet(key_local));
 
         let value_local = self.alloc_local(info.expect_value_ty().wasm_ty());
@@ -322,7 +322,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End);
         self.push(Instruction::Else);
         // OCCUPIED → compare keys; if match, overwrite and exit
-        self.emit_key_equals_stored(buckets_local, slot_local, key_local, &info);
+        self.emit_slot_equals_stored(buckets_local, slot_local, key_local, &info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::LocalSet(is_update));
@@ -640,7 +640,7 @@ impl<'a> FuncContext<'a> {
 
         let key_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(key_arg)?;
-        self.check_key_type(info, ty)?;
+        self.check_slot_type(info, ty, "Map key")?;
         self.push(Instruction::LocalSet(key_local));
 
         let buckets_local = self.alloc_local(WasmType::I32);
@@ -683,7 +683,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
         self.push(Instruction::I32Eq);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_key_equals_stored(buckets_local, slot_local, key_local, info);
+        self.emit_slot_equals_stored(buckets_local, slot_local, key_local, info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::LocalSet(found_local));
@@ -885,17 +885,6 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
-    /// Emit the hash call for a key already held in `key_local`, pushing the
-    /// raw i32 hash onto the stack. Routes to the appropriate
-    /// `__hash_fx_*` / `__hash_xxh3_*` helper based on the key type. For
-    /// helpers authored as L_splice (e.g. `__hash_fx_i32`), the body is
-    /// pasted inline via the splicer rather than emitted as a `Call`.
-    fn emit_hash_for_local(&mut self, key_local: u32, key_ty: &BoundType) {
-        self.push(Instruction::LocalGet(key_local));
-        let name = hash_helper_for(key_ty);
-        self.emit_helper_invocation(name);
-    }
-
     /// Emit a call to a runtime helper by name, splicing if it's L_splice and
     /// falling back to `Call(idx)` otherwise. Args must already be on the
     /// stack in the helper's parameter order. The result (if any) replaces
@@ -926,37 +915,6 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Call(func_idx));
     }
 
-    /// Compare the key stored at `buckets[slot]` against `key_local`, pushing
-    /// `1` (equal) or `0` onto the stack. Assumes the bucket is OCCUPIED —
-    /// calling this on EMPTY/TOMBSTONE slots is undefined because the stored
-    /// key bytes may be stale (matters for string keys whose comparison
-    /// dereferences a pointer).
-    fn emit_key_equals_stored(
-        &mut self,
-        buckets_local: u32,
-        slot_local: u32,
-        key_local: u32,
-        info: &HashTableInfo,
-    ) {
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
-        self.push(Instruction::LocalGet(key_local));
-        match &info.slot_ty {
-            BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
-            BoundType::Str => self.emit_helper_invocation("__str_eq"),
-            _ => self.push(Instruction::I32Eq),
-        }
-    }
-
-    /// Push `buckets_ptr + slot * bucket_size` onto the stack.
-    fn emit_bucket_addr(&mut self, buckets_local: u32, slot_local: u32, bucket_size: u32) {
-        self.push(Instruction::LocalGet(buckets_local));
-        self.push(Instruction::LocalGet(slot_local));
-        self.push(Instruction::I32Const(bucket_size as i32));
-        self.push(Instruction::I32Mul);
-        self.push(Instruction::I32Add);
-    }
-
     /// Copy of `HashTableInfo` — dispatcher wants a long-lived view while
     /// emitting method bodies that need a borrowed `&mut self`. Cheap (two
     /// enums + a small BucketLayout struct).
@@ -978,37 +936,9 @@ impl<'a> FuncContext<'a> {
             .unwrap_or_else(|| panic!("map class '{class_name}' missing field '{field_name}'"))
     }
 
-    /// Validate the type of a user-provided key argument against the map's
-    /// declared `K`. Numeric widening mirrors the rules used elsewhere in
-    /// tscc — an i32 literal passes for an f64-keyed map.
-    fn check_key_type(&mut self, info: &HashTableInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric(info.slot_ty.wasm_ty(), ty, "Map key")
-    }
-
     /// Like `check_key_type`, but for the value slot.
     fn check_value_type(&mut self, info: &HashTableInfo, ty: WasmType) -> Result<(), CompileError> {
         self.coerce_numeric(info.expect_value_ty().wasm_ty(), ty, "Map value")
-    }
-
-    /// If `actual` can be losslessly promoted to `expected` (i32 → f64),
-    /// emit the conversion; otherwise accept only exact matches. `slot` names
-    /// the argument in errors.
-    fn coerce_numeric(
-        &mut self,
-        expected: WasmType,
-        actual: WasmType,
-        slot: &str,
-    ) -> Result<(), CompileError> {
-        if actual == expected {
-            return Ok(());
-        }
-        if expected == WasmType::F64 && actual == WasmType::I32 {
-            self.push(Instruction::F64ConvertI32S);
-            return Ok(());
-        }
-        Err(CompileError::type_err(format!(
-            "{slot} type mismatch: expected {expected:?}, got {actual:?}"
-        )))
     }
 
     /// Stash a set of arrow-param bindings so the callback body sees each

@@ -20,8 +20,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, hash_helper_for,
-    load_i32, load_typed, store_i32, store_typed,
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32,
+    load_typed, store_i32, store_typed,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
@@ -162,7 +162,7 @@ impl<'a> FuncContext<'a> {
 
         let elem_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(elem_arg)?;
-        self.check_elem_type(&info, ty)?;
+        self.check_slot_type(&info, ty, "Set element")?;
         self.push(Instruction::LocalSet(elem_local));
 
         // Load-factor check — if `size*4 >= cap*3`, grow before probing so the
@@ -196,7 +196,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_set_hash_for_local(elem_local, &info.slot_ty);
+        self.emit_hash_for_local(elem_local, &info.slot_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -214,7 +214,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
         let state_local = self.alloc_local(WasmType::I32);
-        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
@@ -239,7 +239,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End);
         self.push(Instruction::Else);
         // OCCUPIED → compare elements; on match, flag and exit
-        self.emit_elem_equals_stored(buckets_local, slot_local, elem_local, &info);
+        self.emit_slot_equals_stored(buckets_local, slot_local, elem_local, &info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::LocalSet(already_present));
@@ -277,7 +277,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(insert_slot));
 
         let target_addr = self.alloc_local(WasmType::I32);
-        self.emit_set_bucket_addr(buckets_local, insert_slot, info.bucket.total_size);
+        self.emit_bucket_addr(buckets_local, insert_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(target_addr));
 
         // state = OCCUPIED
@@ -311,7 +311,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_set_bucket_addr(buckets_local, old_tail, info.bucket.total_size);
+        self.emit_bucket_addr(buckets_local, old_tail, info.bucket.total_size);
         self.push(Instruction::LocalGet(insert_slot));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -357,7 +357,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::If(BlockType::Empty));
 
         let target_addr = self.alloc_local(WasmType::I32);
-        self.emit_set_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
+        self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
         self.push(Instruction::LocalSet(target_addr));
 
         let prev_idx = self.alloc_local(WasmType::I32);
@@ -374,7 +374,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_set_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
+        self.emit_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
         self.push(Instruction::LocalGet(next_idx));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -388,7 +388,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_set_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
+        self.emit_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
         self.push(Instruction::LocalGet(prev_idx));
         self.push(store_i32(info.bucket.prev_offset));
         self.push(Instruction::Else);
@@ -479,7 +479,7 @@ impl<'a> FuncContext<'a> {
 
         // Load elem + next from bucket before calling the body.
         let addr_local = self.alloc_local(WasmType::I32);
-        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
         self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(elem_local));
@@ -524,7 +524,7 @@ impl<'a> FuncContext<'a> {
 
         let elem_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(elem_arg)?;
-        self.check_elem_type(info, ty)?;
+        self.check_slot_type(info, ty, "Set element")?;
         self.push(Instruction::LocalSet(elem_local));
 
         let buckets_local = self.alloc_local(WasmType::I32);
@@ -539,7 +539,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_set_hash_for_local(elem_local, &info.slot_ty);
+        self.emit_hash_for_local(elem_local, &info.slot_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -551,7 +551,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
         let state_local = self.alloc_local(WasmType::I32);
-        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
@@ -564,7 +564,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
         self.push(Instruction::I32Eq);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_elem_equals_stored(buckets_local, slot_local, elem_local, info);
+        self.emit_slot_equals_stored(buckets_local, slot_local, elem_local, info);
         self.push(Instruction::If(BlockType::Empty));
         self.push(Instruction::I32Const(1));
         self.push(Instruction::LocalSet(found_local));
@@ -661,7 +661,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Eq);
         self.push(Instruction::BrIf(1));
 
-        self.emit_set_bucket_addr(old_buckets, old_slot, info.bucket.total_size);
+        self.emit_bucket_addr(old_buckets, old_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(old_addr));
 
         self.push(Instruction::LocalGet(old_addr));
@@ -670,14 +670,14 @@ impl<'a> FuncContext<'a> {
 
         // Probe in the new array: no duplicates, no tombstones, so just find
         // the first EMPTY slot.
-        self.emit_set_hash_for_local(elem_local, &info.slot_ty);
+        self.emit_hash_for_local(elem_local, &info.slot_ty);
         self.push(Instruction::LocalGet(new_mask));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(hash_slot));
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
-        self.emit_set_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
+        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
         self.push(Instruction::I32Load8U(MemArg {
             offset: info.bucket.state_offset as u64,
             align: 0,
@@ -695,7 +695,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End);
         self.push(Instruction::End);
 
-        self.emit_set_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
+        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
         self.push(Instruction::LocalSet(new_addr));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::I32Const(BUCKET_OCCUPIED));
@@ -723,7 +723,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(EMPTY_LINK));
         self.push(Instruction::I32Ne);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_set_bucket_addr(new_buckets, prev_tail, info.bucket.total_size);
+        self.emit_bucket_addr(new_buckets, prev_tail, info.bucket.total_size);
         self.push(Instruction::LocalGet(hash_slot));
         self.push(store_i32(info.bucket.next_offset));
         self.push(Instruction::Else);
@@ -746,43 +746,6 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
-    /// Emit the hash call for an element already held in `elem_local`, pushing
-    /// the raw i32 hash onto the stack. Dispatches via the same helpers Map
-    /// uses — same bundled precompiled functions.
-    fn emit_set_hash_for_local(&mut self, elem_local: u32, elem_ty: &BoundType) {
-        self.push(Instruction::LocalGet(elem_local));
-        let name = hash_helper_for(elem_ty);
-        self.emit_helper_invocation(name);
-    }
-
-    /// Compare the element stored at `buckets[slot]` against `elem_local`,
-    /// pushing `1` (equal) or `0`. Assumes the bucket is OCCUPIED.
-    fn emit_elem_equals_stored(
-        &mut self,
-        buckets_local: u32,
-        slot_local: u32,
-        elem_local: u32,
-        info: &HashTableInfo,
-    ) {
-        self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
-        self.push(Instruction::LocalGet(elem_local));
-        match &info.slot_ty {
-            BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
-            BoundType::Str => self.emit_helper_invocation("__str_eq"),
-            _ => self.push(Instruction::I32Eq),
-        }
-    }
-
-    /// Push `buckets_ptr + slot * bucket_size` onto the stack.
-    fn emit_set_bucket_addr(&mut self, buckets_local: u32, slot_local: u32, bucket_size: u32) {
-        self.push(Instruction::LocalGet(buckets_local));
-        self.push(Instruction::LocalGet(slot_local));
-        self.push(Instruction::I32Const(bucket_size as i32));
-        self.push(Instruction::I32Mul);
-        self.push(Instruction::I32Add);
-    }
-
     fn set_info(&self, class_name: &str) -> HashTableInfo {
         self.module_ctx
             .set_info
@@ -797,28 +760,6 @@ impl<'a> FuncContext<'a> {
             .get(class_name)
             .and_then(|l| l.field_map.get(field_name).map(|(off, _)| *off))
             .unwrap_or_else(|| panic!("set class '{class_name}' missing field '{field_name}'"))
-    }
-
-    fn check_elem_type(&mut self, info: &HashTableInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric_set(info.slot_ty.wasm_ty(), ty, "Set element")
-    }
-
-    fn coerce_numeric_set(
-        &mut self,
-        expected: WasmType,
-        actual: WasmType,
-        slot: &str,
-    ) -> Result<(), CompileError> {
-        if actual == expected {
-            return Ok(());
-        }
-        if expected == WasmType::F64 && actual == WasmType::I32 {
-            self.push(Instruction::F64ConvertI32S);
-            return Ok(());
-        }
-        Err(CompileError::type_err(format!(
-            "{slot} type mismatch: expected {expected:?}, got {actual:?}"
-        )))
     }
 
     fn push_set_arrow_scope(
