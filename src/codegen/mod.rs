@@ -6,6 +6,7 @@ pub(crate) mod expr;
 pub(crate) mod func;
 pub(crate) mod generics;
 pub(crate) mod hash_builtins;
+pub(crate) mod hash_table;
 pub(crate) mod map_builtins;
 pub(crate) mod math_builtins;
 pub(crate) mod module;

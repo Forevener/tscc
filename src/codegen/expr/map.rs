@@ -35,21 +35,13 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
-use crate::codegen::map_builtins::{
-    self, BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, MapInfo,
+use crate::codegen::hash_table::{
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, load_i32, load_typed, store_i32,
+    store_typed,
 };
+use crate::codegen::map_builtins::{self, MapInfo};
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
-
-/// WASM alignment hint (log2 of byte alignment) for a key/value slot. Matches
-/// the natural alignment of each type. Keeping this here so every load/store
-/// against a bucket speaks the same hint.
-fn mem_align(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 3,
-        _ => 2,
-    }
-}
 
 impl<'a> FuncContext<'a> {
     /// Entry point invoked from `emit_call`. Peeks at the call's callee; if
@@ -377,7 +369,7 @@ impl<'a> FuncContext<'a> {
         // Always write the value (overwrite or fresh insert).
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_value(&info.value_ty, info.bucket.value_offset));
+        self.push(store_typed(&info.value_ty, info.bucket.value_offset));
 
         // Insert-only path: state → OCCUPIED, write key, link into chain, bump size.
         self.push(Instruction::LocalGet(is_update));
@@ -394,7 +386,7 @@ impl<'a> FuncContext<'a> {
         // key = k
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_key(&info.key_ty, info.bucket.key_offset));
+        self.push(store_typed(&info.key_ty, info.bucket.key_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -600,10 +592,10 @@ impl<'a> FuncContext<'a> {
         let addr_local = self.alloc_local(WasmType::I32);
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_value(&info.value_ty, info.bucket.value_offset));
+        self.push(load_typed(&info.value_ty, info.bucket.value_offset));
         self.push(Instruction::LocalSet(value_local));
         self.push(Instruction::LocalGet(addr_local));
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
         self.push(Instruction::LocalSet(key_local));
 
         let next_local = self.alloc_local(WasmType::I32);
@@ -802,10 +794,10 @@ impl<'a> FuncContext<'a> {
 
         // Load key + value.
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
         self.push(Instruction::LocalSet(key_local));
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_value(&info.value_ty, info.bucket.value_offset));
+        self.push(load_typed(&info.value_ty, info.bucket.value_offset));
         self.push(Instruction::LocalSet(value_local));
 
         // Probe in the new array: no duplicates and no tombstones, so we
@@ -848,10 +840,10 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_key(&info.key_ty, info.bucket.key_offset));
+        self.push(store_typed(&info.key_ty, info.bucket.key_offset));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_value(&info.value_ty, info.bucket.value_offset));
+        self.push(store_typed(&info.value_ty, info.bucket.value_offset));
 
         // Link into chain: new_prev = header.tail, new_next = -1.
         // If header.tail == -1: header.head = hash_slot. Else: tail_bucket.next = hash_slot.
@@ -948,7 +940,7 @@ impl<'a> FuncContext<'a> {
         info: &MapInfo,
     ) {
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_key(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
         self.push(Instruction::LocalGet(key_local));
         match &info.key_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
@@ -1116,60 +1108,4 @@ struct MapScopeEntry {
     saved_class: Option<String>,
     saved_string: bool,
     saved_closure_sig: Option<ClosureSig>,
-}
-
-// ── mem-access helpers ────────────────────────────────────────────────
-
-fn load_i32(offset: u32) -> Instruction<'static> {
-    Instruction::I32Load(MemArg {
-        offset: offset as u64,
-        align: 2,
-        memory_index: 0,
-    })
-}
-
-fn store_i32(offset: u32) -> Instruction<'static> {
-    Instruction::I32Store(MemArg {
-        offset: offset as u64,
-        align: 2,
-        memory_index: 0,
-    })
-}
-
-fn load_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    match ty {
-        BoundType::F64 => Instruction::F64Load(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-        _ => Instruction::I32Load(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-    }
-}
-
-fn store_key(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    match ty {
-        BoundType::F64 => Instruction::F64Store(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-        _ => Instruction::I32Store(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-    }
-}
-
-fn load_value(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    load_key(ty, offset)
-}
-
-fn store_value(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    store_key(ty, offset)
 }

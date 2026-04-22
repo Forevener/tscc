@@ -23,6 +23,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
+use super::hash_table::{align_up, bound_align, bound_size};
 
 /// Source-level name used to trigger Set recognition in type annotations and
 /// `new` expressions.
@@ -67,30 +68,6 @@ pub fn is_set_base(name: &str) -> bool {
     name == SET_BASE
 }
 
-/// Initial bucket capacity for a freshly-constructed Set. Power of two — the
-/// probing + rebuild machinery relies on it.
-pub const INITIAL_CAPACITY: u32 = 8;
-
-/// Byte width of a `BoundType` when laid out in a bucket.
-fn bound_size(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
-    }
-}
-
-/// Byte alignment of a `BoundType`.
-fn bound_align(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
-    }
-}
-
-fn align_up(offset: u32, alignment: u32) -> u32 {
-    (offset + alignment - 1) & !(alignment - 1)
-}
-
 /// Per-monomorphization bucket layout. All offsets are byte offsets from the
 /// start of the bucket; `total_size` is padded to `max(alignof(T), 4)` so an
 /// array of buckets stays aligned.
@@ -133,16 +110,6 @@ impl SetBucketLayout {
         }
     }
 }
-
-/// Bucket state values. Matches Map's constants — same semantics for the
-/// probe machinery.
-pub const BUCKET_EMPTY: i32 = 0;
-pub const BUCKET_OCCUPIED: i32 = 1;
-pub const BUCKET_TOMBSTONE: i32 = 2;
-
-/// Sentinel for `head_idx` / `tail_idx` meaning "empty list", and for
-/// `next_insert` / `prev_insert` at the ends of the insertion chain.
-pub const EMPTY_LINK: i32 = -1;
 
 /// Runtime helpers the emitted method bodies reference for `insts`. Reuses
 /// `map_builtins::hash_helper_for` / `equality_helper_for` — sets and maps

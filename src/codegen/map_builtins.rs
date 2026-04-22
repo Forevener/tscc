@@ -26,6 +26,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
+use super::hash_table::{align_up, bound_align, bound_size};
 
 /// Source-level name used to trigger Map recognition in type annotations and
 /// `new` expressions.
@@ -81,32 +82,6 @@ pub fn is_map_base(name: &str) -> bool {
     name == MAP_BASE
 }
 
-/// Initial bucket capacity for a freshly-constructed Map. Power of two — the
-/// probing + rebuild machinery (Step 4+) relies on it.
-pub const INITIAL_CAPACITY: u32 = 8;
-
-/// Byte width of a `BoundType` when laid out in a bucket. Matches the widths
-/// used by `ClassLayout` in `classes.rs`.
-fn bound_size(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
-    }
-}
-
-/// Byte alignment of a `BoundType`. `f64` needs 8-byte alignment for fast
-/// naturally-aligned loads; everything else is a 32-bit value.
-fn bound_align(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
-    }
-}
-
-fn align_up(offset: u32, alignment: u32) -> u32 {
-    (offset + alignment - 1) & !(alignment - 1)
-}
-
 /// Per-monomorphization bucket layout. All offsets are byte offsets from the
 /// start of the bucket; `total_size` is padded to `max(alignof(K), alignof(V),
 /// 4)` so an array of buckets stays aligned.
@@ -154,16 +129,6 @@ impl BucketLayout {
         }
     }
 }
-
-/// Bucket state values stored in the `state: u8` byte. `clear()` resets
-/// everything to `BUCKET_EMPTY` via a single `memory.fill`.
-pub const BUCKET_EMPTY: i32 = 0;
-pub const BUCKET_OCCUPIED: i32 = 1;
-pub const BUCKET_TOMBSTONE: i32 = 2;
-
-/// Sentinel value for `head_idx` / `tail_idx` meaning "no entries yet", and
-/// for `next_insert` / `prev_insert` at the ends of the insertion chain.
-pub const EMPTY_LINK: i32 = -1;
 
 /// Name of the hash runtime helper that covers a given key type. Strings ride
 /// on xxh3 (better distribution for prefix-heavy inputs); everything else hits

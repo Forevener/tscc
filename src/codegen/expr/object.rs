@@ -2,10 +2,13 @@ use oxc_ast::ast::*;
 use wasm_encoder::Instruction;
 
 use crate::codegen::classes::ClassLayout;
+use crate::codegen::coerce::{emit_field_load, emit_field_store};
 use crate::codegen::func::FuncContext;
-use crate::codegen::shapes::ShapeField;
+use crate::codegen::shapes::{ShapeField, fingerprint_of};
 use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
+
+use super::{SlotRef, is_pure_rhs, widen_or_check};
 
 impl<'a> FuncContext<'a> {
     /// Emit an `ObjectExpression` literal as a synthetic-class instance store.
@@ -223,22 +226,6 @@ fn fingerprint_object_expression<'a>(
     Ok(fingerprint_of(&fields))
 }
 
-/// Canonical fingerprint identical to `shapes.rs::fingerprint_of`. Duplicated
-/// here (not extracted) because A.4's caller surface is narrow; extraction
-/// waits for D.3 tuples when the same helper is needed again.
-fn fingerprint_of(fields: &[ShapeField]) -> String {
-    let mut pairs: Vec<(&str, String)> = fields
-        .iter()
-        .map(|f| (f.name.as_str(), f.ty.mangle_token()))
-        .collect();
-    pairs.sort_by(|a, b| a.0.cmp(b.0));
-    pairs
-        .into_iter()
-        .map(|(n, t)| format!("{n}_{t}"))
-        .collect::<Vec<_>>()
-        .join("$")
-}
-
 /// Narrow, standalone expression typer for fingerprinting. Mirrors
 /// `shapes.rs::ShapeWalker::infer_expr_bound_type` but runs at emit time so
 /// it can consult `local_class_types` / `local_string_vars`. Returns `None`
@@ -374,22 +361,6 @@ fn all_properties_pure(obj: &ObjectExpression) -> bool {
     })
 }
 
-fn is_pure_rhs(expr: &Expression) -> bool {
-    match expr {
-        Expression::NumericLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::Identifier(_)
-        | Expression::ThisExpression(_) => true,
-        Expression::ParenthesizedExpression(p) => is_pure_rhs(&p.expression),
-        Expression::UnaryExpression(u) => is_pure_rhs(&u.argument),
-        Expression::TSAsExpression(a) => is_pure_rhs(&a.expression),
-        Expression::StaticMemberExpression(m) => is_pure_rhs(&m.object),
-        _ => false,
-    }
-}
-
 fn extract_property_key(p: &ObjectProperty) -> Result<String, CompileError> {
     match &p.key {
         PropertyKey::StaticIdentifier(id) => Ok(id.name.as_str().to_string()),
@@ -398,40 +369,6 @@ fn extract_property_key(p: &ObjectProperty) -> Result<String, CompileError> {
             "computed property key in object literal",
         )),
     }
-}
-
-fn emit_field_store(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
-    match ty {
-        WasmType::F64 => ctx.push(Instruction::F64Store(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 3,
-            memory_index: 0,
-        })),
-        WasmType::I32 => ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 2,
-            memory_index: 0,
-        })),
-        _ => {}
-    }
-}
-
-fn widen_or_check(
-    rhs_ty: WasmType,
-    field_ty: WasmType,
-    key: &str,
-    ctx: &mut FuncContext<'_>,
-) -> Result<(), CompileError> {
-    if rhs_ty == field_ty {
-        return Ok(());
-    }
-    if field_ty == WasmType::F64 && rhs_ty == WasmType::I32 {
-        ctx.push(Instruction::F64ConvertI32S);
-        return Ok(());
-    }
-    Err(CompileError::type_err(format!(
-        "object literal field '{key}' has type {rhs_ty:?}, expected {field_ty:?}"
-    )))
 }
 
 /// Lookup field offset+type by name; error clearly if the name is not on the
@@ -465,8 +402,8 @@ fn emit_inline<'a>(
         let (offset, field_ty) = field_slot(layout, &key)?;
         let expected_class = layout.field_class_types.get(&key).cloned();
         ctx.push(Instruction::LocalGet(ptr_local));
-        let rhs_ty = emit_field_rhs(ctx, &p.value, expected_class.as_deref())?;
-        widen_or_check(rhs_ty, field_ty, &key, ctx)?;
+        let rhs_ty = ctx.emit_expr_with_expected(&p.value, expected_class.as_deref())?;
+        widen_or_check(rhs_ty, field_ty, SlotRef::Field { name: &key }, ctx)?;
         emit_field_store(ctx, offset, field_ty);
     }
 
@@ -487,8 +424,8 @@ fn emit_with_temps<'a>(
         let key = extract_property_key(p)?;
         let (_, field_ty) = field_slot(layout, &key)?;
         let expected_class = layout.field_class_types.get(&key).cloned();
-        let rhs_ty = emit_field_rhs(ctx, &p.value, expected_class.as_deref())?;
-        widen_or_check(rhs_ty, field_ty, &key, ctx)?;
+        let rhs_ty = ctx.emit_expr_with_expected(&p.value, expected_class.as_deref())?;
+        widen_or_check(rhs_ty, field_ty, SlotRef::Field { name: &key }, ctx)?;
         let tmp = ctx.alloc_local(field_ty);
         ctx.push(Instruction::LocalSet(tmp));
         evaluated.push((key, tmp, field_ty));
@@ -506,25 +443,6 @@ fn emit_with_temps<'a>(
 
     ctx.push(Instruction::LocalGet(ptr_local));
     Ok(())
-}
-
-/// Emit the RHS of a single field, threading the field's declared class into
-/// any nested `ObjectExpression` so shape-typed subfields compose naturally.
-fn emit_field_rhs<'a>(
-    ctx: &mut FuncContext<'a>,
-    value: &Expression<'a>,
-    expected_class: Option<&str>,
-) -> Result<WasmType, CompileError> {
-    match value {
-        Expression::ObjectExpression(inner) => {
-            let (ty, _) = ctx.emit_object_literal(inner, expected_class)?;
-            Ok(ty)
-        }
-        Expression::ParenthesizedExpression(p) => {
-            emit_field_rhs(ctx, &p.expression, expected_class)
-        }
-        _ => ctx.emit_expr(value),
-    }
 }
 
 /// Field source recorded during the source-order pre-pass. `Explicit` means a
@@ -643,8 +561,8 @@ fn emit_with_spreads<'a>(
                 }
                 let (_, field_ty) = field_slot(layout, &key)?;
                 let expected_class = layout.field_class_types.get(&key).cloned();
-                let rhs_ty = emit_field_rhs(ctx, &p.value, expected_class.as_deref())?;
-                widen_or_check(rhs_ty, field_ty, &key, ctx)?;
+                let rhs_ty = ctx.emit_expr_with_expected(&p.value, expected_class.as_deref())?;
+                widen_or_check(rhs_ty, field_ty, SlotRef::Field { name: &key }, ctx)?;
                 let tmp_local = ctx.alloc_local(field_ty);
                 ctx.push(Instruction::LocalSet(tmp_local));
                 sources.insert(
@@ -713,20 +631,4 @@ fn emit_with_spreads<'a>(
 
     ctx.push(Instruction::LocalGet(ptr_local));
     Ok(())
-}
-
-fn emit_field_load(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
-    match ty {
-        WasmType::F64 => ctx.push(Instruction::F64Load(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 3,
-            memory_index: 0,
-        })),
-        WasmType::I32 => ctx.push(Instruction::I32Load(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 2,
-            memory_index: 0,
-        })),
-        _ => {}
-    }
 }

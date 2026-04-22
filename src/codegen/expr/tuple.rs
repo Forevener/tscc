@@ -16,9 +16,12 @@ use oxc_ast::ast::*;
 use wasm_encoder::Instruction;
 
 use crate::codegen::classes::ClassLayout;
+use crate::codegen::coerce::emit_field_store;
 use crate::codegen::func::FuncContext;
 use crate::error::CompileError;
 use crate::types::WasmType;
+
+use super::{SlotRef, is_pure_rhs, widen_or_check};
 
 impl<'a> FuncContext<'a> {
     /// Emit an `ArrayExpression` as a tuple-literal store into a freshly
@@ -97,22 +100,6 @@ fn all_elements_pure(arr: &ArrayExpression) -> bool {
     })
 }
 
-fn is_pure_rhs(expr: &Expression) -> bool {
-    match expr {
-        Expression::NumericLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::NullLiteral(_)
-        | Expression::Identifier(_)
-        | Expression::ThisExpression(_) => true,
-        Expression::ParenthesizedExpression(p) => is_pure_rhs(&p.expression),
-        Expression::UnaryExpression(u) => is_pure_rhs(&u.argument),
-        Expression::TSAsExpression(a) => is_pure_rhs(&a.expression),
-        Expression::StaticMemberExpression(m) => is_pure_rhs(&m.object),
-        _ => false,
-    }
-}
-
 fn emit_tuple_inline<'a>(
     ctx: &mut FuncContext<'a>,
     arr: &ArrayExpression<'a>,
@@ -128,8 +115,8 @@ fn emit_tuple_inline<'a>(
         let (slot_name, offset, slot_ty) = slot_info(layout, i);
         let expected_class = layout.field_class_types.get(slot_name).cloned();
         ctx.push(Instruction::LocalGet(ptr_local));
-        let rhs_ty = emit_slot_rhs(ctx, expr, expected_class.as_deref())?;
-        widen_or_check(rhs_ty, slot_ty, i, target_name(layout), ctx)?;
+        let rhs_ty = ctx.emit_expr_with_expected(expr, expected_class.as_deref())?;
+        widen_or_check(rhs_ty, slot_ty, SlotRef::Tuple { index: i, target: target_name(layout) }, ctx)?;
         emit_field_store(ctx, offset, slot_ty);
     }
 
@@ -149,8 +136,8 @@ fn emit_tuple_with_temps<'a>(
         })?;
         let (slot_name, offset, slot_ty) = slot_info(layout, i);
         let expected_class = layout.field_class_types.get(slot_name).cloned();
-        let rhs_ty = emit_slot_rhs(ctx, expr, expected_class.as_deref())?;
-        widen_or_check(rhs_ty, slot_ty, i, target_name(layout), ctx)?;
+        let rhs_ty = ctx.emit_expr_with_expected(expr, expected_class.as_deref())?;
+        widen_or_check(rhs_ty, slot_ty, SlotRef::Tuple { index: i, target: target_name(layout) }, ctx)?;
         let tmp = ctx.alloc_local(slot_ty);
         ctx.push(Instruction::LocalSet(tmp));
         evaluated.push((offset, tmp, slot_ty));
@@ -169,39 +156,6 @@ fn emit_tuple_with_temps<'a>(
     Ok(())
 }
 
-/// Emit a tuple slot's RHS, threading the declared class into nested literal
-/// forms (object + tuple) so shape-typed positions compose naturally.
-fn emit_slot_rhs<'a>(
-    ctx: &mut FuncContext<'a>,
-    value: &Expression<'a>,
-    expected_class: Option<&str>,
-) -> Result<WasmType, CompileError> {
-    match value {
-        Expression::ObjectExpression(inner) => {
-            let (ty, _) = ctx.emit_object_literal(inner, expected_class)?;
-            Ok(ty)
-        }
-        Expression::ArrayExpression(inner) => {
-            // Nested tuple literal — only if the slot's declared class is
-            // itself a tuple shape.
-            if let Some(target) = expected_class
-                && let Some(shape) =
-                    ctx.module_ctx.shape_registry.by_name.get(target).copied()
-                && ctx.module_ctx.shape_registry.shapes[shape].is_tuple
-            {
-                let (ty, _) = ctx.emit_tuple_literal(inner, target)?;
-                return Ok(ty);
-            }
-            // No tuple hint — fall through to array literal.
-            ctx.emit_array_literal(inner, None)
-        }
-        Expression::ParenthesizedExpression(p) => {
-            emit_slot_rhs(ctx, &p.expression, expected_class)
-        }
-        _ => ctx.emit_expr(value),
-    }
-}
-
 fn slot_info(layout: &ClassLayout, i: usize) -> (&str, u32, WasmType) {
     let (name, offset, ty) = &layout.fields[i];
     (name.as_str(), *offset, *ty)
@@ -209,39 +163,4 @@ fn slot_info(layout: &ClassLayout, i: usize) -> (&str, u32, WasmType) {
 
 fn target_name(layout: &ClassLayout) -> &str {
     layout.name.as_str()
-}
-
-fn widen_or_check(
-    rhs_ty: WasmType,
-    slot_ty: WasmType,
-    index: usize,
-    target: &str,
-    ctx: &mut FuncContext<'_>,
-) -> Result<(), CompileError> {
-    if rhs_ty == slot_ty {
-        return Ok(());
-    }
-    if slot_ty == WasmType::F64 && rhs_ty == WasmType::I32 {
-        ctx.push(Instruction::F64ConvertI32S);
-        return Ok(());
-    }
-    Err(CompileError::type_err(format!(
-        "tuple literal element {index} has type {rhs_ty:?}, tuple type '{target}' expects {slot_ty:?}"
-    )))
-}
-
-fn emit_field_store(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
-    match ty {
-        WasmType::F64 => ctx.push(Instruction::F64Store(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 3,
-            memory_index: 0,
-        })),
-        WasmType::I32 => ctx.push(Instruction::I32Store(wasm_encoder::MemArg {
-            offset: offset as u64,
-            align: 2,
-            memory_index: 0,
-        })),
-        WasmType::Void => {}
-    }
 }

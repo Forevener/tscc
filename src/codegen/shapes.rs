@@ -1584,7 +1584,7 @@ fn property_signature_key(prop: &TSPropertySignature) -> Result<String, CompileE
 /// Canonical fingerprint: sort `(name, mangle_token)` pairs by name, join as
 /// `name1_ty1$name2_ty2$...`. Identical to the mangled suffix used in the
 /// anonymous shape's synthetic class name.
-fn fingerprint_of(fields: &[ShapeField]) -> String {
+pub(crate) fn fingerprint_of(fields: &[ShapeField]) -> String {
     let mut pairs: Vec<(&str, String)> = fields
         .iter()
         .map(|f| (f.name.as_str(), f.ty.mangle_token()))

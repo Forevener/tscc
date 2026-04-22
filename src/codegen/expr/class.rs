@@ -104,7 +104,8 @@ impl<'a> FuncContext<'a> {
         &mut self,
         new_expr: &NewExpression<'a>,
     ) -> Result<WasmType, CompileError> {
-        use crate::codegen::map_builtins::{self, INITIAL_CAPACITY};
+        use crate::codegen::hash_table::INITIAL_CAPACITY;
+        use crate::codegen::map_builtins;
 
         if !new_expr.arguments.is_empty() {
             return Err(CompileError::codegen(
@@ -177,14 +178,14 @@ impl<'a> FuncContext<'a> {
 
         // header.head_idx = -1, header.tail_idx = -1
         self.push(Instruction::LocalGet(header_ptr));
-        self.push(Instruction::I32Const(map_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Const(crate::codegen::hash_table::EMPTY_LINK));
         self.push(Instruction::I32Store(wasm_encoder::MemArg {
             offset: head_off as u64,
             align: 2,
             memory_index: 0,
         }));
         self.push(Instruction::LocalGet(header_ptr));
-        self.push(Instruction::I32Const(map_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Const(crate::codegen::hash_table::EMPTY_LINK));
         self.push(Instruction::I32Store(wasm_encoder::MemArg {
             offset: tail_off as u64,
             align: 2,
@@ -206,7 +207,8 @@ impl<'a> FuncContext<'a> {
         &mut self,
         new_expr: &NewExpression<'a>,
     ) -> Result<WasmType, CompileError> {
-        use crate::codegen::set_builtins::{self, INITIAL_CAPACITY};
+        use crate::codegen::hash_table::INITIAL_CAPACITY;
+        use crate::codegen::set_builtins;
 
         if !new_expr.arguments.is_empty() {
             return Err(CompileError::codegen(
@@ -271,14 +273,14 @@ impl<'a> FuncContext<'a> {
         }));
 
         self.push(Instruction::LocalGet(header_ptr));
-        self.push(Instruction::I32Const(set_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Const(crate::codegen::hash_table::EMPTY_LINK));
         self.push(Instruction::I32Store(wasm_encoder::MemArg {
             offset: head_off as u64,
             align: 2,
             memory_index: 0,
         }));
         self.push(Instruction::LocalGet(header_ptr));
-        self.push(Instruction::I32Const(set_builtins::EMPTY_LINK));
+        self.push(Instruction::I32Const(crate::codegen::hash_table::EMPTY_LINK));
         self.push(Instruction::I32Store(wasm_encoder::MemArg {
             offset: tail_off as u64,
             align: 2,

@@ -78,10 +78,6 @@ impl<'a> FuncContext<'a> {
     /// reach `emit_object_literal` / `emit_tuple_literal` directly to get
     /// the resolved class back. This wrapper is the generic entry point
     /// and handles paren-wrapped forwarding.
-    #[allow(
-        dead_code,
-        reason = "entry point for future literal-kind hints; Phase D sites reach tuple / object emitters directly"
-    )]
     pub fn emit_expr_with_expected(
         &mut self,
         expr: &Expression<'a>,
@@ -271,4 +267,48 @@ pub(crate) fn number_constant(name: &str) -> Option<f64> {
         "NaN" => f64::NAN,
         _ => return None,
     })
+}
+
+pub(super) fn is_pure_rhs(expr: &Expression) -> bool {
+    match expr {
+        Expression::NumericLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::ThisExpression(_) => true,
+        Expression::ParenthesizedExpression(p) => is_pure_rhs(&p.expression),
+        Expression::UnaryExpression(u) => is_pure_rhs(&u.argument),
+        Expression::TSAsExpression(a) => is_pure_rhs(&a.expression),
+        Expression::StaticMemberExpression(m) => is_pure_rhs(&m.object),
+        _ => false,
+    }
+}
+
+pub(super) enum SlotRef<'a> {
+    Field { name: &'a str },
+    Tuple { index: usize, target: &'a str },
+}
+
+pub(super) fn widen_or_check(
+    rhs_ty: WasmType,
+    slot_ty: WasmType,
+    slot: SlotRef,
+    ctx: &mut FuncContext<'_>,
+) -> Result<(), CompileError> {
+    if rhs_ty == slot_ty {
+        return Ok(());
+    }
+    if slot_ty == WasmType::F64 && rhs_ty == WasmType::I32 {
+        ctx.push(Instruction::F64ConvertI32S);
+        return Ok(());
+    }
+    Err(CompileError::type_err(match slot {
+        SlotRef::Field { name } => format!(
+            "object literal field '{name}' has type {rhs_ty:?}, expected {slot_ty:?}"
+        ),
+        SlotRef::Tuple { index, target } => format!(
+            "tuple literal element {index} has type {rhs_ty:?}, tuple type '{target}' expects {slot_ty:?}"
+        ),
+    }))
 }

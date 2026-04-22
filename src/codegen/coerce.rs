@@ -157,7 +157,7 @@ impl<'a> FuncContext<'a> {
     }
 }
 
-fn emit_field_load(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
+pub(crate) fn emit_field_load(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
     match ty {
         WasmType::F64 => ctx.push(Instruction::F64Load(wasm_encoder::MemArg {
             offset: offset as u64,
@@ -173,7 +173,7 @@ fn emit_field_load(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
     }
 }
 
-fn emit_field_store(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
+pub(crate) fn emit_field_store(ctx: &mut FuncContext<'_>, offset: u32, ty: WasmType) {
     match ty {
         WasmType::F64 => ctx.push(Instruction::F64Store(wasm_encoder::MemArg {
             offset: offset as u64,

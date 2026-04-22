@@ -19,19 +19,13 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
-use crate::codegen::set_builtins::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, SetInfo,
+use crate::codegen::hash_table::{
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, load_i32, load_typed, store_i32,
+    store_typed,
 };
+use crate::codegen::set_builtins::SetInfo;
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
-
-/// WASM alignment hint (log2 of byte alignment) for an element slot.
-fn mem_align(ty: &BoundType) -> u32 {
-    match ty {
-        BoundType::F64 => 3,
-        _ => 2,
-    }
-}
 
 impl<'a> FuncContext<'a> {
     /// Entry point invoked from `emit_call`. If the call is
@@ -298,7 +292,7 @@ impl<'a> FuncContext<'a> {
         // elem = v
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(elem_local));
-        self.push(store_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(store_typed(&info.elem_ty, info.bucket.elem_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -488,7 +482,7 @@ impl<'a> FuncContext<'a> {
         let addr_local = self.alloc_local(WasmType::I32);
         self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
         self.push(Instruction::LocalSet(elem_local));
 
         let next_local = self.alloc_local(WasmType::I32);
@@ -672,7 +666,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(old_addr));
 
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
         self.push(Instruction::LocalSet(elem_local));
 
         // Probe in the new array: no duplicates, no tombstones, so just find
@@ -713,7 +707,7 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(elem_local));
-        self.push(store_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(store_typed(&info.elem_ty, info.bucket.elem_offset));
 
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -772,7 +766,7 @@ impl<'a> FuncContext<'a> {
         info: &SetInfo,
     ) {
         self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_elem(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
         self.push(Instruction::LocalGet(elem_local));
         match &info.elem_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
@@ -917,52 +911,4 @@ struct SetScopeEntry {
     saved_class: Option<String>,
     saved_string: bool,
     saved_closure_sig: Option<ClosureSig>,
-}
-
-// ── mem-access helpers ────────────────────────────────────────────────
-
-fn load_i32(offset: u32) -> Instruction<'static> {
-    Instruction::I32Load(MemArg {
-        offset: offset as u64,
-        align: 2,
-        memory_index: 0,
-    })
-}
-
-fn store_i32(offset: u32) -> Instruction<'static> {
-    Instruction::I32Store(MemArg {
-        offset: offset as u64,
-        align: 2,
-        memory_index: 0,
-    })
-}
-
-fn load_elem(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    match ty {
-        BoundType::F64 => Instruction::F64Load(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-        _ => Instruction::I32Load(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-    }
-}
-
-fn store_elem(ty: &BoundType, offset: u32) -> Instruction<'static> {
-    match ty {
-        BoundType::F64 => Instruction::F64Store(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-        _ => Instruction::I32Store(MemArg {
-            offset: offset as u64,
-            align: mem_align(ty),
-            memory_index: 0,
-        }),
-    }
 }
