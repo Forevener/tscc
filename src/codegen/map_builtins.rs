@@ -1,32 +1,11 @@
-//! Compiler-owned `Map<K, V>` support.
-//!
-//! Map is not a user-declared class — tscc synthesizes a `ClassLayout` for
-//! each concrete `(K, V)` pair seen in user source. Collection rides on
-//! Phase A's generic instantiation walker (see `generics::collect_instantiations`),
-//! which records a `HashTableInstantiation` (shared with Set) whenever it
-//! sees `Map<K, V>` in a type annotation or `new Map<K, V>()`. Registration
-//! happens in a dedicated pass in `compile_module` before class topo-sort.
-//! Method dispatch (`get`/`set`/`has`/…) lands in `expr/map.rs`.
-//!
-//! Object layout in linear memory (all fields are `i32`, uniform alignment):
-//!
-//! | offset | field        | purpose                                          |
-//! |--------|--------------|--------------------------------------------------|
-//! | 0      | buckets_ptr  | pointer to bucket array (0 when unallocated)     |
-//! | 4      | size         | count of occupied entries                        |
-//! | 8      | capacity     | allocated bucket count (always a power of two)   |
-//! | 12     | head_idx     | first-inserted bucket index (-1 when empty)      |
-//! | 16     | tail_idx     | last-inserted bucket index  (-1 when empty)      |
-//!
-//! The bucket array itself is allocated lazily on first `set()` (Step 2+).
+//! Compiler-owned `Map<K, V>` identity — source-level name, arity, and
+//! mangling. The shared register-layout / helper-selection / instantiation
+//! and info types all live in `hash_table.rs`; this module keeps only the
+//! Map-specific vocabulary that distinguishes it from `Set<T>`. Collection
+//! happens in `generics::collect_instantiations` via
+//! `HashTableInstantiation`; method dispatch lands in `expr/map.rs`.
 
-use std::collections::{HashMap, HashSet};
-
-use crate::error::CompileError;
-use crate::types::{BoundType, WasmType};
-
-use super::classes::{ClassLayout, ClassRegistry};
-use super::hash_table::HashTableInstantiation;
+use crate::types::BoundType;
 
 /// Source-level name used to trigger Map recognition in type annotations and
 /// `new` expressions.
@@ -34,16 +13,6 @@ pub const MAP_BASE: &str = "Map";
 
 /// Number of type arguments `Map` expects (`K`, `V`).
 pub const MAP_ARITY: usize = 2;
-
-/// Field layout of a Map header object. Order fixes offsets; all fields are
-/// `i32` so no alignment padding is needed between them.
-pub const MAP_FIELDS: &[(&str, WasmType)] = &[
-    ("buckets_ptr", WasmType::I32),
-    ("size", WasmType::I32),
-    ("capacity", WasmType::I32),
-    ("head_idx", WasmType::I32),
-    ("tail_idx", WasmType::I32),
-];
 
 /// Mangled Map class name for a given `(K, V)` pair, e.g. `Map$string$i32`.
 pub fn mangle_map_name(key_ty: &BoundType, value_ty: &BoundType) -> String {
@@ -57,100 +26,4 @@ pub fn mangle_map_name(key_ty: &BoundType, value_ty: &BoundType) -> String {
 /// Return `true` when `name` refers to the compiler-owned `Map` template.
 pub fn is_map_base(name: &str) -> bool {
     name == MAP_BASE
-}
-
-/// Name of the hash runtime helper that covers a given key type. Strings ride
-/// on xxh3 (better distribution for prefix-heavy inputs); everything else hits
-/// FxHash via the width-specific entry point.
-pub fn hash_helper_for(key_ty: &BoundType) -> &'static str {
-    match key_ty {
-        BoundType::I32 => "__hash_fx_i32",
-        BoundType::F64 => "__hash_fx_f64",
-        BoundType::Bool => "__hash_fx_bool",
-        BoundType::Str => "__hash_xxh3_str",
-        BoundType::Class(_) => "__hash_fx_ptr",
-    }
-}
-
-/// Name of the equality helper a key type dispatches to, or `None` when
-/// inline `I32Eq` suffices (integer-shape keys and class identity).
-pub fn equality_helper_for(key_ty: &BoundType) -> Option<&'static str> {
-    match key_ty {
-        BoundType::F64 => Some("__key_eq_f64"),
-        BoundType::Str => Some("__str_eq"),
-        BoundType::I32 | BoundType::Bool | BoundType::Class(_) => None,
-    }
-}
-
-/// Runtime helpers the emitted method bodies will reference for `insts`.
-/// Consumed by `compile_module` to seed `used_string_helpers` before
-/// `register_string_helpers` runs — keeps registration tree-shaken when the
-/// program doesn't use Maps and correct when it does.
-///
-/// Inline (L_splice) helpers are included alongside L_helper ones. They have
-/// no bundle slot themselves (the splicer pastes their bodies at each call
-/// site), but `register_string_helpers` consults the same `used` set to
-/// decide which inline helpers' Call targets need to be registered in tscc's
-/// function space — without that, an inline helper whose body calls
-/// `memcmp` (e.g. `__str_eq`) would splice out a `Call(u32::MAX)`.
-pub fn required_runtime_helpers(insts: &[HashTableInstantiation]) -> HashSet<String> {
-    let mut out = HashSet::new();
-    for inst in insts {
-        out.insert(hash_helper_for(&inst.slot_ty).to_string());
-        if let Some(name) = equality_helper_for(&inst.slot_ty) {
-            out.insert(name.to_string());
-        }
-    }
-    out
-}
-
-/// Synthesize a `ClassLayout` for a `Map<K, V>` instantiation and insert it
-/// into `registry`. Step 1 establishes only the header; no methods are
-/// registered yet — `emit_new` will allocate the header via arena bump and
-/// leave fields at their arena-zero default (which is correct for `size` /
-/// `capacity` / `buckets_ptr`; head/tail default to 0, not -1, and will be
-/// fixed up once Step 2 adds a real constructor).
-pub fn register_map_layout(
-    registry: &mut ClassRegistry,
-    mangled_name: &str,
-) -> Result<(), CompileError> {
-    if registry.get(mangled_name).is_some() {
-        return Ok(());
-    }
-    let mut fields: Vec<(String, u32, WasmType)> = Vec::with_capacity(MAP_FIELDS.len());
-    let mut field_map: HashMap<String, (u32, WasmType)> = HashMap::new();
-    let mut own_field_names: HashSet<String> = HashSet::new();
-    let mut offset: u32 = 0;
-    for &(name, ty) in MAP_FIELDS {
-        let width: u32 = match ty {
-            WasmType::F64 => 8,
-            _ => 4,
-        };
-        offset = (offset + width - 1) & !(width - 1);
-        fields.push((name.to_string(), offset, ty));
-        field_map.insert(name.to_string(), (offset, ty));
-        own_field_names.insert(name.to_string());
-        offset += width;
-    }
-    let size = if offset == 0 { 0 } else { (offset + 7) & !7 };
-
-    registry.classes.insert(
-        mangled_name.to_string(),
-        ClassLayout {
-            name: mangled_name.to_string(),
-            size,
-            fields,
-            field_map,
-            field_class_types: HashMap::new(),
-            field_string_types: HashSet::new(),
-            methods: HashMap::new(),
-            parent: None,
-            is_polymorphic: false,
-            vtable_methods: Vec::new(),
-            vtable_method_map: HashMap::new(),
-            vtable_offset: 0,
-            own_field_names,
-        },
-    );
-    Ok(())
 }

@@ -495,10 +495,7 @@ pub fn compile_module<'a>(
     // method dispatcher to consume.
     for inst in &map_insts {
         ctx.class_names.insert(inst.mangled_name.clone());
-        super::map_builtins::register_map_layout(
-            &mut ctx.class_registry,
-            &inst.mangled_name,
-        )?;
+        super::hash_table::register_layout(&mut ctx.class_registry, &inst.mangled_name)?;
         let bucket =
             super::hash_table::BucketLayout::compute(&inst.slot_ty, inst.value_ty.as_ref());
         ctx.map_info.insert(
@@ -512,10 +509,7 @@ pub fn compile_module<'a>(
     }
     for inst in &set_insts {
         ctx.class_names.insert(inst.mangled_name.clone());
-        super::set_builtins::register_set_layout(
-            &mut ctx.class_registry,
-            &inst.mangled_name,
-        )?;
+        super::hash_table::register_layout(&mut ctx.class_registry, &inst.mangled_name)?;
         let bucket = super::hash_table::BucketLayout::compute(&inst.slot_ty, None);
         ctx.set_info.insert(
             inst.mangled_name.clone(),
@@ -850,12 +844,12 @@ pub fn compile_module<'a>(
     // same precompiled bundle the string helpers ride on. Seed based on the
     // collected instantiations so the tree-shaker pulls in only what this
     // program's Maps actually need.
-    for name in super::map_builtins::required_runtime_helpers(&map_insts) {
+    for name in super::hash_table::required_runtime_helpers(&map_insts) {
         used_string_helpers.insert(name);
     }
     // Set<T> methods share Map's hash + equality helper dispatch, gated on
     // the element type. Seed the tree-shaker the same way.
-    for name in super::set_builtins::required_runtime_helpers(&set_insts) {
+    for name in super::hash_table::required_runtime_helpers(&set_insts) {
         used_string_helpers.insert(name);
     }
     if !used_string_helpers.is_empty() {

@@ -36,11 +36,9 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, load_i32, load_typed, store_i32,
-    store_typed,
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, hash_helper_for,
+    load_i32, load_typed, store_i32, store_typed,
 };
-use crate::codegen::hash_table::HashTableInfo;
-use crate::codegen::map_builtins;
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
 
@@ -894,7 +892,7 @@ impl<'a> FuncContext<'a> {
     /// pasted inline via the splicer rather than emitted as a `Call`.
     fn emit_hash_for_local(&mut self, key_local: u32, key_ty: &BoundType) {
         self.push(Instruction::LocalGet(key_local));
-        let name = map_builtins::hash_helper_for(key_ty);
+        let name = hash_helper_for(key_ty);
         self.emit_helper_invocation(name);
     }
 
