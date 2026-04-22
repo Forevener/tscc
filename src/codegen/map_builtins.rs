@@ -3,10 +3,10 @@
 //! Map is not a user-declared class — tscc synthesizes a `ClassLayout` for
 //! each concrete `(K, V)` pair seen in user source. Collection rides on
 //! Phase A's generic instantiation walker (see `generics::collect_instantiations`),
-//! which records a `MapInstantiation` whenever it sees `Map<K, V>` in a type
-//! annotation or `new Map<K, V>()`. Registration happens in a dedicated pass
-//! in `compile_module` before class topo-sort. Method dispatch
-//! (`get`/`set`/`has`/…) will land in a future `expr/map.rs` dispatcher.
+//! which records a `HashTableInstantiation` (shared with Set) whenever it
+//! sees `Map<K, V>` in a type annotation or `new Map<K, V>()`. Registration
+//! happens in a dedicated pass in `compile_module` before class topo-sort.
+//! Method dispatch (`get`/`set`/`has`/…) lands in `expr/map.rs`.
 //!
 //! Object layout in linear memory (all fields are `i32`, uniform alignment):
 //!
@@ -26,7 +26,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
-use super::hash_table::BucketLayout;
+use super::hash_table::HashTableInstantiation;
 
 /// Source-level name used to trigger Map recognition in type annotations and
 /// `new` expressions.
@@ -44,29 +44,6 @@ pub const MAP_FIELDS: &[(&str, WasmType)] = &[
     ("head_idx", WasmType::I32),
     ("tail_idx", WasmType::I32),
 ];
-
-/// One concrete use of `Map<K, V>` discovered in user source.
-///
-/// `key_ty` and `value_ty` ride along from the collector so later steps can
-/// size buckets, route hashing (FxHash for i32/f64/bool/class refs, xxh3 for
-/// string), and emit per-monomorphization method bodies without re-parsing
-/// the mangled name.
-#[derive(Debug, Clone)]
-pub struct MapInstantiation {
-    pub mangled_name: String,
-    pub key_ty: BoundType,
-    pub value_ty: BoundType,
-}
-
-/// Everything `emit_new_map` and the method dispatcher need to know about a
-/// single `Map<K, V>` monomorphization. Stored in `ModuleContext::map_info`
-/// keyed on `mangled_name`.
-#[derive(Debug, Clone)]
-pub struct MapInfo {
-    pub key_ty: BoundType,
-    pub value_ty: BoundType,
-    pub bucket: BucketLayout,
-}
 
 /// Mangled Map class name for a given `(K, V)` pair, e.g. `Map$string$i32`.
 pub fn mangle_map_name(key_ty: &BoundType, value_ty: &BoundType) -> String {
@@ -116,11 +93,11 @@ pub fn equality_helper_for(key_ty: &BoundType) -> Option<&'static str> {
 /// decide which inline helpers' Call targets need to be registered in tscc's
 /// function space — without that, an inline helper whose body calls
 /// `memcmp` (e.g. `__str_eq`) would splice out a `Call(u32::MAX)`.
-pub fn required_runtime_helpers(insts: &[MapInstantiation]) -> HashSet<String> {
+pub fn required_runtime_helpers(insts: &[HashTableInstantiation]) -> HashSet<String> {
     let mut out = HashSet::new();
     for inst in insts {
-        out.insert(hash_helper_for(&inst.key_ty).to_string());
-        if let Some(name) = equality_helper_for(&inst.key_ty) {
+        out.insert(hash_helper_for(&inst.slot_ty).to_string());
+        if let Some(name) = equality_helper_for(&inst.slot_ty) {
             out.insert(name.to_string());
         }
     }

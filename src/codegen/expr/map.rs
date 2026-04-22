@@ -39,7 +39,8 @@ use crate::codegen::hash_table::{
     BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, load_i32, load_typed, store_i32,
     store_typed,
 };
-use crate::codegen::map_builtins::{self, MapInfo};
+use crate::codegen::hash_table::HashTableInfo;
+use crate::codegen::map_builtins;
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
 
@@ -180,7 +181,7 @@ impl<'a> FuncContext<'a> {
         key_arg: &Expression<'a>,
     ) -> Result<WasmType, CompileError> {
         let info = self.map_info(class_name);
-        let value_wasm = info.value_ty.wasm_ty();
+        let value_wasm = info.expect_value_ty().wasm_ty();
         let ctx = self.begin_find(receiver, class_name, key_arg, &info)?;
 
         // `found` is 1 on hit and `slot` points to the matching bucket.
@@ -193,7 +194,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::If(result_block_ty));
         // Load: addr = buckets + slot * bucket_size; value = *(addr + value_offset)
         self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
-        match &info.value_ty {
+        match info.expect_value_ty() {
             BoundType::F64 => self.push(Instruction::F64Load(MemArg {
                 offset: info.bucket.value_offset.expect("map bucket has value slot") as u64,
                 align: 3,
@@ -236,12 +237,12 @@ impl<'a> FuncContext<'a> {
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
 
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
+        let key_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(key_arg)?;
         self.check_key_type(&info, ty)?;
         self.push(Instruction::LocalSet(key_local));
 
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
+        let value_local = self.alloc_local(info.expect_value_ty().wasm_ty());
         let vty = self.emit_expr(value_arg)?;
         self.check_value_type(&info, vty)?;
         self.push(Instruction::LocalSet(value_local));
@@ -278,7 +279,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        self.emit_hash_for_local(key_local, &info.slot_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -369,7 +370,7 @@ impl<'a> FuncContext<'a> {
         // Always write the value (overwrite or fresh insert).
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
+        self.push(store_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
 
         // Insert-only path: state → OCCUPIED, write key, link into chain, bump size.
         self.push(Instruction::LocalGet(is_update));
@@ -386,7 +387,7 @@ impl<'a> FuncContext<'a> {
         // key = k
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_typed(&info.key_ty, info.bucket.slot_offset));
+        self.push(store_typed(&info.slot_ty, info.bucket.slot_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -569,13 +570,13 @@ impl<'a> FuncContext<'a> {
 
         // Per-iteration locals: current value + key. The arrow body reads them
         // through the arrow-scope bindings below.
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
+        let value_local = self.alloc_local(info.expect_value_ty().wasm_ty());
+        let key_local = self.alloc_local(info.slot_ty.wasm_ty());
 
         // The iteration contract matches JS — arrow params are (value, key).
         // If the arrow only takes one param, bind it to value. Two params
         // bind (value, key). Saved scope is restored after the loop.
-        let saved = self.push_map_arrow_scope(&params, &[(value_local, &info.value_ty), (key_local, &info.key_ty)]);
+        let saved = self.push_map_arrow_scope(&params, &[(value_local, info.expect_value_ty()), (key_local, &info.slot_ty)]);
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
@@ -592,10 +593,10 @@ impl<'a> FuncContext<'a> {
         let addr_local = self.alloc_local(WasmType::I32);
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
+        self.push(load_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
         self.push(Instruction::LocalSet(value_local));
         self.push(Instruction::LocalGet(addr_local));
-        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
+        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(key_local));
 
         let next_local = self.alloc_local(WasmType::I32);
@@ -630,7 +631,7 @@ impl<'a> FuncContext<'a> {
         receiver: &Expression<'a>,
         class_name: &str,
         key_arg: &Expression<'a>,
-        info: &MapInfo,
+        info: &HashTableInfo,
     ) -> Result<FindContext, CompileError> {
         let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
         let cap_off = self.field_offset_for(class_name, "capacity");
@@ -639,7 +640,7 @@ impl<'a> FuncContext<'a> {
         self.emit_expr(receiver)?;
         self.push(Instruction::LocalSet(this_local));
 
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
+        let key_local = self.alloc_local(info.slot_ty.wasm_ty());
         let ty = self.emit_expr(key_arg)?;
         self.check_key_type(info, ty)?;
         self.push(Instruction::LocalSet(key_local));
@@ -656,7 +657,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(mask_local));
 
         let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        self.emit_hash_for_local(key_local, &info.slot_ty);
         self.push(Instruction::LocalGet(mask_local));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(slot_local));
@@ -719,7 +720,7 @@ impl<'a> FuncContext<'a> {
         &mut self,
         this_local: u32,
         class_name: &str,
-        info: &MapInfo,
+        info: &HashTableInfo,
     ) -> Result<(), CompileError> {
         let buckets_off = self.field_offset_for(class_name, "buckets_ptr");
         let cap_off = self.field_offset_for(class_name, "capacity");
@@ -777,8 +778,8 @@ impl<'a> FuncContext<'a> {
         let old_addr = self.alloc_local(WasmType::I32);
         let hash_slot = self.alloc_local(WasmType::I32);
         let new_addr = self.alloc_local(WasmType::I32);
-        let key_local = self.alloc_local(info.key_ty.wasm_ty());
-        let value_local = self.alloc_local(info.value_ty.wasm_ty());
+        let key_local = self.alloc_local(info.slot_ty.wasm_ty());
+        let value_local = self.alloc_local(info.expect_value_ty().wasm_ty());
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
@@ -794,15 +795,15 @@ impl<'a> FuncContext<'a> {
 
         // Load key + value.
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
+        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(key_local));
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
+        self.push(load_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
         self.push(Instruction::LocalSet(value_local));
 
         // Probe in the new array: no duplicates and no tombstones, so we
         // only need to scan for the first EMPTY slot.
-        self.emit_hash_for_local(key_local, &info.key_ty);
+        self.emit_hash_for_local(key_local, &info.slot_ty);
         self.push(Instruction::LocalGet(new_mask));
         self.push(Instruction::I32And);
         self.push(Instruction::LocalSet(hash_slot));
@@ -840,10 +841,10 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_typed(&info.key_ty, info.bucket.slot_offset));
+        self.push(store_typed(&info.slot_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
+        self.push(store_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
 
         // Link into chain: new_prev = header.tail, new_next = -1.
         // If header.tail == -1: header.head = hash_slot. Else: tail_bucket.next = hash_slot.
@@ -937,12 +938,12 @@ impl<'a> FuncContext<'a> {
         buckets_local: u32,
         slot_local: u32,
         key_local: u32,
-        info: &MapInfo,
+        info: &HashTableInfo,
     ) {
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
+        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalGet(key_local));
-        match &info.key_ty {
+        match &info.slot_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
             BoundType::Str => self.emit_helper_invocation("__str_eq"),
             _ => self.push(Instruction::I32Eq),
@@ -958,10 +959,10 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Add);
     }
 
-    /// Copy of `MapInfo` — dispatcher wants a long-lived view while emitting
-    /// method bodies that need a borrowed `&mut self`. Cheap (two enums + a
-    /// small BucketLayout struct).
-    fn map_info(&self, class_name: &str) -> MapInfo {
+    /// Copy of `HashTableInfo` — dispatcher wants a long-lived view while
+    /// emitting method bodies that need a borrowed `&mut self`. Cheap (two
+    /// enums + a small BucketLayout struct).
+    fn map_info(&self, class_name: &str) -> HashTableInfo {
         self.module_ctx
             .map_info
             .get(class_name)
@@ -982,13 +983,13 @@ impl<'a> FuncContext<'a> {
     /// Validate the type of a user-provided key argument against the map's
     /// declared `K`. Numeric widening mirrors the rules used elsewhere in
     /// tscc — an i32 literal passes for an f64-keyed map.
-    fn check_key_type(&mut self, info: &MapInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric(info.key_ty.wasm_ty(), ty, "Map key")
+    fn check_key_type(&mut self, info: &HashTableInfo, ty: WasmType) -> Result<(), CompileError> {
+        self.coerce_numeric(info.slot_ty.wasm_ty(), ty, "Map key")
     }
 
     /// Like `check_key_type`, but for the value slot.
-    fn check_value_type(&mut self, info: &MapInfo, ty: WasmType) -> Result<(), CompileError> {
-        self.coerce_numeric(info.value_ty.wasm_ty(), ty, "Map value")
+    fn check_value_type(&mut self, info: &HashTableInfo, ty: WasmType) -> Result<(), CompileError> {
+        self.coerce_numeric(info.expect_value_ty().wasm_ty(), ty, "Map value")
     }
 
     /// If `actual` can be losslessly promoted to `expected` (i32 → f64),

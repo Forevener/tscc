@@ -140,6 +140,40 @@ pub struct BucketLayout {
     pub total_size: u32,
 }
 
+/// One concrete use of `Map<K, V>` or `Set<T>` discovered in user source.
+/// `slot_ty` is the hashed key (Map) or element (Set); `value_ty` is `Some`
+/// for Maps and `None` for Sets. Shape picked by the generics collector in
+/// `generics::collect_instantiations` and carried through to the
+/// registration pass in `compile_module`.
+#[derive(Debug, Clone)]
+pub struct HashTableInstantiation {
+    pub mangled_name: String,
+    pub slot_ty: BoundType,
+    pub value_ty: Option<BoundType>,
+}
+
+/// Everything `emit_new_map` / `emit_new_set` and the method dispatchers
+/// need to know about a single `Map<K, V>` or `Set<T>` monomorphization.
+/// Stored in `ModuleContext::{map_info,set_info}` keyed on `mangled_name`.
+/// `value_ty.is_some()` distinguishes Map from Set at the (rare) call site
+/// that handles both.
+#[derive(Debug, Clone)]
+pub struct HashTableInfo {
+    pub slot_ty: BoundType,
+    pub value_ty: Option<BoundType>,
+    pub bucket: BucketLayout,
+}
+
+impl HashTableInfo {
+    /// Map-only accessor for the value slot type. Panics on Set (which has
+    /// no value slot); callers should already be on a map-specific codepath.
+    pub fn expect_value_ty(&self) -> &BoundType {
+        self.value_ty
+            .as_ref()
+            .expect("HashTableInfo::expect_value_ty called on a Set (no value slot)")
+    }
+}
+
 impl BucketLayout {
     /// Compute the layout. Pass `Some(value_ty)` for a Map bucket and `None`
     /// for a Set bucket. `slot_ty` is the hashed key (Map) or element (Set).

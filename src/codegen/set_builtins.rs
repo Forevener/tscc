@@ -3,9 +3,10 @@
 //! Shares the open-addressing + insertion-chain machinery with `Map<K, V>`,
 //! minus the value slot. Each concrete `T` gets its own synthesized
 //! `ClassLayout`; the collector in `generics::collect_instantiations` records
-//! a `SetInstantiation` whenever it sees `Set<T>` in a type annotation or
-//! `new Set<T>()`. Registration happens in a dedicated pass in `compile_module`
-//! alongside maps. Method dispatch (`add`/`has`/…) lands in `expr/set.rs`.
+//! a `HashTableInstantiation` (shared with Map) whenever it sees `Set<T>` in
+//! a type annotation or `new Set<T>()`. Registration happens in a dedicated
+//! pass in `compile_module` alongside maps. Method dispatch (`add`/`has`/…)
+//! lands in `expr/set.rs`.
 //!
 //! Object layout in linear memory (all fields are `i32`, uniform alignment):
 //!
@@ -23,7 +24,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
-use super::hash_table::BucketLayout;
+use super::hash_table::HashTableInstantiation;
 
 /// Source-level name used to trigger Set recognition in type annotations and
 /// `new` expressions.
@@ -42,22 +43,6 @@ pub const SET_FIELDS: &[(&str, WasmType)] = &[
     ("tail_idx", WasmType::I32),
 ];
 
-/// One concrete use of `Set<T>` discovered in user source.
-#[derive(Debug, Clone)]
-pub struct SetInstantiation {
-    pub mangled_name: String,
-    pub elem_ty: BoundType,
-}
-
-/// Everything `emit_new_set` and the method dispatcher need to know about a
-/// single `Set<T>` monomorphization. Stored in `ModuleContext::set_info` keyed
-/// on `mangled_name`.
-#[derive(Debug, Clone)]
-pub struct SetInfo {
-    pub elem_ty: BoundType,
-    pub bucket: BucketLayout,
-}
-
 /// Mangled Set class name for a given `T`, e.g. `Set$string`.
 pub fn mangle_set_name(elem_ty: &BoundType) -> String {
     format!("{SET_BASE}${}", elem_ty.mangle_token())
@@ -71,11 +56,11 @@ pub fn is_set_base(name: &str) -> bool {
 /// Runtime helpers the emitted method bodies reference for `insts`. Reuses
 /// `map_builtins::hash_helper_for` / `equality_helper_for` — sets and maps
 /// dispatch to the same underlying precompiled helpers based on element type.
-pub fn required_runtime_helpers(insts: &[SetInstantiation]) -> HashSet<String> {
+pub fn required_runtime_helpers(insts: &[HashTableInstantiation]) -> HashSet<String> {
     let mut out = HashSet::new();
     for inst in insts {
-        out.insert(super::map_builtins::hash_helper_for(&inst.elem_ty).to_string());
-        if let Some(name) = super::map_builtins::equality_helper_for(&inst.elem_ty) {
+        out.insert(super::map_builtins::hash_helper_for(&inst.slot_ty).to_string());
+        if let Some(name) = super::map_builtins::equality_helper_for(&inst.slot_ty) {
             out.insert(name.to_string());
         }
     }

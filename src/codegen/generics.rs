@@ -34,8 +34,9 @@ use oxc_ast::ast::*;
 use crate::error::CompileError;
 use crate::types::{BoundType, TypeBindings};
 
-use super::map_builtins::{self, MapInstantiation};
-use super::set_builtins::{self, SetInstantiation};
+use super::hash_table::HashTableInstantiation;
+use super::map_builtins;
+use super::set_builtins;
 
 /// A generic class declaration captured for later monomorphization.
 #[derive(Debug)]
@@ -90,8 +91,8 @@ pub struct CollectResult {
     pub class_insts: Vec<ClassInstantiation>,
     pub fn_insts: Vec<FnInstantiation>,
     pub inferred_call_sites: HashMap<u32, String>,
-    pub map_insts: Vec<MapInstantiation>,
-    pub set_insts: Vec<SetInstantiation>,
+    pub map_insts: Vec<HashTableInstantiation>,
+    pub set_insts: Vec<HashTableInstantiation>,
 }
 
 /// Walk the program body and collect all generic class/function templates.
@@ -423,10 +424,10 @@ struct Walker<'a, 'ctx> {
     inferred_sites: HashMap<u32, String>,
     /// Map<K, V> instantiations — order-preserving insertion with dedup keyed
     /// on the mangled name.
-    maps: Vec<MapInstantiation>,
+    maps: Vec<HashTableInstantiation>,
     maps_seen: HashSet<String>,
     /// Set<T> instantiations — same dedup discipline as `maps`.
-    sets: Vec<SetInstantiation>,
+    sets: Vec<HashTableInstantiation>,
     sets_seen: HashSet<String>,
 }
 
@@ -434,10 +435,10 @@ impl Walker<'_, '_> {
     fn record_map_inst(&mut self, key_ty: BoundType, value_ty: BoundType) {
         let mangled = map_builtins::mangle_map_name(&key_ty, &value_ty);
         if self.maps_seen.insert(mangled.clone()) {
-            self.maps.push(MapInstantiation {
+            self.maps.push(HashTableInstantiation {
                 mangled_name: mangled,
-                key_ty,
-                value_ty,
+                slot_ty: key_ty,
+                value_ty: Some(value_ty),
             });
         }
     }
@@ -445,9 +446,10 @@ impl Walker<'_, '_> {
     fn record_set_inst(&mut self, elem_ty: BoundType) {
         let mangled = set_builtins::mangle_set_name(&elem_ty);
         if self.sets_seen.insert(mangled.clone()) {
-            self.sets.push(SetInstantiation {
+            self.sets.push(HashTableInstantiation {
                 mangled_name: mangled,
-                elem_ty,
+                slot_ty: elem_ty,
+                value_ty: None,
             });
         }
     }

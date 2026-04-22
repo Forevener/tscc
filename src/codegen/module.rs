@@ -91,14 +91,16 @@ pub struct ModuleContext {
     /// generic function call (`identity(5)`). `emit_call` consults this map
     /// to route the call through the right monomorphization.
     pub inferred_fn_calls: HashMap<u32, String>,
-    /// Mangled Map<K, V> name -> (key_ty, value_ty, bucket layout). Populated
+    /// Mangled Map<K, V> name -> (slot_ty, value_ty, bucket layout). Populated
     /// in Pass 0a-iii. Dispatchers in `expr/map.rs` and `emit_new` read this
-    /// to route per-monomorphization codegen.
-    pub map_info: HashMap<String, super::map_builtins::MapInfo>,
-    /// Mangled Set<T> name -> (elem_ty, bucket layout). Populated alongside
+    /// to route per-monomorphization codegen. `value_ty` is always `Some` for
+    /// entries in this map (shared `HashTableInfo` type is also used for sets).
+    pub map_info: HashMap<String, super::hash_table::HashTableInfo>,
+    /// Mangled Set<T> name -> (slot_ty, bucket layout). Populated alongside
     /// `map_info` in Pass 0a-iii. Dispatchers in `expr/set.rs` and `emit_new`
-    /// read this to route per-monomorphization codegen.
-    pub set_info: HashMap<String, super::set_builtins::SetInfo>,
+    /// read this to route per-monomorphization codegen. `value_ty` is always
+    /// `None` for entries in this map.
+    pub set_info: HashMap<String, super::hash_table::HashTableInfo>,
     /// Structural object types discovered in Pass 0a-iv. Each entry describes
     /// a named (`type`/`interface`) or anonymous (inline `TSTypeLiteral` /
     /// `ObjectExpression`) shape, deduped by its sort-by-name fingerprint.
@@ -497,11 +499,12 @@ pub fn compile_module<'a>(
             &mut ctx.class_registry,
             &inst.mangled_name,
         )?;
-        let bucket = super::hash_table::BucketLayout::compute(&inst.key_ty, Some(&inst.value_ty));
+        let bucket =
+            super::hash_table::BucketLayout::compute(&inst.slot_ty, inst.value_ty.as_ref());
         ctx.map_info.insert(
             inst.mangled_name.clone(),
-            super::map_builtins::MapInfo {
-                key_ty: inst.key_ty.clone(),
+            super::hash_table::HashTableInfo {
+                slot_ty: inst.slot_ty.clone(),
                 value_ty: inst.value_ty.clone(),
                 bucket,
             },
@@ -513,11 +516,12 @@ pub fn compile_module<'a>(
             &mut ctx.class_registry,
             &inst.mangled_name,
         )?;
-        let bucket = super::hash_table::BucketLayout::compute(&inst.elem_ty, None);
+        let bucket = super::hash_table::BucketLayout::compute(&inst.slot_ty, None);
         ctx.set_info.insert(
             inst.mangled_name.clone(),
-            super::set_builtins::SetInfo {
-                elem_ty: inst.elem_ty.clone(),
+            super::hash_table::HashTableInfo {
+                slot_ty: inst.slot_ty.clone(),
+                value_ty: None,
                 bucket,
             },
         );
