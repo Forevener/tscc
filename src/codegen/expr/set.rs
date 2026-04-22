@@ -292,7 +292,7 @@ impl<'a> FuncContext<'a> {
         // elem = v
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(elem_local));
-        self.push(store_typed(&info.elem_ty, info.bucket.elem_offset));
+        self.push(store_typed(&info.elem_ty, info.bucket.slot_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -482,7 +482,7 @@ impl<'a> FuncContext<'a> {
         let addr_local = self.alloc_local(WasmType::I32);
         self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(elem_local));
 
         let next_local = self.alloc_local(WasmType::I32);
@@ -666,7 +666,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::LocalSet(old_addr));
 
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(elem_local));
 
         // Probe in the new array: no duplicates, no tombstones, so just find
@@ -707,7 +707,7 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(elem_local));
-        self.push(store_typed(&info.elem_ty, info.bucket.elem_offset));
+        self.push(store_typed(&info.elem_ty, info.bucket.slot_offset));
 
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -766,7 +766,7 @@ impl<'a> FuncContext<'a> {
         info: &SetInfo,
     ) {
         self.emit_set_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_typed(&info.elem_ty, info.bucket.elem_offset));
+        self.push(load_typed(&info.elem_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalGet(elem_local));
         match &info.elem_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),

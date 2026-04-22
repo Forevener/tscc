@@ -26,7 +26,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
-use super::hash_table::{align_up, bound_align, bound_size};
+use super::hash_table::BucketLayout;
 
 /// Source-level name used to trigger Map recognition in type annotations and
 /// `new` expressions.
@@ -80,54 +80,6 @@ pub fn mangle_map_name(key_ty: &BoundType, value_ty: &BoundType) -> String {
 /// Return `true` when `name` refers to the compiler-owned `Map` template.
 pub fn is_map_base(name: &str) -> bool {
     name == MAP_BASE
-}
-
-/// Per-monomorphization bucket layout. All offsets are byte offsets from the
-/// start of the bucket; `total_size` is padded to `max(alignof(K), alignof(V),
-/// 4)` so an array of buckets stays aligned.
-///
-/// Bucket layout in memory:
-///
-/// ```text
-/// +-- 0 ------------ state: u8
-/// |   (pad)
-/// +-- key_offset --- key:   K
-/// +-- next_offset -- next_insert: i32
-/// +-- prev_offset -- prev_insert: i32
-/// +-- value_offset - value: V
-/// +-- total_size --  (next bucket starts here)
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub struct BucketLayout {
-    pub state_offset: u32,
-    pub key_offset: u32,
-    pub next_offset: u32,
-    pub prev_offset: u32,
-    pub value_offset: u32,
-    pub total_size: u32,
-}
-
-impl BucketLayout {
-    pub fn compute(key_ty: &BoundType, value_ty: &BoundType) -> Self {
-        let key_align = bound_align(key_ty);
-        let value_align = bound_align(value_ty);
-        let state_offset = 0;
-        let key_offset = align_up(state_offset + 1, key_align);
-        let next_offset = align_up(key_offset + bound_size(key_ty), 4);
-        let prev_offset = next_offset + 4;
-        let value_offset = align_up(prev_offset + 4, value_align);
-        let unpadded_end = value_offset + bound_size(value_ty);
-        let bucket_align = key_align.max(value_align).max(4);
-        let total_size = align_up(unpadded_end, bucket_align);
-        BucketLayout {
-            state_offset,
-            key_offset,
-            next_offset,
-            prev_offset,
-            value_offset,
-            total_size,
-        }
-    }
 }
 
 /// Name of the hash runtime helper that covers a given key type. Strings ride

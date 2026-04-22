@@ -497,7 +497,7 @@ pub fn compile_module<'a>(
             &mut ctx.class_registry,
             &inst.mangled_name,
         )?;
-        let bucket = super::map_builtins::BucketLayout::compute(&inst.key_ty, &inst.value_ty);
+        let bucket = super::hash_table::BucketLayout::compute(&inst.key_ty, Some(&inst.value_ty));
         ctx.map_info.insert(
             inst.mangled_name.clone(),
             super::map_builtins::MapInfo {
@@ -513,7 +513,7 @@ pub fn compile_module<'a>(
             &mut ctx.class_registry,
             &inst.mangled_name,
         )?;
-        let bucket = super::set_builtins::SetBucketLayout::compute(&inst.elem_ty);
+        let bucket = super::hash_table::BucketLayout::compute(&inst.elem_ty, None);
         ctx.set_info.insert(
             inst.mangled_name.clone(),
             super::set_builtins::SetInfo {

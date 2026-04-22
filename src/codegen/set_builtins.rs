@@ -23,7 +23,7 @@ use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
 use super::classes::{ClassLayout, ClassRegistry};
-use super::hash_table::{align_up, bound_align, bound_size};
+use super::hash_table::BucketLayout;
 
 /// Source-level name used to trigger Set recognition in type annotations and
 /// `new` expressions.
@@ -55,7 +55,7 @@ pub struct SetInstantiation {
 #[derive(Debug, Clone)]
 pub struct SetInfo {
     pub elem_ty: BoundType,
-    pub bucket: SetBucketLayout,
+    pub bucket: BucketLayout,
 }
 
 /// Mangled Set class name for a given `T`, e.g. `Set$string`.
@@ -66,49 +66,6 @@ pub fn mangle_set_name(elem_ty: &BoundType) -> String {
 /// Return `true` when `name` refers to the compiler-owned `Set` template.
 pub fn is_set_base(name: &str) -> bool {
     name == SET_BASE
-}
-
-/// Per-monomorphization bucket layout. All offsets are byte offsets from the
-/// start of the bucket; `total_size` is padded to `max(alignof(T), 4)` so an
-/// array of buckets stays aligned.
-///
-/// Bucket layout in memory:
-///
-/// ```text
-/// +-- 0 ------------ state: u8
-/// |   (pad)
-/// +-- elem_offset -- elem:  T
-/// +-- next_offset -- next_insert: i32
-/// +-- prev_offset -- prev_insert: i32
-/// +-- total_size --  (next bucket starts here)
-/// ```
-#[derive(Debug, Clone, Copy)]
-pub struct SetBucketLayout {
-    pub state_offset: u32,
-    pub elem_offset: u32,
-    pub next_offset: u32,
-    pub prev_offset: u32,
-    pub total_size: u32,
-}
-
-impl SetBucketLayout {
-    pub fn compute(elem_ty: &BoundType) -> Self {
-        let elem_align = bound_align(elem_ty);
-        let state_offset = 0;
-        let elem_offset = align_up(state_offset + 1, elem_align);
-        let next_offset = align_up(elem_offset + bound_size(elem_ty), 4);
-        let prev_offset = next_offset + 4;
-        let unpadded_end = prev_offset + 4;
-        let bucket_align = elem_align.max(4);
-        let total_size = align_up(unpadded_end, bucket_align);
-        SetBucketLayout {
-            state_offset,
-            elem_offset,
-            next_offset,
-            prev_offset,
-            total_size,
-        }
-    }
 }
 
 /// Runtime helpers the emitted method bodies reference for `insts`. Reuses

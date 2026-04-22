@@ -195,11 +195,11 @@ impl<'a> FuncContext<'a> {
         self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
         match &info.value_ty {
             BoundType::F64 => self.push(Instruction::F64Load(MemArg {
-                offset: info.bucket.value_offset as u64,
+                offset: info.bucket.value_offset.expect("map bucket has value slot") as u64,
                 align: 3,
                 memory_index: 0,
             })),
-            _ => self.push(load_i32(info.bucket.value_offset)),
+            _ => self.push(load_i32(info.bucket.value_offset.expect("map bucket has value slot"))),
         }
         self.push(Instruction::Else);
         // Zero value of V as miss sentinel.
@@ -369,7 +369,7 @@ impl<'a> FuncContext<'a> {
         // Always write the value (overwrite or fresh insert).
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_typed(&info.value_ty, info.bucket.value_offset));
+        self.push(store_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
 
         // Insert-only path: state → OCCUPIED, write key, link into chain, bump size.
         self.push(Instruction::LocalGet(is_update));
@@ -386,7 +386,7 @@ impl<'a> FuncContext<'a> {
         // key = k
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_typed(&info.key_ty, info.bucket.key_offset));
+        self.push(store_typed(&info.key_ty, info.bucket.slot_offset));
         // next_insert = -1 (this becomes the new tail)
         self.push(Instruction::LocalGet(target_addr));
         self.push(Instruction::I32Const(EMPTY_LINK));
@@ -592,10 +592,10 @@ impl<'a> FuncContext<'a> {
         let addr_local = self.alloc_local(WasmType::I32);
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
         self.push(Instruction::LocalTee(addr_local));
-        self.push(load_typed(&info.value_ty, info.bucket.value_offset));
+        self.push(load_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
         self.push(Instruction::LocalSet(value_local));
         self.push(Instruction::LocalGet(addr_local));
-        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(key_local));
 
         let next_local = self.alloc_local(WasmType::I32);
@@ -794,10 +794,10 @@ impl<'a> FuncContext<'a> {
 
         // Load key + value.
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalSet(key_local));
         self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.value_ty, info.bucket.value_offset));
+        self.push(load_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
         self.push(Instruction::LocalSet(value_local));
 
         // Probe in the new array: no duplicates and no tombstones, so we
@@ -840,10 +840,10 @@ impl<'a> FuncContext<'a> {
         }));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(key_local));
-        self.push(store_typed(&info.key_ty, info.bucket.key_offset));
+        self.push(store_typed(&info.key_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalGet(new_addr));
         self.push(Instruction::LocalGet(value_local));
-        self.push(store_typed(&info.value_ty, info.bucket.value_offset));
+        self.push(store_typed(&info.value_ty, info.bucket.value_offset.expect("map bucket has value slot")));
 
         // Link into chain: new_prev = header.tail, new_next = -1.
         // If header.tail == -1: header.head = hash_slot. Else: tail_bucket.next = hash_slot.
@@ -940,7 +940,7 @@ impl<'a> FuncContext<'a> {
         info: &MapInfo,
     ) {
         self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(load_typed(&info.key_ty, info.bucket.key_offset));
+        self.push(load_typed(&info.key_ty, info.bucket.slot_offset));
         self.push(Instruction::LocalGet(key_local));
         match &info.key_ty {
             BoundType::F64 => self.emit_helper_invocation("__key_eq_f64"),
