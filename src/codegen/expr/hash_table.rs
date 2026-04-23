@@ -12,7 +12,9 @@ use wasm_encoder::Instruction;
 
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
-use crate::codegen::hash_table::{HashTableInfo, hash_helper_for, load_typed};
+use crate::codegen::hash_table::{
+    BUCKET_EMPTY, EMPTY_LINK, HashTableInfo, hash_helper_for, load_i32, load_typed, store_i32,
+};
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
 
@@ -114,6 +116,68 @@ impl<'a> FuncContext<'a> {
             .unwrap_or_else(|| {
                 panic!("hash-table class '{class_name}' missing field '{field_name}'")
             })
+    }
+
+    /// Cloned copy of the `HashTableInfo` for this class — the shared
+    /// emitters need a long-lived owned value while they mutate `self`.
+    /// Panics if the class is absent; the dispatcher's membership check
+    /// stages that earlier. Cheap (two enums + a small BucketLayout).
+    pub(super) fn hash_table_info(&self, class_name: &str) -> HashTableInfo {
+        self.module_ctx
+            .hash_table_info
+            .get(class_name)
+            .expect("caller verified hash-table membership")
+            .clone()
+    }
+
+    /// `m.clear()` / `s.clear()` — reset size=0, head/tail=-1, and zero every
+    /// state byte in the bucket array via a single `memory.fill`.
+    /// `buckets_ptr` + `capacity` stay as-is so the table is reusable without
+    /// re-allocating. Kind-agnostic: Map and Set share the same header layout
+    /// so the field offsets and the fill length both come from the shared
+    /// `HashTableInfo` / header registry.
+    pub(super) fn emit_hash_table_clear(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let capacity_off = self.hash_table_field_offset(class_name, "capacity");
+
+        // Evaluate receiver once into a local so we can reuse the pointer
+        // without re-emitting side-effecting sub-expressions.
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        // memory.fill(dst=buckets_ptr, val=0, n=capacity * bucket_size).
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::I32Const(BUCKET_EMPTY));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(capacity_off));
+        self.push(Instruction::I32Const(info.bucket.total_size as i32));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::MemoryFill(0));
+
+        // size = 0
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::I32Const(0));
+        self.push(store_i32(size_off));
+
+        // head_idx = -1, tail_idx = -1
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(store_i32(head_off));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(store_i32(tail_off));
+
+        Ok(())
     }
 
     /// Bind `param_names` (the forEach arrow's formal params) to `locals`

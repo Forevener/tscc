@@ -20,8 +20,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 use super::hash_table::{ArrowArity, extract_foreach_params};
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32,
-    load_typed, store_i32, store_typed,
+    BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32, load_typed,
+    store_i32, store_typed,
 };
 use crate::error::CompileError;
 use crate::types::WasmType;
@@ -50,7 +50,7 @@ impl<'a> FuncContext<'a> {
         match method_name {
             "clear" => {
                 self.expect_args(call, 0, "Set.clear")?;
-                self.emit_set_clear(&member.object, &class_name)?;
+                self.emit_hash_table_clear(&member.object, &class_name)?;
                 Ok(Some(WasmType::Void))
             }
             "has" => {
@@ -81,51 +81,6 @@ impl<'a> FuncContext<'a> {
                 "Set has no method '{other}' — supported: clear, has, add, delete, forEach"
             ))),
         }
-    }
-
-    /// `s.clear()` — reset size=0, head/tail=-1, and zero every state byte in
-    /// the bucket array via a single `memory.fill`. `buckets_ptr` + `capacity`
-    /// stay as-is so the set is reusable without re-allocating.
-    fn emit_set_clear(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-    ) -> Result<(), CompileError> {
-        let info = self.set_info(class_name);
-        let size_off = self.hash_table_field_offset(class_name, "size");
-        let head_off = self.hash_table_field_offset(class_name, "head_idx");
-        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
-        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
-        let capacity_off = self.hash_table_field_offset(class_name, "capacity");
-
-        let this_local = self.alloc_local(WasmType::I32);
-        self.emit_expr(receiver)?;
-        self.push(Instruction::LocalSet(this_local));
-
-        // memory.fill(dst=buckets_ptr, val=0, n=capacity * bucket_size).
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(buckets_off));
-        self.push(Instruction::I32Const(BUCKET_EMPTY));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(capacity_off));
-        self.push(Instruction::I32Const(info.bucket.total_size as i32));
-        self.push(Instruction::I32Mul);
-        self.push(Instruction::MemoryFill(0));
-
-        // size = 0
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::I32Const(0));
-        self.push(store_i32(size_off));
-
-        // head_idx = -1, tail_idx = -1
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(store_i32(head_off));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(store_i32(tail_off));
-
-        Ok(())
     }
 
     /// `s.has(v)` — returns `1` on hit, `0` on miss.
