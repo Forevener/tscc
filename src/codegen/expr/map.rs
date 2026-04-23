@@ -91,7 +91,7 @@ impl<'a> FuncContext<'a> {
             "delete" => {
                 self.expect_args(call, 1, "Map.delete")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_map_delete(&member.object, &class_name, arg)?;
+                self.emit_hash_table_delete(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::I32))
             }
             "forEach" => {
@@ -367,93 +367,6 @@ impl<'a> FuncContext<'a> {
 
         self.push(Instruction::End); // end insert-only if
 
-        Ok(())
-    }
-
-    /// `m.delete(k)` — probe; on hit set state=TOMBSTONE, unlink from the
-    /// insertion chain, decrement size, return `1`. Miss returns `0`.
-    fn emit_map_delete(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        key_arg: &Expression<'a>,
-    ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let size_off = self.hash_table_field_offset(class_name, "size");
-        let head_off = self.hash_table_field_offset(class_name, "head_idx");
-        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
-
-        let ctx = self.begin_hash_table_find(receiver, class_name, key_arg, &info, "Map key")?;
-
-        // if found: unlink + tombstone + decrement. Leaves `found` on stack.
-        self.push(Instruction::LocalGet(ctx.found_local));
-        self.push(Instruction::If(BlockType::Empty));
-
-        let target_addr = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
-        self.push(Instruction::LocalSet(target_addr));
-
-        // Read prev/next before stomping state — they are the only fields we
-        // need to preserve; the key slot may hold a stale pointer after, but
-        // that's fine because state=TOMBSTONE gates every future read.
-        let prev_idx = self.alloc_local(WasmType::I32);
-        let next_idx = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(target_addr));
-        self.push(load_i32(info.bucket.prev_offset));
-        self.push(Instruction::LocalSet(prev_idx));
-        self.push(Instruction::LocalGet(target_addr));
-        self.push(load_i32(info.bucket.next_offset));
-        self.push(Instruction::LocalSet(next_idx));
-
-        // prev_bucket.next = next_idx (or header.head = next_idx if this was head)
-        self.push(Instruction::LocalGet(prev_idx));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(Instruction::I32Ne);
-        self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
-        self.push(Instruction::LocalGet(next_idx));
-        self.push(store_i32(info.bucket.next_offset));
-        self.push(Instruction::Else);
-        self.push(Instruction::LocalGet(ctx.this_local));
-        self.push(Instruction::LocalGet(next_idx));
-        self.push(store_i32(head_off));
-        self.push(Instruction::End);
-
-        // next_bucket.prev = prev_idx (or header.tail = prev_idx if this was tail)
-        self.push(Instruction::LocalGet(next_idx));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(Instruction::I32Ne);
-        self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
-        self.push(Instruction::LocalGet(prev_idx));
-        self.push(store_i32(info.bucket.prev_offset));
-        self.push(Instruction::Else);
-        self.push(Instruction::LocalGet(ctx.this_local));
-        self.push(Instruction::LocalGet(prev_idx));
-        self.push(store_i32(tail_off));
-        self.push(Instruction::End);
-
-        // state = TOMBSTONE
-        self.push(Instruction::LocalGet(target_addr));
-        self.push(Instruction::I32Const(BUCKET_TOMBSTONE));
-        self.push(Instruction::I32Store8(MemArg {
-            offset: info.bucket.state_offset as u64,
-            align: 0,
-            memory_index: 0,
-        }));
-
-        // size -= 1
-        self.push(Instruction::LocalGet(ctx.this_local));
-        self.push(Instruction::LocalGet(ctx.this_local));
-        self.push(load_i32(size_off));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Sub);
-        self.push(store_i32(size_off));
-
-        self.push(Instruction::End); // end "if found"
-
-        // Leave `found` on the stack as the return value.
-        self.push(Instruction::LocalGet(ctx.found_local));
         Ok(())
     }
 

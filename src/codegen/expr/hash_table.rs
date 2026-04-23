@@ -13,8 +13,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, BUCKET_OCCUPIED, EMPTY_LINK, HashTableInfo, hash_helper_for, load_i32,
-    load_typed, store_i32,
+    BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, hash_helper_for,
+    load_i32, load_typed, store_i32,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
@@ -200,6 +200,104 @@ impl<'a> FuncContext<'a> {
             &info,
             hash_table_slot_label(&info),
         )?;
+        self.push(Instruction::LocalGet(ctx.found_local));
+        Ok(())
+    }
+
+    /// `m.delete(k)` / `s.delete(v)` — probe for the slot argument; on hit,
+    /// unlink the bucket from the insertion chain, set its state to
+    /// TOMBSTONE, and decrement size. Leaves `found_local` (1 hit, 0 miss)
+    /// on the stack so the caller returns it as `i32`. Kind-agnostic: there
+    /// is no value slot to clear on Map delete (state=TOMBSTONE gates every
+    /// future read, so stale value bytes are harmless); Set has no value
+    /// slot at all. Same body for both.
+    pub(super) fn emit_hash_table_delete(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        slot_arg: &Expression<'a>,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
+
+        let ctx = self.begin_hash_table_find(
+            receiver,
+            class_name,
+            slot_arg,
+            &info,
+            hash_table_slot_label(&info),
+        )?;
+
+        // if found: unlink + tombstone + decrement. Leaves `found` on stack.
+        self.push(Instruction::LocalGet(ctx.found_local));
+        self.push(Instruction::If(BlockType::Empty));
+
+        let target_addr = self.alloc_local(WasmType::I32);
+        self.emit_bucket_addr(ctx.buckets_local, ctx.slot_local, info.bucket.total_size);
+        self.push(Instruction::LocalSet(target_addr));
+
+        // Read prev/next before stomping state — they are the only fields we
+        // need to preserve; the slot value may hold a stale pointer after,
+        // but that's fine because state=TOMBSTONE gates every future read.
+        let prev_idx = self.alloc_local(WasmType::I32);
+        let next_idx = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(load_i32(info.bucket.prev_offset));
+        self.push(Instruction::LocalSet(prev_idx));
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(load_i32(info.bucket.next_offset));
+        self.push(Instruction::LocalSet(next_idx));
+
+        // prev_bucket.next = next_idx (or header.head = next_idx if this was head)
+        self.push(Instruction::LocalGet(prev_idx));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Ne);
+        self.push(Instruction::If(BlockType::Empty));
+        self.emit_bucket_addr(ctx.buckets_local, prev_idx, info.bucket.total_size);
+        self.push(Instruction::LocalGet(next_idx));
+        self.push(store_i32(info.bucket.next_offset));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(ctx.this_local));
+        self.push(Instruction::LocalGet(next_idx));
+        self.push(store_i32(head_off));
+        self.push(Instruction::End);
+
+        // next_bucket.prev = prev_idx (or header.tail = prev_idx if this was tail)
+        self.push(Instruction::LocalGet(next_idx));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Ne);
+        self.push(Instruction::If(BlockType::Empty));
+        self.emit_bucket_addr(ctx.buckets_local, next_idx, info.bucket.total_size);
+        self.push(Instruction::LocalGet(prev_idx));
+        self.push(store_i32(info.bucket.prev_offset));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(ctx.this_local));
+        self.push(Instruction::LocalGet(prev_idx));
+        self.push(store_i32(tail_off));
+        self.push(Instruction::End);
+
+        // state = TOMBSTONE
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(Instruction::I32Const(BUCKET_TOMBSTONE));
+        self.push(Instruction::I32Store8(MemArg {
+            offset: info.bucket.state_offset as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+
+        // size -= 1
+        self.push(Instruction::LocalGet(ctx.this_local));
+        self.push(Instruction::LocalGet(ctx.this_local));
+        self.push(load_i32(size_off));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Sub);
+        self.push(store_i32(size_off));
+
+        self.push(Instruction::End); // end "if found"
+
+        // Leave `found` on the stack as the return value.
         self.push(Instruction::LocalGet(ctx.found_local));
         Ok(())
     }
