@@ -72,7 +72,7 @@ impl<'a> FuncContext<'a> {
             "has" => {
                 self.expect_args(call, 1, "Map.has")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_map_has(&member.object, &class_name, arg)?;
+                self.emit_hash_table_has(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::I32))
             }
             "get" => {
@@ -104,22 +104,6 @@ impl<'a> FuncContext<'a> {
                 "Map has no method '{other}' — supported: clear, has, get, set, delete, forEach"
             ))),
         }
-    }
-
-    /// `m.has(k)` — returns `1` on hit, `0` on miss. Probes linearly until an
-    /// EMPTY slot is seen (definite miss) or an OCCUPIED slot matches the
-    /// key. Tombstones are skipped.
-    fn emit_map_has(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        key_arg: &Expression<'a>,
-    ) -> Result<(), CompileError> {
-        let info = self.map_info(class_name);
-        let ctx = self.begin_hash_table_find(receiver, class_name, key_arg, &info, "Map key")?;
-        // Leaves 1 (hit) / 0 (miss) on the stack.
-        self.push(Instruction::LocalGet(ctx.found_local));
-        Ok(())
     }
 
     /// `m.get(k)` — returns the stored value on hit, or the zero value of V

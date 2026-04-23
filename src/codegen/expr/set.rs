@@ -56,7 +56,7 @@ impl<'a> FuncContext<'a> {
             "has" => {
                 self.expect_args(call, 1, "Set.has")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_set_has(&member.object, &class_name, arg)?;
+                self.emit_hash_table_has(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::I32))
             }
             "add" => {
@@ -81,19 +81,6 @@ impl<'a> FuncContext<'a> {
                 "Set has no method '{other}' — supported: clear, has, add, delete, forEach"
             ))),
         }
-    }
-
-    /// `s.has(v)` — returns `1` on hit, `0` on miss.
-    fn emit_set_has(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        elem_arg: &Expression<'a>,
-    ) -> Result<(), CompileError> {
-        let info = self.set_info(class_name);
-        let ctx = self.begin_hash_table_find(receiver, class_name, elem_arg, &info, "Set element")?;
-        self.push(Instruction::LocalGet(ctx.found_local));
-        Ok(())
     }
 
     /// `s.add(v)` — insert if absent, no-op if already present. Triggers a 2×

@@ -181,6 +181,29 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
+    /// `m.has(k)` / `s.has(v)` — probe for the slot argument, leave `1` on
+    /// the stack for a hit and `0` for a miss. Returns i32. Kind-agnostic:
+    /// the only asymmetry (the `"Map key"` vs `"Set element"` type-check
+    /// error label) is derived from `info.value_ty.is_some()` via
+    /// `hash_table_slot_label`.
+    pub(super) fn emit_hash_table_has(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        slot_arg: &Expression<'a>,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let ctx = self.begin_hash_table_find(
+            receiver,
+            class_name,
+            slot_arg,
+            &info,
+            hash_table_slot_label(&info),
+        )?;
+        self.push(Instruction::LocalGet(ctx.found_local));
+        Ok(())
+    }
+
     /// Bind `param_names` (the forEach arrow's formal params) to `locals`
     /// for the duration of the body. Returns a `HashTableArrowScope` that
     /// `pop_hash_table_arrow_scope` consumes to restore any shadowed outer
@@ -353,6 +376,14 @@ impl<'a> FuncContext<'a> {
             found_local,
         })
     }
+}
+
+/// Error-text label for the slot argument in a Map or Set method
+/// (`"Map key"` / `"Set element"`). Picked from `info.value_ty.is_some()`
+/// so shared emitters can thread kind-appropriate diagnostics without
+/// per-kind shims.
+pub(super) fn hash_table_slot_label(info: &HashTableInfo) -> &'static str {
+    if info.value_ty.is_some() { "Map key" } else { "Set element" }
 }
 
 /// Extract a `forEach` callback's arrow-function AST and validate its param
