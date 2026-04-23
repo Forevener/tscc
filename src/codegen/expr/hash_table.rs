@@ -8,12 +8,13 @@
 //! as needed.
 
 use oxc_ast::ast::{ArrowFunctionExpression, BindingPattern, Expression};
-use wasm_encoder::Instruction;
+use wasm_encoder::{BlockType, Instruction, MemArg};
 
 use crate::codegen::array_builtins::extract_arrow;
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_EMPTY, EMPTY_LINK, HashTableInfo, hash_helper_for, load_i32, load_typed, store_i32,
+    BUCKET_EMPTY, BUCKET_OCCUPIED, EMPTY_LINK, HashTableInfo, hash_helper_for, load_i32,
+    load_typed, store_i32,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, ClosureSig, WasmType};
@@ -258,6 +259,100 @@ impl<'a> FuncContext<'a> {
             }
         }
     }
+
+    /// Probe for `has` / `delete`. Evaluates the receiver and slot argument
+    /// (key for Map, element for Set) once, then walks the probe chain until
+    /// it hits an EMPTY slot (miss) or an OCCUPIED slot matching the slot
+    /// value (hit). Returns the locals that hold the result so callers can
+    /// branch on `found_local` and reuse `slot_local`/`buckets_local` without
+    /// re-deriving them. `slot_label` ("Map key" / "Set element") names the
+    /// argument in the type-check error.
+    pub(super) fn begin_hash_table_find(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        slot_arg: &Expression<'a>,
+        info: &HashTableInfo,
+        slot_label: &str,
+    ) -> Result<HashTableFindContext, CompileError> {
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let cap_off = self.hash_table_field_offset(class_name, "capacity");
+
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        let slot_value_local = self.alloc_local(info.slot_ty.wasm_ty());
+        let ty = self.emit_expr(slot_arg)?;
+        self.check_slot_type(info, ty, slot_label)?;
+        self.push(Instruction::LocalSet(slot_value_local));
+
+        let buckets_local = self.alloc_local(WasmType::I32);
+        let mask_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::LocalSet(buckets_local));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(cap_off));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::LocalSet(mask_local));
+
+        let slot_local = self.alloc_local(WasmType::I32);
+        self.emit_hash_for_local(slot_value_local, &info.slot_ty);
+        self.push(Instruction::LocalGet(mask_local));
+        self.push(Instruction::I32And);
+        self.push(Instruction::LocalSet(slot_local));
+
+        let found_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(found_local));
+
+        // Probe.
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        let state_local = self.alloc_local(WasmType::I32);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(Instruction::I32Load8U(MemArg {
+            offset: info.bucket.state_offset as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalTee(state_local));
+        // EMPTY → miss, break.
+        self.push(Instruction::I32Eqz);
+        self.push(Instruction::BrIf(1));
+        // OCCUPIED → compare; on match, set found and break.
+        self.push(Instruction::LocalGet(state_local));
+        self.push(Instruction::I32Const(BUCKET_OCCUPIED));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::If(BlockType::Empty));
+        self.emit_slot_equals_stored(buckets_local, slot_local, slot_value_local, info);
+        self.push(Instruction::If(BlockType::Empty));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::LocalSet(found_local));
+        self.push(Instruction::Br(3));
+        self.push(Instruction::End);
+        self.push(Instruction::End);
+
+        // slot = (slot + 1) & mask
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(mask_local));
+        self.push(Instruction::I32And);
+        self.push(Instruction::LocalSet(slot_local));
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End); // loop
+        self.push(Instruction::End); // block
+
+        Ok(HashTableFindContext {
+            this_local,
+            buckets_local,
+            slot_local,
+            found_local,
+        })
+    }
 }
 
 /// Extract a `forEach` callback's arrow-function AST and validate its param
@@ -298,6 +393,15 @@ pub(super) fn extract_foreach_params<'b, 'a>(
 
 /// Per-param save for `push_hash_table_arrow_scope` — mirrors the subset of
 /// FuncContext state that arrow-binding mutation needs to restore.
+/// Locals returned from `begin_hash_table_find` so branches can reuse the
+/// probe result without re-deriving them.
+pub(super) struct HashTableFindContext {
+    pub(super) this_local: u32,
+    pub(super) buckets_local: u32,
+    pub(super) slot_local: u32,
+    pub(super) found_local: u32,
+}
+
 pub(super) struct HashTableArrowScope {
     entries: Vec<HashTableScopeEntry>,
 }

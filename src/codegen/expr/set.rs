@@ -91,7 +91,7 @@ impl<'a> FuncContext<'a> {
         elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
         let info = self.set_info(class_name);
-        let ctx = self.begin_set_find(receiver, class_name, elem_arg, &info)?;
+        let ctx = self.begin_hash_table_find(receiver, class_name, elem_arg, &info, "Set element")?;
         self.push(Instruction::LocalGet(ctx.found_local));
         Ok(())
     }
@@ -307,7 +307,7 @@ impl<'a> FuncContext<'a> {
         let head_off = self.hash_table_field_offset(class_name, "head_idx");
         let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
 
-        let ctx = self.begin_set_find(receiver, class_name, elem_arg, &info)?;
+        let ctx = self.begin_hash_table_find(receiver, class_name, elem_arg, &info, "Set element")?;
 
         self.push(Instruction::LocalGet(ctx.found_local));
         self.push(Instruction::If(BlockType::Empty));
@@ -443,92 +443,6 @@ impl<'a> FuncContext<'a> {
 
         self.pop_hash_table_arrow_scope(saved);
         Ok(())
-    }
-
-    /// Probe for `has` / `delete`. Evaluates the receiver and element once,
-    /// then walks the probe chain until it hits an EMPTY slot (miss) or an
-    /// OCCUPIED slot matching the element (hit).
-    fn begin_set_find(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        elem_arg: &Expression<'a>,
-        info: &HashTableInfo,
-    ) -> Result<SetFindContext, CompileError> {
-        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
-        let cap_off = self.hash_table_field_offset(class_name, "capacity");
-
-        let this_local = self.alloc_local(WasmType::I32);
-        self.emit_expr(receiver)?;
-        self.push(Instruction::LocalSet(this_local));
-
-        let elem_local = self.alloc_local(info.slot_ty.wasm_ty());
-        let ty = self.emit_expr(elem_arg)?;
-        self.check_slot_type(info, ty, "Set element")?;
-        self.push(Instruction::LocalSet(elem_local));
-
-        let buckets_local = self.alloc_local(WasmType::I32);
-        let mask_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(buckets_off));
-        self.push(Instruction::LocalSet(buckets_local));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(cap_off));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Sub);
-        self.push(Instruction::LocalSet(mask_local));
-
-        let slot_local = self.alloc_local(WasmType::I32);
-        self.emit_hash_for_local(elem_local, &info.slot_ty);
-        self.push(Instruction::LocalGet(mask_local));
-        self.push(Instruction::I32And);
-        self.push(Instruction::LocalSet(slot_local));
-
-        let found_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::I32Const(0));
-        self.push(Instruction::LocalSet(found_local));
-
-        self.push(Instruction::Block(BlockType::Empty));
-        self.push(Instruction::Loop(BlockType::Empty));
-        let state_local = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(Instruction::I32Load8U(MemArg {
-            offset: info.bucket.state_offset as u64,
-            align: 0,
-            memory_index: 0,
-        }));
-        self.push(Instruction::LocalTee(state_local));
-        self.push(Instruction::I32Eqz);
-        self.push(Instruction::BrIf(1));
-        self.push(Instruction::LocalGet(state_local));
-        self.push(Instruction::I32Const(BUCKET_OCCUPIED));
-        self.push(Instruction::I32Eq);
-        self.push(Instruction::If(BlockType::Empty));
-        self.emit_slot_equals_stored(buckets_local, slot_local, elem_local, info);
-        self.push(Instruction::If(BlockType::Empty));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::LocalSet(found_local));
-        self.push(Instruction::Br(3));
-        self.push(Instruction::End);
-        self.push(Instruction::End);
-
-        // slot = (slot + 1) & mask
-        self.push(Instruction::LocalGet(slot_local));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Add);
-        self.push(Instruction::LocalGet(mask_local));
-        self.push(Instruction::I32And);
-        self.push(Instruction::LocalSet(slot_local));
-        self.push(Instruction::Br(0));
-        self.push(Instruction::End); // loop
-        self.push(Instruction::End); // block
-
-        Ok(SetFindContext {
-            this_local,
-            buckets_local,
-            slot_local,
-            found_local,
-        })
     }
 
     /// 2× capacity rebuild. Called from `add()` when the load factor would
@@ -694,11 +608,4 @@ impl<'a> FuncContext<'a> {
             .clone()
     }
 
-}
-
-struct SetFindContext {
-    this_local: u32,
-    buckets_local: u32,
-    slot_local: u32,
-    found_local: u32,
 }
