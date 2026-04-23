@@ -132,14 +132,14 @@ impl<'a> FuncContext<'a> {
             self.type_bindings.as_ref(),
         )?;
         let mangled = map_builtins::mangle_map_name(&key_ty, &value_ty);
-        let info = self.module_ctx.map_info.get(&mangled).ok_or_else(|| {
+        let info = self.module_ctx.hash_table_info.get(&mangled).ok_or_else(|| {
             CompileError::codegen(format!("map instantiation '{mangled}' not registered"))
         })?;
         let header_size = self
             .module_ctx
             .class_registry
             .get(&mangled)
-            .expect("map layout registered alongside map_info")
+            .expect("map layout registered alongside hash_table_info")
             .size;
         let bucket_size = info.bucket.total_size;
 
@@ -230,14 +230,14 @@ impl<'a> FuncContext<'a> {
             self.type_bindings.as_ref(),
         )?;
         let mangled = set_builtins::mangle_set_name(&elem_ty);
-        let info = self.module_ctx.set_info.get(&mangled).ok_or_else(|| {
+        let info = self.module_ctx.hash_table_info.get(&mangled).ok_or_else(|| {
             CompileError::codegen(format!("set instantiation '{mangled}' not registered"))
         })?;
         let header_size = self
             .module_ctx
             .class_registry
             .get(&mangled)
-            .expect("set layout registered alongside set_info")
+            .expect("set layout registered alongside hash_table_info")
             .size;
         let bucket_size = info.bucket.total_size;
 

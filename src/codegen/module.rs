@@ -91,16 +91,11 @@ pub struct ModuleContext {
     /// generic function call (`identity(5)`). `emit_call` consults this map
     /// to route the call through the right monomorphization.
     pub inferred_fn_calls: HashMap<u32, String>,
-    /// Mangled Map<K, V> name -> (slot_ty, value_ty, bucket layout). Populated
-    /// in Pass 0a-iii. Dispatchers in `expr/map.rs` and `emit_new` read this
-    /// to route per-monomorphization codegen. `value_ty` is always `Some` for
-    /// entries in this map (shared `HashTableInfo` type is also used for sets).
-    pub map_info: HashMap<String, super::hash_table::HashTableInfo>,
-    /// Mangled Set<T> name -> (slot_ty, bucket layout). Populated alongside
-    /// `map_info` in Pass 0a-iii. Dispatchers in `expr/set.rs` and `emit_new`
-    /// read this to route per-monomorphization codegen. `value_ty` is always
-    /// `None` for entries in this map.
-    pub set_info: HashMap<String, super::hash_table::HashTableInfo>,
+    /// Mangled `Map<K, V>` / `Set<T>` name -> bucket + slot metadata.
+    /// Populated in Pass 0a-iii. Dispatchers in `expr/map.rs`, `expr/set.rs`,
+    /// and `emit_new_{map,set}` read this to route per-monomorphization
+    /// codegen. Map vs Set is distinguished by `value_ty.is_some()`.
+    pub hash_table_info: HashMap<String, super::hash_table::HashTableInfo>,
     /// Structural object types discovered in Pass 0a-iv. Each entry describes
     /// a named (`type`/`interface`) or anonymous (inline `TSTypeLiteral` /
     /// `ObjectExpression`) shape, deduped by its sort-by-name fingerprint.
@@ -179,8 +174,7 @@ impl ModuleContext {
             class_bindings: HashMap::new(),
             fn_bindings: HashMap::new(),
             inferred_fn_calls: HashMap::new(),
-            map_info: HashMap::new(),
-            set_info: HashMap::new(),
+            hash_table_info: HashMap::new(),
             shape_registry: super::shapes::ShapeRegistry::default(),
             helper_registration: RefCell::new(None),
             fn_param_classes: HashMap::new(),
@@ -486,36 +480,24 @@ pub fn compile_module<'a>(
             .insert(inst.mangled_name.clone(), inst.bindings.clone());
     }
 
-    // Pass 0a-iii: register compiler-owned Map<K, V> instantiations. Maps
-    // live outside class_info/class_ast_map — they carry no user AST, no
-    // inheritance, and no user-facing methods yet. Their header layouts are
-    // synthesized directly in the ClassRegistry so field access + member
-    // resolution flow through the same paths as user classes; bucket
-    // layouts are stashed on `ctx.map_info` for `emit_new_map` and the
-    // method dispatcher to consume.
-    for inst in &map_insts {
+    // Pass 0a-iii: register compiler-owned Map<K, V> / Set<T> instantiations.
+    // Maps and Sets live outside class_info/class_ast_map — they carry no
+    // user AST, no inheritance, and no user-facing methods yet. Their header
+    // layouts are synthesized directly in the ClassRegistry so field access +
+    // member resolution flow through the same paths as user classes; bucket
+    // layouts are stashed on `ctx.hash_table_info` for `emit_new_{map,set}`
+    // and the method dispatchers to consume. Map vs Set is recovered from
+    // `value_ty.is_some()`.
+    for inst in map_insts.iter().chain(set_insts.iter()) {
         ctx.class_names.insert(inst.mangled_name.clone());
         super::hash_table::register_layout(&mut ctx.class_registry, &inst.mangled_name)?;
         let bucket =
             super::hash_table::BucketLayout::compute(&inst.slot_ty, inst.value_ty.as_ref());
-        ctx.map_info.insert(
+        ctx.hash_table_info.insert(
             inst.mangled_name.clone(),
             super::hash_table::HashTableInfo {
                 slot_ty: inst.slot_ty.clone(),
                 value_ty: inst.value_ty.clone(),
-                bucket,
-            },
-        );
-    }
-    for inst in &set_insts {
-        ctx.class_names.insert(inst.mangled_name.clone());
-        super::hash_table::register_layout(&mut ctx.class_registry, &inst.mangled_name)?;
-        let bucket = super::hash_table::BucketLayout::compute(&inst.slot_ty, None);
-        ctx.set_info.insert(
-            inst.mangled_name.clone(),
-            super::hash_table::HashTableInfo {
-                slot_ty: inst.slot_ty.clone(),
-                value_ty: None,
                 bucket,
             },
         );

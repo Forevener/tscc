@@ -162,9 +162,9 @@ pub struct HashTableInstantiation {
 
 /// Everything `emit_new_map` / `emit_new_set` and the method dispatchers
 /// need to know about a single `Map<K, V>` or `Set<T>` monomorphization.
-/// Stored in `ModuleContext::{map_info,set_info}` keyed on `mangled_name`.
-/// `value_ty.is_some()` distinguishes Map from Set at the (rare) call site
-/// that handles both.
+/// Stored in `ModuleContext::hash_table_info` keyed on `mangled_name`.
+/// `value_ty.is_some()` distinguishes Map from Set at call sites that
+/// need to tell them apart.
 #[derive(Debug, Clone)]
 pub struct HashTableInfo {
     pub slot_ty: BoundType,

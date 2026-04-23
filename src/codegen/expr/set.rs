@@ -17,14 +17,14 @@
 use oxc_ast::ast::*;
 use wasm_encoder::{BlockType, Instruction, MemArg};
 
-use crate::codegen::array_builtins::extract_arrow;
+use super::hash_table::{ArrowArity, extract_foreach_params};
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
     BUCKET_EMPTY, BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32,
     load_typed, store_i32, store_typed,
 };
 use crate::error::CompileError;
-use crate::types::{BoundType, ClosureSig, WasmType};
+use crate::types::WasmType;
 
 impl<'a> FuncContext<'a> {
     /// Entry point invoked from `emit_call`. If the call is
@@ -42,8 +42,9 @@ impl<'a> FuncContext<'a> {
             Ok(name) => name,
             Err(_) => return Ok(None),
         };
-        if !self.module_ctx.set_info.contains_key(&class_name) {
-            return Ok(None);
+        match self.module_ctx.hash_table_info.get(&class_name) {
+            Some(info) if info.value_ty.is_none() => {}
+            _ => return Ok(None),
         }
         let method_name = member.property.name.as_str();
         match method_name {
@@ -91,11 +92,11 @@ impl<'a> FuncContext<'a> {
         class_name: &str,
     ) -> Result<(), CompileError> {
         let info = self.set_info(class_name);
-        let size_off = self.set_field_offset_for(class_name, "size");
-        let head_off = self.set_field_offset_for(class_name, "head_idx");
-        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
-        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
-        let capacity_off = self.set_field_offset_for(class_name, "capacity");
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let capacity_off = self.hash_table_field_offset(class_name, "capacity");
 
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
@@ -150,11 +151,11 @@ impl<'a> FuncContext<'a> {
         elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
         let info = self.set_info(class_name);
-        let size_off = self.set_field_offset_for(class_name, "size");
-        let cap_off = self.set_field_offset_for(class_name, "capacity");
-        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
-        let head_off = self.set_field_offset_for(class_name, "head_idx");
-        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let cap_off = self.hash_table_field_offset(class_name, "capacity");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
 
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
@@ -347,9 +348,9 @@ impl<'a> FuncContext<'a> {
         elem_arg: &Expression<'a>,
     ) -> Result<(), CompileError> {
         let info = self.set_info(class_name);
-        let size_off = self.set_field_offset_for(class_name, "size");
-        let head_off = self.set_field_offset_for(class_name, "head_idx");
-        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
 
         let ctx = self.begin_set_find(receiver, class_name, elem_arg, &info)?;
 
@@ -430,26 +431,10 @@ impl<'a> FuncContext<'a> {
         callback: &Expression<'a>,
     ) -> Result<(), CompileError> {
         let info = self.set_info(class_name);
-        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
-        let head_off = self.set_field_offset_for(class_name, "head_idx");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
 
-        let arrow = extract_arrow(callback)?;
-        let params: Vec<String> = arrow
-            .params
-            .items
-            .iter()
-            .map(|p| match &p.pattern {
-                BindingPattern::BindingIdentifier(ident) => Ok(ident.name.as_str().to_string()),
-                _ => Err(CompileError::unsupported(
-                    "forEach callback param must be a bare identifier",
-                )),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if params.len() != 1 {
-            return Err(CompileError::codegen(
-                "Set.forEach callback must take exactly 1 parameter: (value)",
-            ));
-        }
+        let (arrow, params) = extract_foreach_params(callback, ArrowArity::One, "Set")?;
 
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
@@ -467,7 +452,7 @@ impl<'a> FuncContext<'a> {
 
         let elem_local = self.alloc_local(info.slot_ty.wasm_ty());
 
-        let saved = self.push_set_arrow_scope(&params, &[(elem_local, &info.slot_ty)]);
+        let saved = self.push_hash_table_arrow_scope(&params, &[(elem_local, &info.slot_ty)]);
 
         self.push(Instruction::Block(BlockType::Empty));
         self.push(Instruction::Loop(BlockType::Empty));
@@ -501,7 +486,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End); // loop
         self.push(Instruction::End); // block
 
-        self.pop_set_arrow_scope(&params, saved);
+        self.pop_hash_table_arrow_scope(saved);
         Ok(())
     }
 
@@ -515,8 +500,8 @@ impl<'a> FuncContext<'a> {
         elem_arg: &Expression<'a>,
         info: &HashTableInfo,
     ) -> Result<SetFindContext, CompileError> {
-        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
-        let cap_off = self.set_field_offset_for(class_name, "capacity");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let cap_off = self.hash_table_field_offset(class_name, "capacity");
 
         let this_local = self.alloc_local(WasmType::I32);
         self.emit_expr(receiver)?;
@@ -601,10 +586,10 @@ impl<'a> FuncContext<'a> {
         class_name: &str,
         info: &HashTableInfo,
     ) -> Result<(), CompileError> {
-        let buckets_off = self.set_field_offset_for(class_name, "buckets_ptr");
-        let cap_off = self.set_field_offset_for(class_name, "capacity");
-        let head_off = self.set_field_offset_for(class_name, "head_idx");
-        let tail_off = self.set_field_offset_for(class_name, "tail_idx");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let cap_off = self.hash_table_field_offset(class_name, "capacity");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
         let bucket_size = info.bucket.total_size as i32;
 
         let old_buckets = self.alloc_local(WasmType::I32);
@@ -748,90 +733,12 @@ impl<'a> FuncContext<'a> {
 
     fn set_info(&self, class_name: &str) -> HashTableInfo {
         self.module_ctx
-            .set_info
+            .hash_table_info
             .get(class_name)
-            .expect("caller verified set_info membership")
+            .expect("caller verified set membership")
             .clone()
     }
 
-    fn set_field_offset_for(&self, class_name: &str, field_name: &str) -> u32 {
-        self.module_ctx
-            .class_registry
-            .get(class_name)
-            .and_then(|l| l.field_map.get(field_name).map(|(off, _)| *off))
-            .unwrap_or_else(|| panic!("set class '{class_name}' missing field '{field_name}'"))
-    }
-
-    fn push_set_arrow_scope(
-        &mut self,
-        param_names: &[String],
-        locals: &[(u32, &BoundType)],
-    ) -> SetArrowScope {
-        let mut saved = SetArrowScope {
-            entries: Vec::with_capacity(param_names.len()),
-        };
-        for (i, name) in param_names.iter().enumerate() {
-            let (local_idx, ty) = locals[i];
-            saved.entries.push(SetScopeEntry {
-                name: name.clone(),
-                saved_local: self.locals.get(name).copied(),
-                saved_class: self.local_class_types.get(name).cloned(),
-                saved_string: self.local_string_vars.contains(name),
-                saved_closure_sig: self.local_closure_sigs.get(name).cloned(),
-            });
-            self.locals.insert(name.clone(), (local_idx, ty.wasm_ty()));
-            match ty {
-                BoundType::Class(cn) => {
-                    self.local_class_types.insert(name.clone(), cn.clone());
-                    self.local_string_vars.remove(name);
-                }
-                BoundType::Str => {
-                    self.local_class_types.remove(name);
-                    self.local_string_vars.insert(name.clone());
-                }
-                _ => {
-                    self.local_class_types.remove(name);
-                    self.local_string_vars.remove(name);
-                }
-            }
-            self.local_closure_sigs.remove(name);
-        }
-        saved
-    }
-
-    fn pop_set_arrow_scope(&mut self, _param_names: &[String], saved: SetArrowScope) {
-        for entry in saved.entries.into_iter().rev() {
-            match entry.saved_local {
-                Some(prev) => {
-                    self.locals.insert(entry.name.clone(), prev);
-                }
-                None => {
-                    self.locals.remove(&entry.name);
-                }
-            }
-            match entry.saved_class {
-                Some(cn) => {
-                    self.local_class_types.insert(entry.name.clone(), cn);
-                }
-                None => {
-                    self.local_class_types.remove(&entry.name);
-                }
-            }
-            if entry.saved_string {
-                self.local_string_vars.insert(entry.name.clone());
-            } else {
-                self.local_string_vars.remove(&entry.name);
-            }
-            match entry.saved_closure_sig {
-                Some(sig) => {
-                    self.local_closure_sigs.insert(entry.name, sig);
-                }
-                None => {
-                    self.local_closure_sigs.remove(&entry.name);
-                }
-            }
-        }
-    }
 }
 
 struct SetFindContext {
@@ -839,16 +746,4 @@ struct SetFindContext {
     buckets_local: u32,
     slot_local: u32,
     found_local: u32,
-}
-
-struct SetArrowScope {
-    entries: Vec<SetScopeEntry>,
-}
-
-struct SetScopeEntry {
-    name: String,
-    saved_local: Option<(u32, WasmType)>,
-    saved_class: Option<String>,
-    saved_string: bool,
-    saved_closure_sig: Option<ClosureSig>,
 }
