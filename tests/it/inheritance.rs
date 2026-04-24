@@ -1,9 +1,7 @@
-mod common;
-
 use std::cell::Cell;
 
 use wasmtime::*;
-use common::compile;
+use super::common::compile;
 
 #[test]
 fn inherit_basic_field_access() {

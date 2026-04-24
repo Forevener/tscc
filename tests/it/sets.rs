@@ -1,6 +1,4 @@
-mod common;
-
-use common::run_sink_tick;
+use super::common::run_sink_tick;
 
 // ─── Phase D Step 1 — layout & construction ─────────────────────────────────
 

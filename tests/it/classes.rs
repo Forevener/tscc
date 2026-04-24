@@ -1,8 +1,6 @@
-mod common;
-
 use wasmtime::*;
 
-use common::compile;
+use super::common::compile;
 
 #[test]
 fn realistic_lowlevel_perceive_parsing() {

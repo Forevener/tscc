@@ -1,6 +1,4 @@
-mod common;
-
-use common::run_sink_tick;
+use super::common::run_sink_tick;
 
 /// Phase C Step 1: `new Map<K, V>()` compiles end-to-end, allocates the 5-field
 /// header, and `.size` reads as zero on a fresh map.

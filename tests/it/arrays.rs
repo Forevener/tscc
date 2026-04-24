@@ -1,10 +1,8 @@
-mod common;
-
 use std::cell::Cell;
 
 use wasmtime::*;
 
-use common::{compile, compile_err, run_sink_tick};
+use super::common::{compile, compile_err, run_sink_tick};
 
 #[test]
 fn array_is_array_static() {

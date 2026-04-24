@@ -40,3 +40,14 @@ wasmparser = "0.226"
 # wasm-side bytes. (FxHash is inlined in both places and needs no reference
 # crate — see `fx_round_u64` in `tests/hashers.rs`.)
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Dev/test builds don't need full DWARF/PDB for the wasmtime + cranelift
+# dependency tree. `line-tables-only` keeps file:line in backtraces while
+# cutting debug-info link time and PDB size by ~10×. See the integration
+# test binary consolidation (tests/it.rs) for the matching reduction in
+# link jobs.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

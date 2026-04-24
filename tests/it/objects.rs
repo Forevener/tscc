@@ -8,11 +8,9 @@
 //! directly from an `ObjectExpression`, and destructuring from a free
 //! function that returns a synthetic-class instance.
 
-mod common;
-
 use wasmtime::*;
 
-use common::{compile, compile_err, read_wasm_string, run_sink_tick};
+use super::common::{compile, compile_err, read_wasm_string, run_sink_tick};
 
 // ---- Named shapes (`type` alias path) ----
 

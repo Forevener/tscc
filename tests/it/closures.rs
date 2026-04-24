@@ -1,6 +1,6 @@
-mod common;
 use wasmtime::*;
-use common::compile;
+
+use super::common::compile;
 
 #[test]
 fn closure_basic_no_capture() {

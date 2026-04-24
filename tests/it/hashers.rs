@@ -14,8 +14,6 @@
 //! `xxhash-rust` dev-dep versions ever drift from `helpers/Cargo.toml`,
 //! failures here will flag it immediately.
 
-mod common;
-
 use std::collections::HashSet;
 
 use wasmtime::*;

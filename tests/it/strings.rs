@@ -1,8 +1,6 @@
-mod common;
-
 use wasmtime::*;
 
-use common::{compile, compile_err, read_wasm_string};
+use super::common::{compile, compile_err, read_wasm_string};
 
 #[test]
 fn string_concat_method() {

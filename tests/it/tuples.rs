@@ -6,9 +6,7 @@
 //! `[[i32, i32], string]`; rejection of variable index and shape
 //! disagreements; plus the function-arg and `Array<[i32, i32]>` flows.
 
-mod common;
-
-use common::{compile_err, run_sink_tick};
+use super::common::{compile_err, run_sink_tick};
 
 // ---- Literals + indexed access ----
 

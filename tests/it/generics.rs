@@ -1,8 +1,6 @@
-mod common;
-
 use wasmtime::*;
 
-use common::{compile, run_sink_tick};
+use super::common::{compile, run_sink_tick};
 
 /// `Box<T>` with T = i32. One monomorphization, concrete constructor call.
 #[test]

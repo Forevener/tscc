@@ -1,10 +1,8 @@
-mod common;
-
 use std::cell::Cell;
 
 use wasmtime::*;
 
-use common::compile;
+use super::common::compile;
 
 #[test]
 fn empty_tick_loads_and_runs() {

@@ -1,6 +1,6 @@
-mod common;
 use wasmtime::*;
-use common::{compile, compile_debug, find_custom_sections};
+
+use super::common::{compile, compile_debug, find_custom_sections};
 
 #[test]
 fn debug_name_section_present() {

@@ -17,8 +17,6 @@
 //! If any of the three rewrites is wrong the wasm module fails validation
 //! or produces wrong answers for these reference values.
 
-mod common;
-
 use std::collections::HashSet;
 
 use wasmtime::*;

@@ -1,6 +1,4 @@
-mod common;
-
-use common::compile_err;
+use super::common::compile_err;
 
 #[test]
 fn error_undefined_variable_has_location() {
