@@ -8,7 +8,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Version
 
 ### Added
 
-- **Object literals / structural types** — landed 2026-04-22 (Phases A + C of [`docs/plan-object-literals-tuples.md`](docs/plan-object-literals-tuples.md)).
+- **Object literals / structural types** — landed 2026-04-22.
   - `type P = { x: number; y: number }` and `interface P { ... }` lower to the same synthetic class; both names resolve to a single layout.
   - Anonymous literals `{ x: 1, y: 2 }` fingerprint-match to a named shape when the field set aligns, or get a mangled `__ObjLit$...` name otherwise. Reorders (`{y, x}` ↔ `{x, y}`) dedupe to one shape — first-declaration wins layout.
   - Field access `p.x`, reassignment `p.x = v`, and destructuring `const { x, y } = p` all work through the existing class-ref machinery.
