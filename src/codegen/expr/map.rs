@@ -35,8 +35,8 @@ use wasm_encoder::{BlockType, Instruction, MemArg};
 
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
-    BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32, load_typed,
-    store_i32, store_typed,
+    BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32, store_i32,
+    store_typed,
 };
 use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
@@ -195,7 +195,7 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Mul);
         self.push(Instruction::I32GeU);
         self.push(Instruction::If(BlockType::Empty));
-        self.emit_map_rebuild(this_local, class_name, &info)?;
+        self.emit_hash_table_rebuild(this_local, class_name, &info)?;
         self.push(Instruction::End);
 
         // Probe. Tracks first tombstone for insert reuse; if an OCCUPIED
@@ -365,185 +365,6 @@ impl<'a> FuncContext<'a> {
         self.push(store_i32(size_off));
 
         self.push(Instruction::End); // end insert-only if
-
-        Ok(())
-    }
-
-    /// `m.forEach((v, k) => { ... })` — walk the insertion chain from head
-    /// via each bucket's `next_insert` pointer, binding the 1 or 2 arrow
-    /// params to `(value, key)` per iteration. Mirrors `arr.forEach`'s arrow
-    /// scope management so captured outer vars resolve correctly.
-    /// 2× capacity rebuild. Called from inside `set()` when the load factor
-    /// would exceed 75% with one more entry. Walks the old insertion chain
-    /// (head → next) into freshly-allocated buckets, preserving order and
-    /// collecting tombstones out as a side effect.
-    fn emit_map_rebuild(
-        &mut self,
-        this_local: u32,
-        class_name: &str,
-        info: &HashTableInfo,
-    ) -> Result<(), CompileError> {
-        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
-        let cap_off = self.hash_table_field_offset(class_name, "capacity");
-        let head_off = self.hash_table_field_offset(class_name, "head_idx");
-        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
-        let bucket_size = info.bucket.total_size as i32;
-
-        // old_buckets / old_capacity / old_head
-        let old_buckets = self.alloc_local(WasmType::I32);
-        let new_cap = self.alloc_local(WasmType::I32);
-        let new_mask = self.alloc_local(WasmType::I32);
-        let old_slot = self.alloc_local(WasmType::I32);
-
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(buckets_off));
-        self.push(Instruction::LocalSet(old_buckets));
-
-        // new_cap = old_cap * 2
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(cap_off));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Shl);
-        self.push(Instruction::LocalTee(new_cap));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Sub);
-        self.push(Instruction::LocalSet(new_mask));
-
-        // Allocate new bucket array: new_cap * bucket_size (zero-init via arena bump).
-        self.push(Instruction::LocalGet(new_cap));
-        self.push(Instruction::I32Const(bucket_size));
-        self.push(Instruction::I32Mul);
-        let new_buckets = self.emit_arena_alloc_to_local(true)?;
-
-        // Snapshot old head (first entry to re-insert), then clear header's
-        // chain + point it at the new array.
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(head_off));
-        self.push(Instruction::LocalSet(old_slot));
-
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::LocalGet(new_buckets));
-        self.push(store_i32(buckets_off));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::LocalGet(new_cap));
-        self.push(store_i32(cap_off));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(store_i32(head_off));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(store_i32(tail_off));
-
-        // Walk old chain, re-inserting into new array while maintaining order.
-        // Re-using insertion-link append gives us the source-order chain for free.
-        let old_addr = self.alloc_local(WasmType::I32);
-        let hash_slot = self.alloc_local(WasmType::I32);
-        let new_addr = self.alloc_local(WasmType::I32);
-        let key_local = self.alloc_local(info.slot_ty.wasm_ty());
-        let value_local = self.alloc_local(info.expect_value_ty().wasm_ty());
-
-        self.push(Instruction::Block(BlockType::Empty));
-        self.push(Instruction::Loop(BlockType::Empty));
-        // if old_slot == -1: break
-        self.push(Instruction::LocalGet(old_slot));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(Instruction::I32Eq);
-        self.push(Instruction::BrIf(1));
-
-        // addr = old_buckets + old_slot * bucket_size
-        self.emit_bucket_addr(old_buckets, old_slot, info.bucket.total_size);
-        self.push(Instruction::LocalSet(old_addr));
-
-        // Load key + value.
-        self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
-        self.push(Instruction::LocalSet(key_local));
-        self.push(Instruction::LocalGet(old_addr));
-        self.push(load_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
-        self.push(Instruction::LocalSet(value_local));
-
-        // Probe in the new array: no duplicates and no tombstones, so we
-        // only need to scan for the first EMPTY slot.
-        self.emit_hash_for_local(key_local, &info.slot_ty);
-        self.push(Instruction::LocalGet(new_mask));
-        self.push(Instruction::I32And);
-        self.push(Instruction::LocalSet(hash_slot));
-
-        self.push(Instruction::Block(BlockType::Empty));
-        self.push(Instruction::Loop(BlockType::Empty));
-        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
-        self.push(Instruction::I32Load8U(MemArg {
-            offset: info.bucket.state_offset as u64,
-            align: 0,
-            memory_index: 0,
-        }));
-        self.push(Instruction::I32Eqz);
-        self.push(Instruction::BrIf(1));
-        // advance
-        self.push(Instruction::LocalGet(hash_slot));
-        self.push(Instruction::I32Const(1));
-        self.push(Instruction::I32Add);
-        self.push(Instruction::LocalGet(new_mask));
-        self.push(Instruction::I32And);
-        self.push(Instruction::LocalSet(hash_slot));
-        self.push(Instruction::Br(0));
-        self.push(Instruction::End);
-        self.push(Instruction::End);
-
-        // Write to new bucket at hash_slot.
-        self.emit_bucket_addr(new_buckets, hash_slot, info.bucket.total_size);
-        self.push(Instruction::LocalSet(new_addr));
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::I32Const(BUCKET_OCCUPIED));
-        self.push(Instruction::I32Store8(MemArg {
-            offset: info.bucket.state_offset as u64,
-            align: 0,
-            memory_index: 0,
-        }));
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::LocalGet(key_local));
-        self.push(store_typed(&info.slot_ty, info.bucket.slot_offset));
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::LocalGet(value_local));
-        self.push(store_typed(info.expect_value_ty(), info.bucket.value_offset.expect("map bucket has value slot")));
-
-        // Link into chain: new_prev = header.tail, new_next = -1.
-        // If header.tail == -1: header.head = hash_slot. Else: tail_bucket.next = hash_slot.
-        // Then header.tail = hash_slot.
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(store_i32(info.bucket.next_offset));
-        self.push(Instruction::LocalGet(new_addr));
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(tail_off));
-        self.push(store_i32(info.bucket.prev_offset));
-
-        let prev_tail = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(tail_off));
-        self.push(Instruction::LocalTee(prev_tail));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(Instruction::I32Ne);
-        self.push(Instruction::If(BlockType::Empty));
-        self.emit_bucket_addr(new_buckets, prev_tail, info.bucket.total_size);
-        self.push(Instruction::LocalGet(hash_slot));
-        self.push(store_i32(info.bucket.next_offset));
-        self.push(Instruction::Else);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::LocalGet(hash_slot));
-        self.push(store_i32(head_off));
-        self.push(Instruction::End);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(Instruction::LocalGet(hash_slot));
-        self.push(store_i32(tail_off));
-
-        // old_slot = old_bucket.next_insert
-        self.push(Instruction::LocalGet(old_addr));
-        self.push(load_i32(info.bucket.next_offset));
-        self.push(Instruction::LocalSet(old_slot));
-        self.push(Instruction::Br(0));
-        self.push(Instruction::End); // loop
-        self.push(Instruction::End); // block
 
         Ok(())
     }
