@@ -17,7 +17,6 @@
 use oxc_ast::ast::*;
 use wasm_encoder::{BlockType, Instruction, MemArg};
 
-use super::hash_table::{ArrowArity, extract_foreach_params};
 use crate::codegen::func::FuncContext;
 use crate::codegen::hash_table::{
     BUCKET_OCCUPIED, BUCKET_TOMBSTONE, EMPTY_LINK, HashTableInfo, load_i32, load_typed,
@@ -74,7 +73,7 @@ impl<'a> FuncContext<'a> {
             "forEach" => {
                 self.expect_args(call, 1, "Set.forEach")?;
                 let arg = call.arguments[0].to_expression();
-                self.emit_set_foreach(&member.object, &class_name, arg)?;
+                self.emit_hash_table_foreach(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::Void))
             }
             other => Err(CompileError::codegen(format!(
@@ -284,72 +283,6 @@ impl<'a> FuncContext<'a> {
     /// `s.forEach((v) => { ... })` — walk the insertion chain from head via
     /// each bucket's `next_insert` pointer, binding the arrow's single param
     /// to the element per iteration.
-    fn emit_set_foreach(
-        &mut self,
-        receiver: &Expression<'a>,
-        class_name: &str,
-        callback: &Expression<'a>,
-    ) -> Result<(), CompileError> {
-        let info = self.set_info(class_name);
-        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
-        let head_off = self.hash_table_field_offset(class_name, "head_idx");
-
-        let (arrow, params) = extract_foreach_params(callback, ArrowArity::One, "Set")?;
-
-        let this_local = self.alloc_local(WasmType::I32);
-        self.emit_expr(receiver)?;
-        self.push(Instruction::LocalSet(this_local));
-
-        let buckets_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(buckets_off));
-        self.push(Instruction::LocalSet(buckets_local));
-
-        let slot_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(this_local));
-        self.push(load_i32(head_off));
-        self.push(Instruction::LocalSet(slot_local));
-
-        let elem_local = self.alloc_local(info.slot_ty.wasm_ty());
-
-        let saved = self.push_hash_table_arrow_scope(&params, &[(elem_local, &info.slot_ty)]);
-
-        self.push(Instruction::Block(BlockType::Empty));
-        self.push(Instruction::Loop(BlockType::Empty));
-        // if slot == -1: break
-        self.push(Instruction::LocalGet(slot_local));
-        self.push(Instruction::I32Const(EMPTY_LINK));
-        self.push(Instruction::I32Eq);
-        self.push(Instruction::BrIf(1));
-
-        // Load elem + next from bucket before calling the body.
-        let addr_local = self.alloc_local(WasmType::I32);
-        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
-        self.push(Instruction::LocalTee(addr_local));
-        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
-        self.push(Instruction::LocalSet(elem_local));
-
-        let next_local = self.alloc_local(WasmType::I32);
-        self.push(Instruction::LocalGet(addr_local));
-        self.push(load_i32(info.bucket.next_offset));
-        self.push(Instruction::LocalSet(next_local));
-
-        let body_ty = crate::codegen::array_builtins::eval_arrow_body(self, arrow)?;
-        if body_ty != WasmType::Void {
-            self.push(Instruction::Drop);
-        }
-
-        // slot = next
-        self.push(Instruction::LocalGet(next_local));
-        self.push(Instruction::LocalSet(slot_local));
-        self.push(Instruction::Br(0));
-        self.push(Instruction::End); // loop
-        self.push(Instruction::End); // block
-
-        self.pop_hash_table_arrow_scope(saved);
-        Ok(())
-    }
-
     /// 2× capacity rebuild. Called from `add()` when the load factor would
     /// exceed 75% with one more entry. Walks the old insertion chain into
     /// freshly-allocated buckets, preserving order and collecting tombstones

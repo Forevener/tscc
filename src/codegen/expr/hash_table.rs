@@ -302,6 +302,116 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
+    /// `m.forEach((v, k) => ...)` / `s.forEach((v) => ...)` — walk the
+    /// insertion chain from `head`, binding the arrow's params to the current
+    /// row on each iteration. The callback's return value (if any) is
+    /// dropped. Kind split falls out of `info.value_ty.is_some()`: Map
+    /// accepts 1 or 2 params and binds `(value, key)`; Set accepts exactly 1
+    /// and binds `(element)`.
+    pub(super) fn emit_hash_table_foreach(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        callback: &Expression<'a>,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+
+        let (arity, kind) = if info.value_ty.is_some() {
+            (ArrowArity::OneOrTwo, "Map")
+        } else {
+            (ArrowArity::One, "Set")
+        };
+        let (arrow, params) = extract_foreach_params(callback, arity, kind)?;
+
+        // Cache receiver + derived pointers so we can walk the chain without
+        // re-emitting the receiver expression each iteration.
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        let buckets_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::LocalSet(buckets_local));
+
+        let slot_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(head_off));
+        self.push(Instruction::LocalSet(slot_local));
+
+        // `primary_local` is bound to arrow param 0 — the value for Map
+        // (typed as `value_ty`) or the element for Set (typed as `slot_ty`).
+        // `secondary_local` is Map-only and binds arrow param 1 (the key,
+        // typed as `slot_ty`).
+        let primary_ty: &BoundType = info.value_ty.as_ref().unwrap_or(&info.slot_ty);
+        let primary_local = self.alloc_local(primary_ty.wasm_ty());
+        let secondary_local = info
+            .value_ty
+            .as_ref()
+            .map(|_| self.alloc_local(info.slot_ty.wasm_ty()));
+
+        let mut bindings: Vec<(u32, &BoundType)> = Vec::with_capacity(2);
+        bindings.push((primary_local, primary_ty));
+        if let Some(sec) = secondary_local {
+            bindings.push((sec, &info.slot_ty));
+        }
+        let saved = self.push_hash_table_arrow_scope(&params, &bindings);
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        // if slot == -1: break
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::BrIf(1));
+
+        // Load primary (and secondary, for Map) + next from the bucket up
+        // front. Reading once per iteration keeps the callback's view of the
+        // row consistent; mutating the table from inside forEach is
+        // unsupported semantics, but at least a single iteration stays
+        // internally coherent.
+        let addr_local = self.alloc_local(WasmType::I32);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(Instruction::LocalTee(addr_local));
+        if let Some(value_ty) = info.value_ty.as_ref() {
+            self.push(load_typed(
+                value_ty,
+                info.bucket.value_offset.expect("map bucket has value slot"),
+            ));
+            self.push(Instruction::LocalSet(primary_local));
+            self.push(Instruction::LocalGet(addr_local));
+            self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
+            self.push(Instruction::LocalSet(
+                secondary_local.expect("map has secondary binding"),
+            ));
+        } else {
+            self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
+            self.push(Instruction::LocalSet(primary_local));
+        }
+
+        let next_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(addr_local));
+        self.push(load_i32(info.bucket.next_offset));
+        self.push(Instruction::LocalSet(next_local));
+
+        let body_ty = crate::codegen::array_builtins::eval_arrow_body(self, arrow)?;
+        if body_ty != WasmType::Void {
+            self.push(Instruction::Drop);
+        }
+
+        // slot = next; continue.
+        self.push(Instruction::LocalGet(next_local));
+        self.push(Instruction::LocalSet(slot_local));
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End); // loop
+        self.push(Instruction::End); // block
+
+        self.pop_hash_table_arrow_scope(saved);
+        Ok(())
+    }
+
     /// Bind `param_names` (the forEach arrow's formal params) to `locals`
     /// for the duration of the body. Returns a `HashTableArrowScope` that
     /// `pop_hash_table_arrow_scope` consumes to restore any shadowed outer
