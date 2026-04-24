@@ -444,3 +444,94 @@ fn map_clear_on_populated_then_reuse() {
     );
     assert_eq!(values, vec![0.0, 0.0, 1.0, 30.0]);
 }
+
+/// E.5 spot-check: generic nesting through Array — `Array<Map<string, i32>>`.
+/// Each array slot holds an independent Map instance; per-element method
+/// dispatch and forEach over the outer array both route through the mangled
+/// `Map$string$i32` layout.
+#[test]
+fn map_nested_inside_array_independent_instances() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const maps: Array<Map<string, i32>> = new Array<Map<string, i32>>(3);
+            maps.push(new Map<string, i32>());
+            maps.push(new Map<string, i32>());
+            maps.push(new Map<string, i32>());
+            maps[0].set("a", 1);
+            maps[0].set("b", 2);
+            maps[1].set("a", 10);
+            maps[2].set("c", 99);
+
+            // Sizes are independent per slot.
+            sink(f64(maps[0].size));
+            sink(f64(maps[1].size));
+            sink(f64(maps[2].size));
+
+            // Cross-slot reads — each Map sees only its own keys.
+            sink(f64(maps[0].get("a")));
+            sink(f64(maps[1].get("a")));
+            sink(f64(maps[0].has("c")));
+            sink(f64(maps[2].has("c")));
+
+            // forEach over the outer array, summing every Map's values.
+            let total: i32 = 0;
+            maps.forEach((m: Map<string, i32>) => {
+                m.forEach((v: i32) => { total = total + v; });
+            });
+            sink(f64(total));
+        }
+        "#,
+    );
+    assert_eq!(
+        values,
+        vec![
+            2.0, 1.0, 1.0,           // sizes
+            1.0, 10.0, 0.0, 1.0,     // cross-slot reads
+            112.0,                    // 1 + 2 + 10 + 99
+        ]
+    );
+}
+
+/// E.5 spot-check: a user-written generic class whose field is a tscc-generic
+/// `Map<K, V>`. `Cache<K, V>` monomorphizations must cascade into Map
+/// monomorphizations under the right K/V bindings.
+#[test]
+fn user_generic_class_wraps_tscc_generic_map() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        class Cache<K, V> {
+            inner: Map<K, V>;
+            constructor() {
+                this.inner = new Map<K, V>();
+            }
+            put(k: K, v: V): void { this.inner.set(k, v); }
+            fetch(k: K): V { return this.inner.get(k); }
+            count(): i32 { return this.inner.size; }
+        }
+
+        export function tick(_me: i32): void {
+            const a: Cache<string, i32> = new Cache<string, i32>();
+            a.put("hp", 42);
+            a.put("mp", 7);
+            sink(f64(a.count()));
+            sink(f64(a.fetch("hp")));
+            sink(f64(a.fetch("mp")));
+
+            // Second monomorphization with different K/V — must not collide
+            // with the first Cache<string, i32>'s Map layout.
+            const b: Cache<i32, f64> = new Cache<i32, f64>();
+            b.put(1, 1.5);
+            b.put(2, 2.5);
+            sink(f64(b.count()));
+            sink(b.fetch(1));
+            sink(b.fetch(2));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 42.0, 7.0, 2.0, 1.5, 2.5]);
+}

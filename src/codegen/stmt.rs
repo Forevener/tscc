@@ -105,9 +105,11 @@ impl<'a> FuncContext<'a> {
                 self.local_array_elem_types.insert(name.clone(), elem_ty);
                 annotated_array_elem_ty = Some(elem_ty);
                 // Track array element class if applicable
-                if let Some(elem_class) =
-                    types::get_array_element_class(ann, Some(&self.module_ctx.shape_registry))
-                {
+                if let Some(elem_class) = types::get_array_element_class_with_bindings(
+                    ann,
+                    self.type_bindings.as_ref(),
+                    Some(&self.module_ctx.shape_registry),
+                ) {
                     self.local_array_elem_classes
                         .insert(name.clone(), elem_class);
                 }

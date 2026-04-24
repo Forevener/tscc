@@ -1398,9 +1398,11 @@ fn codegen_method<'a>(
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
-                if let Some(elem_class) =
-                    types::get_array_element_class(ann, Some(&ctx.shape_registry))
-                {
+                if let Some(elem_class) = types::get_array_element_class_with_bindings(
+                    ann,
+                    bindings,
+                    Some(&ctx.shape_registry),
+                ) {
                     func_ctx
                         .local_array_elem_classes
                         .insert(pname.clone(), elem_class);
@@ -1568,9 +1570,11 @@ fn codegen_function<'a>(
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
-                if let Some(elem_class) =
-                    types::get_array_element_class(ann, Some(&ctx.shape_registry))
-                {
+                if let Some(elem_class) = types::get_array_element_class_with_bindings(
+                    ann,
+                    bindings,
+                    Some(&ctx.shape_registry),
+                ) {
                     func_ctx
                         .local_array_elem_classes
                         .insert(pname.clone(), elem_class);

@@ -225,8 +225,14 @@ pub fn get_array_element_type(
 
 /// Extract the class name from an Array<ClassName> type annotation.
 /// Returns Some("ClassName") if element type is a class, None otherwise.
-pub fn get_array_element_class(
+/// Bindings-aware element-class extraction. Delegates to
+/// `get_class_type_name_from_ts_type_with_bindings` so that generic
+/// instantiations like `Map<string, i32>` mangle correctly (`Map$string$i32`)
+/// and so that a type-parameter element like `Array<T>` inside a monomorphized
+/// generic resolves to its bound class name.
+pub fn get_array_element_class_with_bindings(
     annotation: &TSTypeAnnotation,
+    bindings: Option<&TypeBindings>,
     shape_registry: Option<&ShapeRegistry>,
 ) -> Option<String> {
     let first = match &annotation.type_annotation {
@@ -244,27 +250,7 @@ pub fn get_array_element_class(
         TSType::TSArrayType(arr) => &arr.element_type,
         _ => return None,
     };
-    // Check if the element type is a class reference
-    if let TSType::TSTypeReference(elem_ref) = first {
-        let elem_name = elem_ref
-            .type_name
-            .get_identifier_reference()
-            .map(|r| r.name.as_str())?;
-        match elem_name {
-            "i32" | "f64" | "bool" | "Array" | "string" | "int" | "number" => None,
-            class_name => Some(class_name.to_string()),
-        }
-    } else if let TSType::TSTypeLiteral(lit) = first {
-        shape_registry
-            .and_then(|r| r.get_by_annotation(lit))
-            .map(|s| s.name.clone())
-    } else if let TSType::TSTupleType(tuple) = first {
-        shape_registry
-            .and_then(|r| r.get_by_tuple_annotation(tuple))
-            .map(|s| s.name.clone())
-    } else {
-        None
-    }
+    get_class_type_name_from_ts_type_with_bindings(first, bindings, shape_registry)
 }
 
 /// Bindings-aware string-type check. A type parameter bound to `BoundType::Str`
