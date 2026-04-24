@@ -611,6 +611,268 @@ impl<'a> FuncContext<'a> {
         Ok(())
     }
 
+    /// `m.set(k, v)` / `s.add(v)` — insert-or-overwrite with chain-linked
+    /// insertion order. Triggers a 2× rebuild before probing when the load
+    /// factor would exceed 75% with one more entry, so the probe always runs
+    /// on a ≥25%-empty array and always terminates. `value_arg` must be
+    /// `Some` iff `info.value_ty.is_some()` (Map); `None` for Set.
+    ///
+    /// The kind split lives at three points:
+    /// - Evaluating + type-checking `value_arg` (Map only).
+    /// - Writing the value slot on the overwrite/insert path (Map only).
+    /// - Nothing else — probe, chain link, tombstone reuse, and insertion
+    ///   bookkeeping are identical for both. The `matched` flag unifies
+    ///   Map's `is_update` with Set's `already_present`: same semantics
+    ///   (probe hit an OCCUPIED slot matching our key), same downstream
+    ///   guard (skip state/slot/chain/size++ on match).
+    ///
+    /// The shared shape computes `insert_slot` and `target_addr`
+    /// unconditionally — even on Set's already-present path, where it's
+    /// never read. That's a handful of extra pure-arithmetic wasm ops on
+    /// the already-present-hot path; in exchange the Map/Set paths share
+    /// one suffix instead of two.
+    pub(super) fn emit_hash_table_insert(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        key_arg: &Expression<'a>,
+        value_arg: Option<&Expression<'a>>,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        debug_assert_eq!(info.value_ty.is_some(), value_arg.is_some());
+
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let cap_off = self.hash_table_field_offset(class_name, "capacity");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+        let tail_off = self.hash_table_field_offset(class_name, "tail_idx");
+
+        // Evaluate receiver + args into locals up front. Pinning the
+        // receiver pointer here means subsequent arena-allocating arg
+        // evaluations can't move it; the header stores `buckets_ptr` by
+        // pointer so the buckets themselves can't move either.
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        let slot_value_local = self.alloc_local(info.slot_ty.wasm_ty());
+        let ty = self.emit_expr(key_arg)?;
+        self.check_slot_type(&info, ty, hash_table_slot_label(&info))?;
+        self.push(Instruction::LocalSet(slot_value_local));
+
+        let value_local = if let Some(value_arg) = value_arg {
+            let value_ty = info.value_ty.as_ref().expect("map has value type");
+            let local = self.alloc_local(value_ty.wasm_ty());
+            let vty = self.emit_expr(value_arg)?;
+            self.coerce_numeric(value_ty.wasm_ty(), vty, "Map value")?;
+            self.push(Instruction::LocalSet(local));
+            Some(local)
+        } else {
+            None
+        };
+
+        // Load-factor check: if size * 4 >= capacity * 3, grow first. The
+        // rebuild rewrites buckets_ptr + capacity on `this_local`, so we
+        // re-read both below.
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(size_off));
+        self.push(Instruction::I32Const(4));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(cap_off));
+        self.push(Instruction::I32Const(3));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32GeU);
+        self.push(Instruction::If(BlockType::Empty));
+        self.emit_hash_table_rebuild(this_local, class_name, &info)?;
+        self.push(Instruction::End);
+
+        // Probe setup: snapshot buckets_ptr, derive mask, compute the
+        // initial slot from the hash.
+        let buckets_local = self.alloc_local(WasmType::I32);
+        let cap_local = self.alloc_local(WasmType::I32);
+        let mask_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::LocalSet(buckets_local));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(cap_off));
+        self.push(Instruction::LocalTee(cap_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Sub);
+        self.push(Instruction::LocalSet(mask_local));
+
+        let slot_local = self.alloc_local(WasmType::I32);
+        self.emit_hash_for_local(slot_value_local, &info.slot_ty);
+        self.push(Instruction::LocalGet(mask_local));
+        self.push(Instruction::I32And);
+        self.push(Instruction::LocalSet(slot_local));
+
+        let first_tomb = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::LocalSet(first_tomb));
+
+        // `matched` is set to 1 iff the probe hits an OCCUPIED slot whose
+        // stored key equals `slot_value_local`. Same role as Map's
+        // `is_update` / Set's `already_present` in the per-kind versions.
+        let matched = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(matched));
+
+        // Probe loop. Walks slots linearly; an EMPTY terminates
+        // (definite miss), a TOMBSTONE remembers first-seen for insert
+        // reuse, an OCCUPIED match flags + breaks.
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        let state_local = self.alloc_local(WasmType::I32);
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(Instruction::I32Load8U(MemArg {
+            offset: info.bucket.state_offset as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalTee(state_local));
+        // EMPTY → break.
+        self.push(Instruction::I32Eqz);
+        self.push(Instruction::BrIf(1));
+
+        self.push(Instruction::LocalGet(state_local));
+        self.push(Instruction::I32Const(BUCKET_TOMBSTONE));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::If(BlockType::Empty));
+        // TOMBSTONE → record first_tomb if unset, then fall through to
+        // advance.
+        self.push(Instruction::LocalGet(first_tomb));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::If(BlockType::Empty));
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::LocalSet(first_tomb));
+        self.push(Instruction::End);
+        self.push(Instruction::Else);
+        // OCCUPIED → compare the stored slot value; on match, flag and
+        // break to the post-probe cleanup.
+        self.emit_slot_equals_stored(buckets_local, slot_local, slot_value_local, &info);
+        self.push(Instruction::If(BlockType::Empty));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::LocalSet(matched));
+        self.push(Instruction::Br(3));
+        self.push(Instruction::End);
+        self.push(Instruction::End);
+
+        // slot = (slot + 1) & mask
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(mask_local));
+        self.push(Instruction::I32And);
+        self.push(Instruction::LocalSet(slot_local));
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End); // loop
+        self.push(Instruction::End); // block
+
+        // After probe: on match, `slot_local` points at the hit. On miss,
+        // `slot_local` points at the terminating EMPTY; prefer
+        // `first_tomb` over it to keep probe chains short. (On Set's
+        // already-present path these are computed but unused — see the
+        // fn-level comment.)
+        let insert_slot = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(matched));
+        self.push(Instruction::If(BlockType::Result(wasm_encoder::ValType::I32)));
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(first_tomb));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Ne);
+        self.push(Instruction::If(BlockType::Result(wasm_encoder::ValType::I32)));
+        self.push(Instruction::LocalGet(first_tomb));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::End);
+        self.push(Instruction::End);
+        self.push(Instruction::LocalSet(insert_slot));
+
+        let target_addr = self.alloc_local(WasmType::I32);
+        self.emit_bucket_addr(buckets_local, insert_slot, info.bucket.total_size);
+        self.push(Instruction::LocalSet(target_addr));
+
+        // Map: always write the value — overwrite on update, fresh store
+        // on insert. Set has no value slot; skip.
+        if let Some(value_ty) = info.value_ty.as_ref() {
+            self.push(Instruction::LocalGet(target_addr));
+            self.push(Instruction::LocalGet(
+                value_local.expect("map value local allocated"),
+            ));
+            self.push(store_typed(
+                value_ty,
+                info.bucket.value_offset.expect("map bucket has value slot"),
+            ));
+        }
+
+        // Insert-only bookkeeping — skipped on match (overwrite leaves
+        // state/slot/chain/size untouched).
+        self.push(Instruction::LocalGet(matched));
+        self.push(Instruction::I32Eqz);
+        self.push(Instruction::If(BlockType::Empty));
+
+        // state = OCCUPIED
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(Instruction::I32Const(BUCKET_OCCUPIED));
+        self.push(Instruction::I32Store8(MemArg {
+            offset: info.bucket.state_offset as u64,
+            align: 0,
+            memory_index: 0,
+        }));
+        // slot = key/elem
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(Instruction::LocalGet(slot_value_local));
+        self.push(store_typed(&info.slot_ty, info.bucket.slot_offset));
+        // next_insert = -1 (this is the new tail)
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(store_i32(info.bucket.next_offset));
+        // prev_insert = old tail_idx
+        self.push(Instruction::LocalGet(target_addr));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(tail_off));
+        self.push(store_i32(info.bucket.prev_offset));
+
+        // If old_tail != -1: old_tail.next_insert = insert_slot.
+        // Else: header.head = insert_slot (list was empty).
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(tail_off));
+        let old_tail = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalTee(old_tail));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Ne);
+        self.push(Instruction::If(BlockType::Empty));
+        self.emit_bucket_addr(buckets_local, old_tail, info.bucket.total_size);
+        self.push(Instruction::LocalGet(insert_slot));
+        self.push(store_i32(info.bucket.next_offset));
+        self.push(Instruction::Else);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::LocalGet(insert_slot));
+        self.push(store_i32(head_off));
+        self.push(Instruction::End);
+
+        // tail_idx = insert_slot
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::LocalGet(insert_slot));
+        self.push(store_i32(tail_off));
+
+        // size += 1
+        self.push(Instruction::LocalGet(this_local));
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(size_off));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(store_i32(size_off));
+
+        self.push(Instruction::End); // end insert-only if
+
+        Ok(())
+    }
+
     /// Bind `param_names` (the forEach arrow's formal params) to `locals`
     /// for the duration of the body. Returns a `HashTableArrowScope` that
     /// `pop_hash_table_arrow_scope` consumes to restore any shadowed outer
