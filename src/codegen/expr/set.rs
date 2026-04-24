@@ -6,13 +6,10 @@
 //! `Ok(None)` when the call's receiver isn't a Set so upstream dispatchers
 //! keep their normal fall-through behavior.
 //!
-//! Shares semantics with `expr/map.rs` (same probing, same insertion-chain
-//! bookkeeping, same rebuild-on-grow policy). The differences from Map:
-//!
-//! - Bucket has no value slot — `add(v)` writes only the element.
-//! - `forEach((v) => ...)` takes exactly one parameter.
-//! - Methods use element-centric names: `add` instead of `set`, a single
-//!   argument throughout.
+//! All method bodies are Map/Set-shared and live in `hash_table.rs`; the
+//! kind split (Set has no value slot, `forEach` takes exactly one param,
+//! `add` replaces `set`) falls out of `info.value_ty.is_some()` plus the
+//! per-method dispatcher wiring here. This file is only the dispatcher.
 
 use oxc_ast::ast::*;
 

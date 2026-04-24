@@ -106,6 +106,36 @@ impl<'a> FuncContext<'a> {
         )))
     }
 
+    /// Emit a call to a runtime helper by name, splicing if it's L_splice and
+    /// falling back to `Call(idx)` otherwise. Args must already be on the
+    /// stack in the helper's parameter order. The result (if any) replaces
+    /// them on the stack — same convention either path.
+    pub(crate) fn emit_helper_invocation(&mut self, name: &str) {
+        if let Some(pf) = crate::codegen::precompiled::find_inline(name) {
+            let reg_borrow = self.module_ctx.helper_registration.borrow();
+            let reg = reg_borrow.as_ref().unwrap_or_else(|| {
+                panic!(
+                    "helper_registration unset — register_string_helpers must run \
+                     before method codegen splices inline helper '{name}'"
+                )
+            });
+            let plan = crate::codegen::precompiled::RewritePlan {
+                func_index_map: &reg.func_index_map,
+                type_index_map: &reg.type_index_map,
+                global_index_map: &reg.global_index_map,
+                helper_table_index: reg.helper_table_index,
+            };
+            crate::codegen::splice::splice_inline_call(self, pf, &plan)
+                .unwrap_or_else(|e| panic!("splicing '{name}' failed: {e:?}"));
+            return;
+        }
+        let (func_idx, _) = self
+            .module_ctx
+            .get_func(name)
+            .unwrap_or_else(|| panic!("helper '{name}' not registered"));
+        self.push(Instruction::Call(func_idx));
+    }
+
     /// Byte offset of a header field on a compiler-owned `Map<K, V>` or
     /// `Set<T>` header class. Panics if the class or field is absent — the
     /// dispatcher's membership check stages that earlier.
