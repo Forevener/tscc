@@ -321,12 +321,63 @@ impl<'a> FuncContext<'a> {
             }
             Expression::StaticMemberExpression(member) => {
                 // Check if accessing a string field on a class instance
-                if let Ok(class_name) = self.resolve_expr_class(&member.object)
-                    && let Some(layout) = self.module_ctx.class_registry.get(&class_name)
-                {
-                    return layout
-                        .field_string_types
-                        .contains(member.property.name.as_str());
+                if let Ok(class_name) = self.resolve_expr_class(&member.object) {
+                    if let Some(layout) = self.module_ctx.class_registry.get(&class_name) {
+                        return layout
+                            .field_string_types
+                            .contains(member.property.name.as_str());
+                    }
+                    // Union receiver: a shared string field is string-typed
+                    // iff every (possibly refined) variant declares the field
+                    // as `string`. Sub-phase 1.5.1 walks the refined member
+                    // set when the receiver is a refined identifier;
+                    // un-refined receivers walk the union's full membership.
+                    if let Some(union) =
+                        self.module_ctx.union_registry.get_by_name(&class_name)
+                    {
+                        let field_name = member.property.name.as_str();
+                        let refinement = match crate::codegen::func::peel_parens(&member.object) {
+                            Expression::Identifier(ident) => {
+                                self.current_refinement_of(ident.name.as_str()).cloned()
+                            }
+                            _ => None,
+                        };
+                        let union_members_owned;
+                        let members: &[crate::codegen::unions::UnionMember] = match &refinement {
+                            // Never-refined receivers fail the "is string"
+                            // probe — member access elsewhere will surface
+                            // the unreachable-receiver error with a clear
+                            // diagnostic.
+                            Some(crate::codegen::func::Refinement::Never) => return false,
+                            Some(crate::codegen::func::Refinement::Subunion(m)) => m.as_slice(),
+                            _ => {
+                                union_members_owned = union.members.clone();
+                                &union_members_owned[..]
+                            }
+                        };
+                        let mut all_string = !members.is_empty();
+                        for m in members {
+                            match m {
+                                crate::codegen::unions::UnionMember::Shape(sn) => {
+                                    match self.module_ctx.class_registry.get(sn) {
+                                        Some(layout)
+                                            if layout
+                                                .field_string_types
+                                                .contains(field_name) => {}
+                                        _ => {
+                                            all_string = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                crate::codegen::unions::UnionMember::Literal(_) => {
+                                    all_string = false;
+                                    break;
+                                }
+                            }
+                        }
+                        return all_string;
+                    }
                 }
                 false
             }

@@ -76,6 +76,13 @@ impl<'a> FuncContext<'a> {
         &mut self,
         bin: &BinaryExpression<'a>,
     ) -> Result<WasmType, CompileError> {
+        // `instanceof` short-circuits operand emission: the right operand is
+        // a *type* identifier (class name), not a value, so feeding it to
+        // `emit_expr` would fail. Phase 2 sub-phase 2.
+        if bin.operator == BinaryOperator::Instanceof {
+            return self.emit_instanceof(&bin.left, &bin.right, bin.span.start);
+        }
+
         // Check for string operations BEFORE emitting operands
         let left_is_string = self.resolve_expr_is_string(&bin.left);
         let right_is_string = self.resolve_expr_is_string(&bin.right);
@@ -228,6 +235,168 @@ impl<'a> FuncContext<'a> {
                 bin.operator
             ))),
         }
+    }
+
+    /// Lower `left instanceof RightClass` to a vtable-pointer comparison.
+    ///
+    /// The runtime test loads the vtable pointer from offset 0 of `left`
+    /// (every polymorphic class instance carries one — see `expr/class.rs`)
+    /// and compares it against `RightClass`'s `vtable_offset`. When
+    /// `RightClass` has descendants the comparison fans out into an
+    /// OR-chain over each matching class's `vtable_offset`; when `left` is
+    /// statically a class union the chain is intersected with the union's
+    /// member set so only reachable variants contribute to the test.
+    ///
+    /// Validation rules:
+    /// - Right operand must be a bare identifier resolving to a registered,
+    ///   polymorphic class (the polymorphism gate from sub-phase 1
+    ///   guarantees this for class-union members).
+    /// - Left operand's static type must be a registered class or class
+    ///   union — anything else can't carry a vtable to inspect.
+    /// - The matched set (right_class plus descendants, intersected with
+    ///   left's union members when applicable) must be non-empty; an empty
+    ///   set means the test is statically false because right_class can't
+    ///   share runtime tags with anything left could be.
+    pub(crate) fn emit_instanceof(
+        &mut self,
+        left: &Expression<'a>,
+        right: &Expression<'a>,
+        span_start: u32,
+    ) -> Result<WasmType, CompileError> {
+        let right_class = match right {
+            Expression::Identifier(id) => id.name.as_str().to_string(),
+            _ => {
+                return Err(self.locate(
+                    CompileError::type_err(
+                        "right operand of `instanceof` must name a class — \
+                         expressions, member access, and generic type args are \
+                         not yet supported",
+                    ),
+                    span_start,
+                ));
+            }
+        };
+        let right_layout = self
+            .module_ctx
+            .class_registry
+            .get(&right_class)
+            .ok_or_else(|| {
+                self.locate(
+                    CompileError::type_err(format!(
+                        "right operand of `instanceof` must name a registered class \
+                         — '{right_class}' is not a class"
+                    )),
+                    span_start,
+                )
+            })?
+            .clone();
+        if !right_layout.is_polymorphic {
+            return Err(self.locate(
+                CompileError::type_err(format!(
+                    "`instanceof {right_class}` requires '{right_class}' to be \
+                     polymorphic — leaf classes carry no vtable pointer to \
+                     inspect at runtime. Add a common base class so '{right_class}' \
+                     participates in an inheritance hierarchy."
+                )),
+                span_start,
+            ));
+        }
+
+        let left_class = self.resolve_expr_class(left).map_err(|_| {
+            self.locate(
+                CompileError::type_err(
+                    "left operand of `instanceof` must have a class or class-union \
+                     static type",
+                ),
+                span_start,
+            )
+        })?;
+
+        // Build the matched set: every registered class whose `vtable_offset`
+        // would satisfy `instanceof right_class` at runtime — i.e. itself or
+        // a descendant. Walk the registry once; the size cap is the class
+        // count, which is bounded.
+        let mut matched: Vec<String> = self
+            .module_ctx
+            .class_registry
+            .classes
+            .keys()
+            .filter(|c| {
+                c.as_str() == right_class
+                    || self
+                        .module_ctx
+                        .class_registry
+                        .is_subclass_of(c, &right_class)
+            })
+            .cloned()
+            .collect();
+
+        // When `left` is a static class union, restrict the chain to the
+        // union's class members — shapes and literals can never match
+        // `instanceof` at runtime, and a class member outside the matched
+        // descendant set can never satisfy the test either.
+        if let Some(u) = self.module_ctx.union_registry.get_by_name(&left_class) {
+            use crate::codegen::unions::UnionMember;
+            use std::collections::HashSet;
+            let union_class_members: HashSet<&str> = u
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    UnionMember::Shape(name)
+                        if !self.module_ctx.shape_registry.by_name.contains_key(name) =>
+                    {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            matched.retain(|c| union_class_members.contains(c.as_str()));
+        }
+        // Stable order so generated wasm is deterministic across runs.
+        matched.sort();
+
+        if matched.is_empty() {
+            return Err(self.locate(
+                CompileError::type_err(format!(
+                    "`instanceof {right_class}` is statically false on a value of \
+                     type '{left_class}' — '{right_class}' is unrelated to every \
+                     member of the static type. Did you mean a different class?"
+                )),
+                span_start,
+            ));
+        }
+
+        let vtable_offsets: Vec<u32> = matched
+            .iter()
+            .map(|c| self.module_ctx.class_registry.classes[c].vtable_offset)
+            .collect();
+
+        // Emit `left` and load its vtable pointer (i32 at offset 0).
+        let _left_ty = self.emit_expr(left)?;
+        self.push(Instruction::I32Load(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        if vtable_offsets.len() == 1 {
+            self.push(Instruction::I32Const(vtable_offsets[0] as i32));
+            self.push(Instruction::I32Eq);
+        } else {
+            // Tee the vtable pointer to a temp so each comparison can re-read it.
+            let vt_temp = self.alloc_local(WasmType::I32);
+            self.push(Instruction::LocalTee(vt_temp));
+            self.push(Instruction::I32Const(vtable_offsets[0] as i32));
+            self.push(Instruction::I32Eq);
+            for &off in &vtable_offsets[1..] {
+                self.push(Instruction::LocalGet(vt_temp));
+                self.push(Instruction::I32Const(off as i32));
+                self.push(Instruction::I32Eq);
+                self.push(Instruction::I32Or);
+            }
+        }
+
+        Ok(WasmType::I32)
     }
 
     pub(crate) fn emit_logical(

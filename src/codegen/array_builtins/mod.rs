@@ -516,9 +516,11 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         // If the arrow has a return type annotation, use it
         if let Some(ret_ann) = &arrow.return_type {
-            return crate::types::resolve_type_annotation_with_classes(
+            return crate::types::resolve_type_annotation_with_unions(
                 ret_ann,
                 &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                &self.module_ctx.non_i32_union_wasm_types,
             );
         }
 
@@ -607,9 +609,11 @@ impl<'a> FuncContext<'a> {
                 // `x as f64` / `x as i32` resolves to the annotated type
                 // regardless of the source expression. Falls back to recursing
                 // into the source if the target annotation doesn't resolve.
-                crate::types::resolve_ts_type(
+                crate::types::resolve_ts_type_full(
                     &as_expr.type_annotation,
                     &self.module_ctx.class_names,
+                    self.type_bindings.as_ref(),
+                    Some(&self.module_ctx.non_i32_union_wasm_types),
                 )
                 .or_else(|_| {
                     self.infer_expr_type(&as_expr.expression, arrow_params, elem_ty, elem_class)

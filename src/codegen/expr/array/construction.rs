@@ -427,7 +427,12 @@ impl<'a> FuncContext<'a> {
         let elem_ty = if let Some(type_args) = call.type_arguments.as_ref()
             && let Some(first) = type_args.params.first()
         {
-            crate::types::resolve_ts_type(first, &self.module_ctx.class_names)?
+            crate::types::resolve_ts_type_full(
+                first,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                Some(&self.module_ctx.non_i32_union_wasm_types),
+            )?
         } else if let Some(first) = call.arguments.first() {
             let (ty, _) = self.infer_init_type(first.to_expression())?;
             ty
@@ -579,7 +584,12 @@ impl<'a> FuncContext<'a> {
         let elem_ty = if let Some(type_args) = call.type_arguments.as_ref()
             && let Some(first) = type_args.params.first()
         {
-            crate::types::resolve_ts_type(first, &self.module_ctx.class_names)?
+            crate::types::resolve_ts_type_full(
+                first,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                Some(&self.module_ctx.non_i32_union_wasm_types),
+            )?
         } else {
             self.infer_arrow_result_type(arrow, &params, WasmType::I32, None)?
         };

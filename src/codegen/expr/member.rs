@@ -1,7 +1,9 @@
 use oxc_ast::ast::*;
 use wasm_encoder::Instruction;
 
-use crate::codegen::func::FuncContext;
+use crate::codegen::classes::MethodSig;
+use crate::codegen::func::{FuncContext, Refinement, peel_parens};
+use crate::codegen::unions::UnionMember;
 use crate::error::CompileError;
 use crate::types::WasmType;
 
@@ -54,6 +56,68 @@ impl<'a> FuncContext<'a> {
 
         // Determine the class of the object
         let class_name = self.resolve_expr_class(&member.object)?;
+
+        // Union receiver (shared-field rule): emit a normal field load
+        // when every (possibly refined) variant declares the field at
+        // the same offset with the same WasmType. Variant-specific
+        // fields require narrowing — the error message points the user
+        // at the guard.
+        if let Some(union) = self.module_ctx.union_registry.get_by_name(&class_name) {
+            // Sub-phase 1.5.1: if the receiver is a refined identifier,
+            // restrict the shared-field check to the refined member set.
+            // `Never` is unreachable; reject member access there.
+            let receiver_refinement =
+                if let Expression::Identifier(ident) = peel_parens(&member.object) {
+                    self.current_refinement_of(ident.name.as_str()).cloned()
+                } else {
+                    None
+                };
+            let (effective_members, refined): (Vec<UnionMember>, bool) =
+                match receiver_refinement {
+                    Some(Refinement::Never) => {
+                        return Err(CompileError::type_err(format!(
+                            "value of union '{class_name}' is unreachable here — every \
+                             variant has been ruled out by prior narrowing"
+                        )));
+                    }
+                    Some(Refinement::Subunion(members)) => (members, true),
+                    // `Class(_)` is handled by `resolve_expr_class` above
+                    // returning the refined class name, which takes the
+                    // class-registry path further down — not this union arm.
+                    Some(Refinement::Class(_)) | None => (union.members.clone(), false),
+                };
+            let (offset, ty) =
+                resolve_shared_field_in_members(self, &effective_members, field_name)
+                    .ok_or_else(|| {
+                        let suffix = if refined {
+                            " (after refinement)".to_string()
+                        } else {
+                            String::new()
+                        };
+                        CompileError::type_err(format!(
+                            "field '{field_name}' is not shared across all variants of \
+                             union '{class_name}'{suffix} — narrow the value with \
+                             `if (x.kind === '...')` before accessing variant-specific \
+                             fields"
+                        ))
+                    })?;
+            self.emit_expr(&member.object)?;
+            match ty {
+                WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 3,
+                    memory_index: 0,
+                })),
+                WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                    offset: offset as u64,
+                    align: 2,
+                    memory_index: 0,
+                })),
+                _ => return Err(CompileError::codegen("void field access")),
+            }
+            return Ok(ty);
+        }
+
         let layout = self
             .module_ctx
             .class_registry
@@ -708,4 +772,123 @@ fn tuple_literal_index(expr: &Expression<'_>) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Shared-field rule over an explicit member list. Returns the
+/// `(offset, WasmType)` of `field_name` only if every shape member
+/// declares it at the same offset with the same type. Literal members
+/// short-circuit to `None` (they have no fields). Used by
+/// `emit_member_access` for both un-narrowed unions (full `members`)
+/// and Sub-phase 1.5.1's refined sub-unions (`Refinement::Subunion`).
+pub(crate) fn resolve_shared_field_in_members(
+    ctx: &FuncContext<'_>,
+    members: &[UnionMember],
+    field_name: &str,
+) -> Option<(u32, WasmType)> {
+    let mut resolved: Option<(u32, WasmType)> = None;
+    for m in members {
+        match m {
+            UnionMember::Shape(sn) => {
+                let layout = ctx.module_ctx.class_registry.get(sn)?;
+                let &(off, ty) = layout.field_map.get(field_name)?;
+                match resolved {
+                    None => resolved = Some((off, ty)),
+                    Some((off0, ty0)) => {
+                        if off0 != off || ty0 != ty {
+                            return None;
+                        }
+                    }
+                }
+            }
+            UnionMember::Literal(_) => return None,
+        }
+    }
+    resolved
+}
+
+/// Why a shared-method lookup over a union failed. Distinguishes the
+/// shapes a caller will want to surface as different diagnostics.
+#[derive(Debug)]
+pub(crate) enum SharedMethodIssue {
+    /// A class variant lacks the method entirely (or there are no
+    /// members at all). Carries the variant name so the caller can name
+    /// it. Also produced for literal members.
+    MissingOnVariant(String),
+    /// A shape member is part of the union — shapes have no methods at
+    /// all, so the rule can never be satisfied with this variant in the
+    /// member set. Distinguished from `MissingOnVariant` so the caller
+    /// can produce a more actionable diagnostic ("narrow with
+    /// `instanceof <Class>` first") rather than the generic
+    /// "Variant lacks the method" message.
+    ShapeHasNoMethods(String),
+    /// All variants declare the method but at differing vtable slots.
+    /// Implies independent declarations without a common ancestor owning
+    /// the method.
+    SlotMismatch,
+    /// Same slot across variants but parameter or return WasmTypes
+    /// differ — invalid for a shared `call_indirect` site.
+    SignatureMismatch,
+}
+
+/// Shared-method rule over an explicit member list. Mirrors
+/// [`resolve_shared_field_in_members`] one-to-one but on vtable slots
+/// instead of field offsets. Returns the slot index plus a representative
+/// `MethodSig` (for synthesizing the `call_indirect` type and threading
+/// `param_classes` hints into object-literal arguments). Each variant
+/// must declare the method at the same slot with matching parameter and
+/// return WasmTypes. Literal and method-less shape members are rejected
+/// via `MissingOnVariant`.
+pub(crate) fn resolve_shared_method_in_members(
+    ctx: &FuncContext<'_>,
+    members: &[UnionMember],
+    method_name: &str,
+) -> Result<(usize, MethodSig), SharedMethodIssue> {
+    let mut resolved: Option<(usize, MethodSig)> = None;
+    for m in members {
+        match m {
+            UnionMember::Shape(name) => {
+                // Shape vs class: shapes register a synthetic
+                // `ClassLayout` with empty `methods`/`vtable_method_map`,
+                // so a generic "method not found" check would fire here.
+                // Surface the distinction so the caller can steer the
+                // user toward `instanceof <Class>` rather than implying
+                // a method declaration would help.
+                if ctx.module_ctx.shape_registry.by_name.contains_key(name) {
+                    return Err(SharedMethodIssue::ShapeHasNoMethods(name.clone()));
+                }
+                let layout = ctx
+                    .module_ctx
+                    .class_registry
+                    .get(name)
+                    .ok_or_else(|| SharedMethodIssue::MissingOnVariant(name.clone()))?;
+                let &slot = layout
+                    .vtable_method_map
+                    .get(method_name)
+                    .ok_or_else(|| SharedMethodIssue::MissingOnVariant(name.clone()))?;
+                let sig = layout
+                    .methods
+                    .get(method_name)
+                    .ok_or_else(|| SharedMethodIssue::MissingOnVariant(name.clone()))?
+                    .clone();
+                match &resolved {
+                    None => resolved = Some((slot, sig)),
+                    Some((slot0, sig0)) => {
+                        if *slot0 != slot {
+                            return Err(SharedMethodIssue::SlotMismatch);
+                        }
+                        let p0: Vec<WasmType> =
+                            sig0.params.iter().map(|(_, t)| *t).collect();
+                        let p1: Vec<WasmType> = sig.params.iter().map(|(_, t)| *t).collect();
+                        if p0 != p1 || sig0.return_type != sig.return_type {
+                            return Err(SharedMethodIssue::SignatureMismatch);
+                        }
+                    }
+                }
+            }
+            UnionMember::Literal(lit) => {
+                return Err(SharedMethodIssue::MissingOnVariant(lit.canonical()));
+            }
+        }
+    }
+    resolved.ok_or(SharedMethodIssue::MissingOnVariant(String::from("(empty)")))
 }

@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_ast::ast::*;
 
 use crate::error::CompileError;
-use crate::types::{BoundType, TypeBindings};
+use crate::types::{BoundType, TypeBindings, WasmType};
 
 use super::hash_table::HashTableInstantiation;
 use super::map_builtins;
@@ -183,11 +183,16 @@ fn classify_fn<'a>(func: &'a Function<'a>, is_export: bool) -> Option<GenericFnT
 /// Resolve a TSType argument into a `BoundType`, honoring an outer binding
 /// scope (so `Box<T>` inside `class Foo<T>` binds through correctly).
 /// Returns an error if the type is unsupported as a generic argument (e.g. a
-/// function type).
+/// function type). `union_overrides` carries non-`I32` named-union
+/// `WasmType`s (collected pre-discovery in Pass 0a-i.5) so `Box<Half>` over
+/// a pure-`f64`-literal union resolves to `BoundType::Union { wasm_ty: F64 }`
+/// instead of the default `BoundType::Class` (which would wrongly produce
+/// `I32` at codegen).
 pub fn resolve_bound_type(
     ts_type: &TSType,
     class_names: &HashSet<String>,
     bindings: Option<&TypeBindings>,
+    union_overrides: &HashMap<String, WasmType>,
 ) -> Result<BoundType, CompileError> {
     match ts_type {
         TSType::TSNumberKeyword(_) => Ok(BoundType::F64),
@@ -219,13 +224,25 @@ pub fn resolve_bound_type(
                         // Mangle the nested instantiation (e.g. Box<i32>).
                         let mut token_parts = Vec::with_capacity(args.params.len());
                         for p in &args.params {
-                            let bt = resolve_bound_type(p, class_names, bindings)?;
+                            let bt = resolve_bound_type(p, class_names, bindings, union_overrides)?;
                             token_parts.push(bt.mangle_token());
                         }
                         return Ok(BoundType::Class(format!(
                             "{other}${}",
                             token_parts.join("$")
                         )));
+                    }
+                    // Named non-`I32` union (e.g. `Half` for `0.5 | 1.5`):
+                    // produce `BoundType::Union { wasm_ty: F64 }` so
+                    // `bindings.get(T).wasm_ty()` returns `F64` at codegen.
+                    // Pre-collected in Pass 0a-i.5; overrides only carry
+                    // non-`I32` entries, so missing names fall through to the
+                    // default `Class` arm below (correct for `I32` unions).
+                    if let Some(&wt) = union_overrides.get(other) {
+                        return Ok(BoundType::Union {
+                            name: other.to_string(),
+                            wasm_ty: wt,
+                        });
                     }
                     if class_names.contains(other) {
                         return Ok(BoundType::Class(other.to_string()));
@@ -236,8 +253,123 @@ pub fn resolve_bound_type(
                 }
             }
         }
+        TSType::TSUnionType(u) => {
+            // Inline `A | B` as a generic argument. `discover_unions` hasn't
+            // run yet (it's Pass 0a-vi, after `collect_instantiations` in
+            // Pass 0a-ii), so we recompute the canonical synthetic name from
+            // the AST — matching the `__Union$<sorted-tokens>` scheme
+            // `UnionRegistry` uses for anonymous inline unions. When the
+            // same member set also has a `type` alias, `UnionRegistry::insert`
+            // makes sure the synthetic name resolves back to that entry (see
+            // `unions.rs`), so downstream lookups succeed either way.
+            let mut tokens: Vec<String> = Vec::with_capacity(u.types.len());
+            for t in &u.types {
+                tokens.push(union_member_canonical_token(t, bindings)?);
+            }
+            tokens.sort();
+            tokens.dedup();
+            // Compute the union's `WasmType` from the AST: pure-`f64` literal
+            // members → `F64`, anything else → `I32`. This matches what
+            // `unions.rs::validate_uniform_wasm_ty` will produce when the
+            // registry catches up at Pass 0a-vi; mismatched (mixed) member
+            // sets are rejected there with a user-facing diagnostic, so a
+            // best-effort default of `I32` here is safe for the dead path.
+            let wasm_ty = inline_union_wasm_ty(u, bindings).unwrap_or(WasmType::I32);
+            Ok(BoundType::Union {
+                name: format!("__Union${}", tokens.join("$")),
+                wasm_ty,
+            })
+        }
+        TSType::TSParenthesizedType(p) => {
+            resolve_bound_type(&p.type_annotation, class_names, bindings, union_overrides)
+        }
         _ => Err(CompileError::unsupported(
             "unsupported TS type as generic argument",
+        )),
+    }
+}
+
+/// `WasmType` of an inline `TSUnionType` generic argument, computed from the
+/// AST because `resolve_bound_type` runs before `discover_unions`. Returns
+/// `Some(F64)` only when every member is a numeric literal that resolves to
+/// `f64` (fractional value or out-of-`i32`-range integer); returns
+/// `Some(I32)` for any pointer-typed or `i32`-representable member; `None`
+/// when members disagree (which `validate_uniform_wasm_ty` will later reject
+/// with a user-facing error).
+fn inline_union_wasm_ty(u: &TSUnionType, bindings: Option<&TypeBindings>) -> Option<WasmType> {
+    let mut chosen: Option<WasmType> = None;
+    for t in &u.types {
+        let wt = member_wasm_ty(t, bindings)?;
+        match chosen {
+            None => chosen = Some(wt),
+            Some(c) if c == wt => {}
+            Some(_) => return None,
+        }
+    }
+    chosen
+}
+
+/// `WasmType` of a single union-member AST node. Mirrors
+/// `unions.rs::validate_uniform_wasm_ty`'s per-member rule but on the AST.
+fn member_wasm_ty(t: &TSType, bindings: Option<&TypeBindings>) -> Option<WasmType> {
+    match t {
+        TSType::TSLiteralType(lit) => {
+            let (bt, _) = crate::codegen::shapes::literal_type_to_tag(&lit.literal).ok()?;
+            Some(bt.wasm_ty())
+        }
+        TSType::TSParenthesizedType(p) => member_wasm_ty(&p.type_annotation, bindings),
+        // Type-reference members are shapes / classes / nested-union aliases,
+        // all I32. A bound type-parameter could be anything — defer to its
+        // bound `WasmType`.
+        TSType::TSTypeReference(r) => {
+            let name = r.type_name.get_identifier_reference().map(|id| id.name.as_str())?;
+            if let Some(bound) = bindings.and_then(|b| b.get(name)) {
+                return Some(bound.wasm_ty());
+            }
+            Some(WasmType::I32)
+        }
+        _ => None,
+    }
+}
+
+/// Canonical token for a union member as it appears in an inline `TSUnionType`
+/// generic argument. Mirrors `UnionMember::canonical` but operates on the AST
+/// because `resolve_bound_type` runs before `discover_unions` populates the
+/// registry. Accepts the same member shapes `UnionWalker::resolve_member`
+/// does: type references (shape / class / nested union alias), literal types,
+/// and parenthesized forms.
+fn union_member_canonical_token(
+    t: &TSType,
+    bindings: Option<&TypeBindings>,
+) -> Result<String, CompileError> {
+    match t {
+        TSType::TSTypeReference(r) => {
+            let name = r
+                .type_name
+                .get_identifier_reference()
+                .map(|id| id.name.as_str())
+                .ok_or_else(|| {
+                    CompileError::type_err(
+                        "union member in generic argument must be a simple type reference",
+                    )
+                })?;
+            if let Some(bound) = bindings.and_then(|b| b.get(name)) {
+                return Ok(bound.mangle_token());
+            }
+            // No primitive-keyword short-circuit: Phase 1 unions reject
+            // primitive-typed members at registration, so if a user writes
+            // `Box<i32 | string>` we let discovery produce the clear error.
+            Ok(name.to_string())
+        }
+        TSType::TSLiteralType(lit) => {
+            let (_, tv) = crate::codegen::shapes::literal_type_to_tag(&lit.literal)?;
+            Ok(tv.canonical())
+        }
+        TSType::TSParenthesizedType(p) => {
+            union_member_canonical_token(&p.type_annotation, bindings)
+        }
+        _ => Err(CompileError::unsupported(
+            "unsupported union member kind in generic argument",
         )),
     }
 }
@@ -253,6 +385,7 @@ pub fn mangle_parent_name(
     class_names: &HashSet<String>,
     class_templates: &HashMap<String, GenericClassTemplate>,
     bindings: Option<&TypeBindings>,
+    union_overrides: &HashMap<String, WasmType>,
 ) -> Result<Option<String>, CompileError> {
     let Some(super_class) = &class.super_class else {
         return Ok(None);
@@ -280,7 +413,7 @@ pub fn mangle_parent_name(
     }
     let mut tokens = Vec::with_capacity(super_args.params.len());
     for a in &super_args.params {
-        let bt = resolve_bound_type(a, class_names, bindings)?;
+        let bt = resolve_bound_type(a, class_names, bindings, union_overrides)?;
         tokens.push(bt.mangle_token());
     }
     Ok(Some(format!("{raw}${}", tokens.join("$"))))
@@ -296,11 +429,13 @@ pub fn collect_instantiations<'a>(
     class_templates: &HashMap<String, GenericClassTemplate<'a>>,
     fn_templates: &HashMap<String, GenericFnTemplate<'a>>,
     class_names: &HashSet<String>,
+    union_overrides: &HashMap<String, WasmType>,
 ) -> Result<CollectResult, CompileError> {
     let mut walker = Walker {
         class_templates,
         fn_templates,
         class_names,
+        union_overrides,
         cls: InstantiationSet::default(),
         fns: InstantiationSet::default(),
         inferred_sites: HashMap::new(),
@@ -419,6 +554,7 @@ struct Walker<'a, 'ctx> {
     class_templates: &'ctx HashMap<String, GenericClassTemplate<'a>>,
     fn_templates: &'ctx HashMap<String, GenericFnTemplate<'a>>,
     class_names: &'ctx HashSet<String>,
+    union_overrides: &'ctx HashMap<String, WasmType>,
     cls: InstantiationSet,
     fns: InstantiationSet,
     inferred_sites: HashMap<u32, String>,
@@ -475,7 +611,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
             }
             Statement::FunctionDeclaration(func) if !func.declare => {
                 if func.type_parameters.is_none() {
-                    let fn_locals = build_fn_locals(func, self.class_names, bindings);
+                    let fn_locals = build_fn_locals(func, self.class_names, bindings, self.union_overrides);
                     self.walk_function_body(func, bindings, &fn_locals)?;
                 }
             }
@@ -489,7 +625,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                     match decl {
                         Declaration::FunctionDeclaration(func) if !func.declare => {
                             if func.type_parameters.is_none() {
-                                let fn_locals = build_fn_locals(func, self.class_names, bindings);
+                                let fn_locals = build_fn_locals(func, self.class_names, bindings, self.union_overrides);
                                 self.walk_function_body(func, bindings, &fn_locals)?;
                             }
                         }
@@ -612,7 +748,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                         self.walk_ts_type(&ann.type_annotation, bindings)?;
                     }
                     if let Some(body) = &method.value.body {
-                        let locals = build_fn_locals(&method.value, self.class_names, bindings);
+                        let locals = build_fn_locals(&method.value, self.class_names, bindings, self.union_overrides);
                         for stmt in &body.statements {
                             self.walk_statement(stmt, bindings, &locals)?;
                         }
@@ -683,7 +819,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
         let mut concrete = Vec::with_capacity(super_args.params.len());
         let mut tokens = Vec::with_capacity(super_args.params.len());
         for a in &super_args.params {
-            let bt = resolve_bound_type(a, self.class_names, bindings)?;
+            let bt = resolve_bound_type(a, self.class_names, bindings, self.union_overrides)?;
             tokens.push(bt.mangle_token());
             concrete.push(bt);
         }
@@ -714,9 +850,9 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             args.params.len()
                         )));
                     }
-                    let key_ty = resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                    let key_ty = resolve_bound_type(&args.params[0], self.class_names, bindings, self.union_overrides)?;
                     let value_ty =
-                        resolve_bound_type(&args.params[1], self.class_names, bindings)?;
+                        resolve_bound_type(&args.params[1], self.class_names, bindings, self.union_overrides)?;
                     self.record_map_inst(key_ty, value_ty);
                     for arg in &args.params {
                         self.walk_ts_type(arg, bindings)?;
@@ -730,7 +866,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             args.params.len()
                         )));
                     }
-                    let elem_ty = resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                    let elem_ty = resolve_bound_type(&args.params[0], self.class_names, bindings, self.union_overrides)?;
                     self.record_set_inst(elem_ty);
                     for arg in &args.params {
                         self.walk_ts_type(arg, bindings)?;
@@ -748,7 +884,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                     let mut concrete = Vec::with_capacity(args.params.len());
                     let mut tokens = Vec::with_capacity(args.params.len());
                     for arg in &args.params {
-                        let bt = resolve_bound_type(arg, self.class_names, bindings)?;
+                        let bt = resolve_bound_type(arg, self.class_names, bindings, self.union_overrides)?;
                         tokens.push(bt.mangle_token());
                         concrete.push(bt);
                     }
@@ -789,9 +925,9 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             )));
                         }
                         let key_ty =
-                            resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                            resolve_bound_type(&args.params[0], self.class_names, bindings, self.union_overrides)?;
                         let value_ty =
-                            resolve_bound_type(&args.params[1], self.class_names, bindings)?;
+                            resolve_bound_type(&args.params[1], self.class_names, bindings, self.union_overrides)?;
                         self.record_map_inst(key_ty, value_ty);
                         for arg in &args.params {
                             self.walk_ts_type(arg, bindings)?;
@@ -807,7 +943,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             )));
                         }
                         let elem_ty =
-                            resolve_bound_type(&args.params[0], self.class_names, bindings)?;
+                            resolve_bound_type(&args.params[0], self.class_names, bindings, self.union_overrides)?;
                         self.record_set_inst(elem_ty);
                         for arg in &args.params {
                             self.walk_ts_type(arg, bindings)?;
@@ -825,7 +961,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             let mut concrete = Vec::with_capacity(args.params.len());
                             let mut tokens = Vec::with_capacity(args.params.len());
                             for a in &args.params {
-                                let bt = resolve_bound_type(a, self.class_names, bindings)?;
+                                let bt = resolve_bound_type(a, self.class_names, bindings, self.union_overrides)?;
                                 tokens.push(bt.mangle_token());
                                 concrete.push(bt);
                             }
@@ -866,7 +1002,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                             let mut concrete = Vec::with_capacity(args.params.len());
                             let mut tokens = Vec::with_capacity(args.params.len());
                             for a in &args.params {
-                                let bt = resolve_bound_type(a, self.class_names, bindings)?;
+                                let bt = resolve_bound_type(a, self.class_names, bindings, self.union_overrides)?;
                                 tokens.push(bt.mangle_token());
                                 concrete.push(bt);
                             }
@@ -1038,7 +1174,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
             Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Some(BoundType::Str),
             Expression::Identifier(id) => locals.get(id.name.as_str()).cloned(),
             Expression::TSAsExpression(as_expr) => {
-                resolve_bound_type(&as_expr.type_annotation, self.class_names, bindings).ok()
+                resolve_bound_type(&as_expr.type_annotation, self.class_names, bindings, self.union_overrides).ok()
             }
             Expression::ParenthesizedExpression(p) => {
                 self.infer_arg_bound_type(&p.expression, bindings, locals)
@@ -1056,7 +1192,7 @@ impl<'a, 'ctx> Walker<'a, 'ctx> {
                     let mut tokens = Vec::with_capacity(args.params.len());
                     for a in &args.params {
                         tokens.push(
-                            resolve_bound_type(a, self.class_names, bindings)
+                            resolve_bound_type(a, self.class_names, bindings, self.union_overrides)
                                 .ok()?
                                 .mangle_token(),
                         );
@@ -1097,6 +1233,7 @@ fn build_fn_locals(
     func: &Function,
     class_names: &HashSet<String>,
     bindings: Option<&TypeBindings>,
+    union_overrides: &HashMap<String, WasmType>,
 ) -> LocalTypeEnv {
     let mut env = LocalTypeEnv::new();
     for param in &func.params.items {
@@ -1106,7 +1243,9 @@ fn build_fn_locals(
         let Some(ann) = param.type_annotation.as_ref() else {
             continue;
         };
-        let Ok(bt) = resolve_bound_type(&ann.type_annotation, class_names, bindings) else {
+        let Ok(bt) =
+            resolve_bound_type(&ann.type_annotation, class_names, bindings, union_overrides)
+        else {
             continue;
         };
         env.insert(id.name.as_str().to_string(), bt);

@@ -7,6 +7,7 @@ use crate::error::{self, CompileError};
 use crate::types::{self, ClosureSig, TypeBindings, WasmType};
 
 use super::module::ModuleContext;
+use super::unions::UnionMember;
 
 /// One emit slot in a function body. Most of tscc pushes `Instruction` values
 /// one at a time; the splicer (L_splice) pastes a pre-rewritten helper body as
@@ -65,6 +66,15 @@ pub struct FuncContext<'a> {
     /// into `ObjectExpression` return arguments so a `{...}` literal can
     /// resolve against the declared shape.
     pub return_class: Option<String>,
+    /// Narrowing refinement environment. Owned by `stmt::emit_if` /
+    /// `expr::emit_conditional` (and Sub-phase 1.5.3's `emit_switch`),
+    /// which call `enter_refinement_scope` / `leave_refinement_scope`
+    /// around branch bodies. Member access, coerce, and class resolution
+    /// read it via `current_class_of` (single-variant fast path) and
+    /// `current_refinement_of` (full `Refinement` for `Subunion` /
+    /// `Never` cases) so guarded branches see the refined effective
+    /// type.
+    pub(crate) refinement_env: RefinementEnv,
 }
 
 pub(crate) struct LoopLabels {
@@ -106,6 +116,274 @@ impl<'a> FuncContext<'a> {
             method_receiver_override: None,
             type_bindings: None,
             return_class: None,
+            refinement_env: RefinementEnv::default(),
+        }
+    }
+
+    /// Push a fresh refinement layer. Every call must be balanced by a
+    /// later `leave_refinement_scope` on the same code path.
+    pub(crate) fn enter_refinement_scope(&mut self) {
+        self.refinement_env.enter_scope();
+    }
+
+    /// Pop the topmost refinement layer, restoring the snapshot taken by
+    /// the matching `enter_refinement_scope`.
+    pub(crate) fn leave_refinement_scope(&mut self) {
+        self.refinement_env.leave_scope();
+    }
+
+    /// Install a refinement on the current scope. The recognizer
+    /// (`recognize_narrowing_facts`) feeds facts here from `if` / `else`
+    /// / ternary lifecycles, plus `switch` clauses (Sub-phase 3).
+    pub(crate) fn refine_local(&mut self, name: &str, refinement: Refinement) {
+        self.refinement_env.refine(name, refinement);
+    }
+
+    /// Effective single-class name for `name`. Returns `Some(c)` when the
+    /// refinement is `Refinement::Class(c)`; otherwise falls back to the
+    /// declared class / union name in `local_class_types`. `Subunion` and
+    /// `Never` refinements **deliberately do not** collapse to a class
+    /// here — callers that need the un-narrowed union name to look up in
+    /// the registry get it via the fallback, while consumers that care
+    /// about the refinement (member access, coerce) consult
+    /// `current_refinement_of` directly.
+    pub(crate) fn current_class_of(&self, name: &str) -> Option<&str> {
+        if let Some(Refinement::Class(c)) = self.refinement_env.refined_of(name) {
+            return Some(c.as_str());
+        }
+        self.local_class_types.get(name).map(String::as_str)
+    }
+
+    /// Full refinement for `name` (any variant), or `None` if the local
+    /// is unrefined. Member access and coerce read this to handle
+    /// `Subunion` / `Never` cases that `current_class_of` deliberately
+    /// hides.
+    pub(crate) fn current_refinement_of(&self, name: &str) -> Option<&Refinement> {
+        self.refinement_env.refined_of(name)
+    }
+
+    /// Recognize narrowing facts implied by `test` in condition position.
+    /// Returns `(positive, negative)` — facts that hold in the if-true
+    /// branch and the else branch respectively.
+    ///
+    /// Matches two shapes, both in either operand order:
+    ///   - `x.field === LITERAL` (discriminator predicate): `x` is a
+    ///     local of union type, `field` is a discriminator on each
+    ///     variant (its `tag_value` decides membership). Positive fact
+    ///     fires when exactly one variant matches.
+    ///   - `x === LITERAL` (literal-union predicate): `x` is a local of
+    ///     union type with literal members. Positive produces no fact in
+    ///     Phase 1 (there is no `Refinement::Literal` for "just this
+    ///     literal" yet — see `Refinement` doc).
+    ///
+    /// Negative facts (Sub-phase 1.5.1) are built by
+    /// [`build_negative_refinement`] from the surviving member set: 0 →
+    /// `Never`, 1 shape → `Class`, ≥2 → `Subunion`, 1 literal → no fact.
+    ///
+    /// `!==` and `!=` swap positive / negative. `==` and `!=` are
+    /// treated like `===` / `!==` (tscc's static subset has no coercion
+    /// semantics). Unrecognized test shapes return `(empty, empty)`;
+    /// codegen still emits the comparison correctly since the recognizer
+    /// doesn't gate emission, only refinements.
+    pub(crate) fn recognize_narrowing_facts(
+        &self,
+        test: &Expression<'a>,
+    ) -> (Vec<NarrowingFact>, Vec<NarrowingFact>) {
+        let bin = match peel_parens(test) {
+            Expression::BinaryExpression(b) => b,
+            _ => return (Vec::new(), Vec::new()),
+        };
+
+        // Phase 2 sub-phase 2 — `instanceof` predicate. Operand order is
+        // fixed (`x instanceof Class`); no literal-vs-side flip needed.
+        if bin.operator == BinaryOperator::Instanceof {
+            return match_instanceof_pair(self, &bin.left, &bin.right)
+                .unwrap_or_else(|| (Vec::new(), Vec::new()));
+        }
+
+        let negate = match bin.operator {
+            BinaryOperator::StrictEquality | BinaryOperator::Equality => false,
+            BinaryOperator::StrictInequality | BinaryOperator::Inequality => true,
+            _ => return (Vec::new(), Vec::new()),
+        };
+
+        // Try both operand orders: either side may be the literal.
+        let facts = match_eq_pair(self, &bin.left, &bin.right)
+            .or_else(|| match_eq_pair(self, &bin.right, &bin.left));
+        let Some((positive, negative)) = facts else {
+            return (Vec::new(), Vec::new());
+        };
+        if negate {
+            (negative, positive)
+        } else {
+            (positive, negative)
+        }
+    }
+
+    /// Sub-phase 1.5.3 — switch-statement narrowing.
+    ///
+    /// Given a switch's discriminant and the full ordered case list, return
+    /// per-case positive facts and the cumulative negative facts to install
+    /// for the `default` body. Each case body sees the same positive
+    /// refinement that an `if (disc === case_lit)` test would produce; the
+    /// default body sees the original union minus every literal matched by
+    /// a prior case. Cases that don't recognize a literal test contribute
+    /// no positive fact and don't trim the cumulative negative — the
+    /// emitter still generates code for them, just without narrowing.
+    ///
+    /// Recognized discriminant shapes match the if-recognizer:
+    ///   - `x.field` (discriminator predicate over a shape union)
+    ///   - `x` (literal-union value)
+    ///
+    /// Anything else returns an all-empty `SwitchNarrowing`. Fall-through
+    /// is intentionally NOT modeled — each case body's refinement is its
+    /// own positive (matching AssemblyScript's switch semantics rather
+    /// than full TS).
+    pub(crate) fn recognize_switch_facts(
+        &self,
+        discriminant: &Expression<'a>,
+        cases: &[&SwitchCase<'a>],
+    ) -> SwitchNarrowing {
+        let empty = || SwitchNarrowing {
+            case_facts: cases.iter().map(|_| Vec::new()).collect(),
+            default_facts: Vec::new(),
+        };
+
+        // Resolve the local being narrowed and (for shape-discriminator
+        // switches) the field name. Either operand shape mirrors the
+        // if-recognizer; anything else falls through to "no narrowing".
+        let (local_name, field_name): (String, Option<String>) = match peel_parens(discriminant) {
+            Expression::StaticMemberExpression(member) => {
+                let Expression::Identifier(ident) = peel_parens(&member.object) else {
+                    return empty();
+                };
+                (
+                    ident.name.as_str().to_string(),
+                    Some(member.property.name.as_str().to_string()),
+                )
+            }
+            Expression::Identifier(ident) => (ident.name.as_str().to_string(), None),
+            _ => return empty(),
+        };
+
+        let Some(active_members) = active_member_set(self, &local_name) else {
+            return empty();
+        };
+
+        let mut matched_shapes: Vec<String> = Vec::new();
+        let mut matched_literals: Vec<crate::codegen::shapes::TagValue> = Vec::new();
+        let mut any_non_shape_unmatched = false;
+        let mut case_facts: Vec<Vec<NarrowingFact>> = Vec::with_capacity(cases.len());
+
+        for case in cases {
+            let Some(test) = case.test.as_ref() else {
+                // Default — facts come from the cumulative negative below.
+                case_facts.push(Vec::new());
+                continue;
+            };
+            let Some(tv) = crate::codegen::expr::object::expr_to_tag_value(test) else {
+                case_facts.push(Vec::new());
+                continue;
+            };
+
+            let mut facts = Vec::new();
+            if let Some(field_name) = field_name.as_deref() {
+                // Shape-discriminator switch — each case may match one or
+                // more shape members whose `field_name` carries this tag.
+                let mut matched_in_case: Vec<String> = Vec::new();
+                for m in &active_members {
+                    match m {
+                        UnionMember::Shape(shape_name) => {
+                            let Some(shape) =
+                                self.module_ctx.shape_registry.get_by_name(shape_name)
+                            else {
+                                continue;
+                            };
+                            let Some(field) =
+                                shape.fields.iter().find(|f| f.name == field_name)
+                            else {
+                                continue;
+                            };
+                            if field.tag_value.as_ref() == Some(&tv)
+                                && !matched_shapes.contains(shape_name)
+                                && !matched_in_case.contains(shape_name)
+                            {
+                                matched_in_case.push(shape_name.clone());
+                            }
+                        }
+                        UnionMember::Literal(_) => {
+                            // A literal member can't satisfy a `x.field`
+                            // predicate; same conservative bail as the
+                            // if-recognizer's `any_non_shape_unmatched`.
+                            any_non_shape_unmatched = true;
+                        }
+                    }
+                }
+                if matched_in_case.len() == 1 {
+                    facts.push(NarrowingFact {
+                        local_name: local_name.clone(),
+                        refined: Refinement::Class(matched_in_case[0].clone()),
+                    });
+                }
+                matched_shapes.extend(matched_in_case);
+            } else {
+                // Literal-union switch — each case may pull a literal
+                // member out of the union. Phase 1 has no
+                // `Refinement::Literal`, so positive facts stay empty;
+                // tracking matched literals still drives the default's
+                // cumulative negative.
+                let mut hit = false;
+                for m in &active_members {
+                    if let UnionMember::Literal(lit) = m
+                        && lit == &tv
+                        && !matched_literals.iter().any(|m| m == &tv)
+                    {
+                        matched_literals.push(tv.clone());
+                        hit = true;
+                        break;
+                    }
+                }
+                let _ = hit;
+            }
+            case_facts.push(facts);
+        }
+
+        // Cumulative default: original active set minus every shape /
+        // literal a prior case matched. Reuses `build_negative_refinement`
+        // so the N-arithmetic (0 → Never, 1 shape → Class, ≥2 → Subunion,
+        // singleton-literal-only → no fact) stays exactly aligned with the
+        // if-recognizer.
+        let unmatched_shapes: Vec<String> = active_members
+            .iter()
+            .filter_map(|m| match m {
+                UnionMember::Shape(n) if !matched_shapes.contains(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        let unmatched_literals: Vec<crate::codegen::shapes::TagValue> = active_members
+            .iter()
+            .filter_map(|m| match m {
+                UnionMember::Literal(lit) if !matched_literals.iter().any(|x| x == lit) => {
+                    Some(lit.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let default_facts = match build_negative_refinement(
+            &unmatched_shapes,
+            &unmatched_literals,
+            any_non_shape_unmatched,
+        ) {
+            Some(refined) => vec![NarrowingFact {
+                local_name,
+                refined,
+            }],
+            None => Vec::new(),
+        };
+
+        SwitchNarrowing {
+            case_facts,
+            default_facts,
         }
     }
 
@@ -416,15 +694,26 @@ impl<'a> FuncContext<'a> {
         let mut param_types = Vec::new();
         for param in &arrow.params.items {
             let ty = if let Some(ann) = &param.type_annotation {
-                types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names)
-                    .ok()?
+                types::resolve_type_annotation_with_unions(
+                    ann,
+                    &self.module_ctx.class_names,
+                    self.type_bindings.as_ref(),
+                    &self.module_ctx.non_i32_union_wasm_types,
+                )
+                .ok()?
             } else {
                 return None;
             };
             param_types.push(ty);
         }
         let return_type = if let Some(ann) = &arrow.return_type {
-            types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names).ok()?
+            types::resolve_type_annotation_with_unions(
+                ann,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                &self.module_ctx.non_i32_union_wasm_types,
+            )
+            .ok()?
         } else {
             // Try to infer from expression body
             if arrow.expression {
@@ -702,6 +991,343 @@ fn collect_local_decls(stmt: &Statement, out: &mut HashSet<String>) {
     }
 }
 
+/// Peel any number of `TSParenthesizedExpression`s from `expr`, returning
+/// the innermost non-parenthesized form. Used by the narrowing recognizer so
+/// `(x.kind) === 'circle'` and `x.kind === ('circle')` match the same
+/// patterns as their unparenthesized counterparts.
+pub(crate) fn peel_parens<'a, 'b>(expr: &'b Expression<'a>) -> &'b Expression<'a> {
+    let mut cur = expr;
+    while let Expression::ParenthesizedExpression(p) = cur {
+        cur = &p.expression;
+    }
+    cur
+}
+
+/// Try to recognize `expr_side OP literal_side` as a narrowing predicate and
+/// return the `(positive_facts, negative_facts)` it implies. Caller tries
+/// this both ways so either operand order matches. Returns `None` when the
+/// pair doesn't look like one of the two recognised shapes (`x.field === L`
+/// or `x === L`) or when the relevant local isn't union-typed.
+fn match_eq_pair<'a>(
+    ctx: &FuncContext<'a>,
+    expr_side: &Expression<'a>,
+    literal_side: &Expression<'a>,
+) -> Option<(Vec<NarrowingFact>, Vec<NarrowingFact>)> {
+    let tv = crate::codegen::expr::object::expr_to_tag_value(literal_side)?;
+
+    match peel_parens(expr_side) {
+        // Sub-phase 5: discriminator predicate — `x.field === LIT`.
+        Expression::StaticMemberExpression(member) => {
+            let Expression::Identifier(ident) = peel_parens(&member.object) else {
+                return None;
+            };
+            let local = ident.name.as_str();
+            // Sub-phase 1.5.1: when the local has already been refined to
+            // a sub-union, recognize against the refined member set so
+            // nested narrowing composes (an inner predicate sees the
+            // outer's leftover members, not the original full union).
+            // `Class` and `Never` refinements bail — Class is already a
+            // single variant (no further union narrowing), Never is a
+            // dead branch (no useful facts).
+            let active_members = active_member_set(ctx, local)?;
+            let field_name = member.property.name.as_str();
+
+            let mut matched: Vec<String> = Vec::new();
+            let mut unmatched_shapes: Vec<String> = Vec::new();
+            let mut any_non_shape_unmatched = false;
+            for m in &active_members {
+                match m {
+                    crate::codegen::unions::UnionMember::Shape(shape_name) => {
+                        let shape = ctx.module_ctx.shape_registry.get_by_name(shape_name)?;
+                        let field = shape.fields.iter().find(|f| f.name == field_name)?;
+                        if field.tag_value.as_ref() == Some(&tv) {
+                            matched.push(shape_name.clone());
+                        } else {
+                            unmatched_shapes.push(shape_name.clone());
+                        }
+                    }
+                    // A shape.field predicate against a literal member makes
+                    // no sense — bail rather than produce a misleading fact.
+                    crate::codegen::unions::UnionMember::Literal(_) => {
+                        any_non_shape_unmatched = true;
+                    }
+                }
+            }
+
+            let mut positive = Vec::new();
+            let mut negative = Vec::new();
+            if matched.len() == 1 {
+                positive.push(NarrowingFact {
+                    local_name: local.to_string(),
+                    refined: Refinement::Class(matched.remove(0)),
+                });
+            }
+            // Negative refinement (Sub-phase 1.5.1): N-arithmetic over the
+            // surviving member set. Mixed shape/literal unions fall back to
+            // a "shapes-only" negative when no literal can reach this branch
+            // (the discriminator predicate is on a shape field, so literal
+            // members aren't affected by the matching logic — they always
+            // survive to the negative side).
+            if let Some(neg) = build_negative_refinement(
+                &unmatched_shapes,
+                /*surviving_literals=*/ &[],
+                any_non_shape_unmatched,
+            ) {
+                negative.push(NarrowingFact {
+                    local_name: local.to_string(),
+                    refined: neg,
+                });
+            }
+            Some((positive, negative))
+        }
+        // Sub-phase 6: literal-union predicate — `x === LIT`.
+        Expression::Identifier(ident) => {
+            let local = ident.name.as_str();
+            let active_members = active_member_set(ctx, local)?;
+
+            // Split members by whether they match the literal. Shape members
+            // never match a value-literal (the shape has identity, not a
+            // singleton value in Phase 1).
+            let mut matched_count = 0usize;
+            let mut unmatched_shapes: Vec<String> = Vec::new();
+            let mut unmatched_literals: Vec<crate::codegen::shapes::TagValue> = Vec::new();
+            for m in &active_members {
+                match m {
+                    crate::codegen::unions::UnionMember::Literal(lit) => {
+                        if lit == &tv {
+                            matched_count += 1;
+                        } else {
+                            unmatched_literals.push(lit.clone());
+                        }
+                    }
+                    crate::codegen::unions::UnionMember::Shape(sn) => {
+                        unmatched_shapes.push(sn.clone());
+                    }
+                }
+            }
+
+            // Positive: no class-name refinement — Phase 1 has no `BoundType`
+            // for a singleton literal. Future work (see `Refinement` doc) can
+            // extend `Refinement::Class` to a `Refinement::Literal(TagValue)`
+            // for primitive-union narrowing.
+            let positive = Vec::new();
+            let mut negative = Vec::new();
+            // Negative refinement (Sub-phase 1.5.1): if the literal didn't
+            // match anything in the union, the predicate is always false in
+            // the true branch and always true in the else branch — no useful
+            // refinement either way (caller's predicate is dead code, but
+            // that's a separate diagnostic). Otherwise, build the surviving
+            // member set and refine.
+            if matched_count >= 1
+                && let Some(neg) = build_negative_refinement(
+                    &unmatched_shapes,
+                    &unmatched_literals,
+                    /*any_non_shape_unmatched=*/ false,
+                )
+            {
+                negative.push(NarrowingFact {
+                    local_name: local.to_string(),
+                    refined: neg,
+                });
+            }
+            Some((positive, negative))
+        }
+        _ => None,
+    }
+}
+
+/// Active member set for a union-typed local, honoring any active
+/// refinement. Returns `None` when no useful narrowing is possible:
+/// the local has a `Class` or `Never` refinement (already narrowed past
+/// the union, or unreachable), or the local isn't union-typed at all.
+/// `Subunion` returns the refined members; un-refined locals return
+/// the full member set from the registry.
+///
+/// Cleanly composes: the recognizer always sees "what variants does the
+/// current scope still consider possible," so nested predicates
+/// re-narrow against the leftover set rather than the original union.
+/// Phase 2 sub-phase 2 — partition a union's active members against an
+/// `instanceof RightClass` predicate. Returns `(positive, negative)` facts
+/// in the same shape as `match_eq_pair` so the caller can splice them into
+/// the recognizer's branch refinements unchanged.
+///
+/// Matching rule per the plan: a class member matches iff its name equals
+/// `RightClass` or `is_subclass_of(member, RightClass)` is true. Shape
+/// members and literal members never match — a shape carries no vtable
+/// pointer and a literal isn't a class.
+///
+/// Bails (`None`) when:
+/// - the local has no static union type,
+/// - the right operand isn't a bare identifier referring to a registered
+///   class.
+///
+/// An empty matched set is *not* a bail — the predicate is statically
+/// false, the positive branch becomes `Never` (consumed by exhaustiveness),
+/// and the negative branch keeps the original membership.
+fn match_instanceof_pair<'a>(
+    ctx: &FuncContext<'a>,
+    expr_side: &Expression<'a>,
+    class_side: &Expression<'a>,
+) -> Option<(Vec<NarrowingFact>, Vec<NarrowingFact>)> {
+    use crate::codegen::unions::UnionMember;
+
+    let Expression::Identifier(local_id) = peel_parens(expr_side) else {
+        return None;
+    };
+    let local = local_id.name.as_str().to_string();
+
+    let Expression::Identifier(class_id) = peel_parens(class_side) else {
+        return None;
+    };
+    let right_class = class_id.name.as_str().to_string();
+    if !ctx
+        .module_ctx
+        .class_registry
+        .classes
+        .contains_key(&right_class)
+    {
+        return None;
+    }
+
+    // Active members: a refined local feeds its current member set; a
+    // `Class(C)` refinement collapses to a singleton `[C]` so an exhaustive
+    // if-chain like `instanceof Cat ; else instanceof Dog ; else
+    // assertNever(p)` can drive the second predicate's else branch all the
+    // way to `Never`. Without this fallback, the outer `instanceof` already
+    // narrows N=2 unions to `Class(Dog)`, and the inner predicate would see
+    // `None` from `active_member_set` and emit no facts.
+    let active_members = if let Some(m) = active_member_set(ctx, &local) {
+        m
+    } else if let Some(Refinement::Class(c)) = ctx.current_refinement_of(&local) {
+        vec![UnionMember::Shape(c.clone())]
+    } else {
+        return None;
+    };
+
+    let mut matched: Vec<String> = Vec::new();
+    let mut unmatched_shapes_or_classes: Vec<String> = Vec::new();
+    let mut unmatched_literals: Vec<crate::codegen::shapes::TagValue> = Vec::new();
+    for m in &active_members {
+        match m {
+            UnionMember::Shape(name) => {
+                let is_shape = ctx.module_ctx.shape_registry.by_name.contains_key(name);
+                let is_match = !is_shape
+                    && (name == &right_class
+                        || ctx
+                            .module_ctx
+                            .class_registry
+                            .is_subclass_of(name, &right_class));
+                if is_match {
+                    matched.push(name.clone());
+                } else {
+                    unmatched_shapes_or_classes.push(name.clone());
+                }
+            }
+            UnionMember::Literal(lit) => {
+                unmatched_literals.push(lit.clone());
+            }
+        }
+    }
+
+    let positive_refined = match matched.len() {
+        0 => Refinement::Never,
+        1 => Refinement::Class(matched.remove(0)),
+        _ => {
+            let mut members: Vec<UnionMember> =
+                matched.into_iter().map(UnionMember::Shape).collect();
+            members.sort_by_key(|m| m.canonical());
+            members.dedup_by(|a, b| a.canonical() == b.canonical());
+            Refinement::Subunion(members)
+        }
+    };
+    let positive = vec![NarrowingFact {
+        local_name: local.clone(),
+        refined: positive_refined,
+    }];
+
+    let negative = match build_negative_refinement(
+        &unmatched_shapes_or_classes,
+        &unmatched_literals,
+        /*any_non_shape_unmatched=*/ false,
+    ) {
+        Some(refined) => vec![NarrowingFact {
+            local_name: local,
+            refined,
+        }],
+        None => Vec::new(),
+    };
+
+    Some((positive, negative))
+}
+
+fn active_member_set(
+    ctx: &FuncContext<'_>,
+    local: &str,
+) -> Option<Vec<crate::codegen::unions::UnionMember>> {
+    match ctx.current_refinement_of(local) {
+        Some(Refinement::Subunion(m)) => Some(m.clone()),
+        Some(Refinement::Class(_) | Refinement::Never) => None,
+        None => {
+            let class = ctx.local_class_types.get(local)?;
+            ctx.module_ctx
+                .union_registry
+                .get_by_name(class)
+                .map(|u| u.members.clone())
+        }
+    }
+}
+
+/// Compose a `Refinement` for the negative side of an equality predicate
+/// from the surviving shape names and literal values. Returns `None` to
+/// signal "no useful refinement" — three distinct cases:
+///
+/// 1. `any_non_shape_unmatched` is set: a `x.f === LIT` predicate ran
+///    against a union containing literal members. Literal members have no
+///    fields, so the predicate is undefined on them and we can't safely
+///    say which side they fall on. Skip refinement (conservative).
+/// 2. The surviving set has exactly one literal member and zero shapes:
+///    Phase 1 has no `BoundType` for a singleton literal, so we can't
+///    install a useful refinement. (Future literal-union work would
+///    extend `Refinement::Class` with a `Refinement::Literal(TagValue)`
+///    sibling.)
+/// 3. Otherwise the result is `Class` (1 shape, 0 literals), `Subunion`
+///    (≥2 members), or `Never` (0 members — predicate matched every
+///    variant, so the negative branch is unreachable).
+fn build_negative_refinement(
+    unmatched_shapes: &[String],
+    surviving_literals: &[crate::codegen::shapes::TagValue],
+    any_non_shape_unmatched: bool,
+) -> Option<Refinement> {
+    if any_non_shape_unmatched {
+        return None;
+    }
+    let total = unmatched_shapes.len() + surviving_literals.len();
+    if total == 0 {
+        return Some(Refinement::Never);
+    }
+    if total == 1 {
+        if let [name] = unmatched_shapes {
+            return Some(Refinement::Class(name.clone()));
+        }
+        // Singleton literal — no Phase 1 refinement representation.
+        return None;
+    }
+    let mut members: Vec<crate::codegen::unions::UnionMember> = unmatched_shapes
+        .iter()
+        .cloned()
+        .map(crate::codegen::unions::UnionMember::Shape)
+        .chain(
+            surviving_literals
+                .iter()
+                .cloned()
+                .map(crate::codegen::unions::UnionMember::Literal),
+        )
+        .collect();
+    members.sort_by_key(|m| m.canonical());
+    members.dedup_by(|a, b| a.canonical() == b.canonical());
+    Some(Refinement::Subunion(members))
+}
+
 /// Extract a non-negative integer literal from a tuple-index expression used
 /// in `infer_init_type`. Mirrors the helpers in `class.rs` and `member.rs`;
 /// if more sites need it, promote to a shared utility.
@@ -716,5 +1342,216 @@ fn tuple_init_literal_index(expr: &Expression<'_>) -> Option<usize> {
             Some(v as usize)
         }
         _ => None,
+    }
+}
+
+/// One narrowing fact recovered from a control-flow predicate. The
+/// `refined` payload is a [`Refinement`] so the recognizer can express
+/// the full range: a single variant (`Class`), a multi-member sub-union
+/// (`Subunion`), or the unreachable case (`Never`).
+#[derive(Debug, Clone)]
+pub(crate) struct NarrowingFact {
+    /// The local variable being refined (binding name in the source).
+    pub local_name: String,
+    /// The refinement to install in the active scope.
+    pub refined: Refinement,
+}
+
+/// Sub-phase 1.5.3 — narrowing facts harvested from a `switch` statement.
+/// `case_facts` is parallel to the source case list (one entry per case,
+/// including default slots — those entries are empty since the default
+/// reads from `default_facts` instead). `default_facts` is the cumulative
+/// negative refinement: discriminant minus every literal matched by a
+/// prior case.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SwitchNarrowing {
+    pub case_facts: Vec<Vec<NarrowingFact>>,
+    pub default_facts: Vec<NarrowingFact>,
+}
+
+/// Compile-time-only override for a local's effective type inside a
+/// guarded scope. Refinements **never** materialize in the wasm output
+/// and **never** appear in `UnionRegistry` — sub-unions produced here
+/// don't need a stable name because they don't escape to the source
+/// language.
+///
+/// The three variants cover everything Phase 1.5 + Phase 2 require
+/// without rework: `Class` is the single-variant fast path (Phase 1 + the
+/// majority of `instanceof` outcomes); `Subunion` carries an arbitrary
+/// member list (mixed shapes / classes / literals — `UnionMember`
+/// already discriminates them); `Never` is the empty-set sink that
+/// exhaustiveness reduces to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Refinement {
+    /// Exactly one shape or class variant.
+    Class(String),
+    /// A multi-member sub-union — at least two members, sorted by
+    /// `UnionMember::canonical()` and deduped at construction so
+    /// equivalent refinements compare equal.
+    Subunion(Vec<UnionMember>),
+    /// Unreachable: every variant of the original union has been ruled
+    /// out by prior branches. Member access on a `Never`-refined local
+    /// is a compile error; assignment to a `: never` slot (Sub-phase 4)
+    /// is the only legal use site.
+    Never,
+}
+
+/// Refinement environment for the narrowing skeleton (Sub-phase 4).
+/// Each `enter_scope` snapshots the current refinement map; each
+/// `leave_scope` restores the snapshot. `refine` installs an override
+/// that lasts until the matching `leave_scope`. Lookups consult the
+/// active map only.
+///
+/// Lifecycle is owned by `stmt::emit_if` and `expr::emit_conditional`:
+/// they call `enter_scope` immediately before emitting a branch's body
+/// and `leave_scope` immediately after. Push/pop balance is the codegen
+/// caller's responsibility.
+///
+/// The map is keyed by source-name (not wasm `LocalSlot`) because all
+/// refinement consumers (member access, coerce) read declared types via
+/// `local_class_types`, which is the same key space.
+#[derive(Default, Debug)]
+pub(crate) struct RefinementEnv {
+    refined: HashMap<String, Refinement>,
+    saved: Vec<HashMap<String, Refinement>>,
+}
+
+impl RefinementEnv {
+    pub(crate) fn enter_scope(&mut self) {
+        self.saved.push(self.refined.clone());
+    }
+
+    /// Restore the snapshot taken by the matching `enter_scope`. If no
+    /// snapshot is on the stack (caller bug — every leave must match an
+    /// earlier enter) the env resets to empty rather than panicking, so
+    /// codegen errors surface as type / runtime failures downstream
+    /// rather than as a panic in the test harness.
+    pub(crate) fn leave_scope(&mut self) {
+        self.refined = self.saved.pop().unwrap_or_default();
+    }
+
+    pub(crate) fn refine(&mut self, name: &str, refinement: Refinement) {
+        self.refined.insert(name.to_string(), refinement);
+    }
+
+    pub(crate) fn refined_of(&self, name: &str) -> Option<&Refinement> {
+        self.refined.get(name)
+    }
+
+    /// Number of snapshots currently on the stack — i.e. how many
+    /// `enter_scope` calls haven't yet been matched by `leave_scope`.
+    /// Used by debug-time balance assertions.
+    #[cfg(test)]
+    pub(crate) fn depth(&self) -> usize {
+        self.saved.len()
+    }
+}
+
+#[cfg(test)]
+mod refinement_tests {
+    use super::*;
+    use crate::codegen::shapes::TagValue;
+    use crate::codegen::unions::UnionMember;
+
+    fn cls(n: &str) -> Refinement {
+        Refinement::Class(n.to_string())
+    }
+
+    #[test]
+    fn empty_env_returns_none_and_zero_depth() {
+        let env = RefinementEnv::default();
+        assert_eq!(env.refined_of("x"), None);
+        assert_eq!(env.depth(), 0);
+    }
+
+    #[test]
+    fn enter_refine_leave_restores_to_empty() {
+        let mut env = RefinementEnv::default();
+        env.enter_scope();
+        env.refine("sh", cls("Circle"));
+        assert_eq!(env.refined_of("sh"), Some(&cls("Circle")));
+        assert_eq!(env.depth(), 1);
+        env.leave_scope();
+        assert_eq!(env.refined_of("sh"), None);
+        assert_eq!(env.depth(), 0);
+    }
+
+    #[test]
+    fn nested_scopes_compose_and_pop_in_order() {
+        let mut env = RefinementEnv::default();
+        env.enter_scope();
+        env.refine("a", cls("A1"));
+        env.enter_scope();
+        env.refine("a", cls("A2")); // shadow inner
+        env.refine("b", cls("B1")); // new in inner only
+        assert_eq!(env.refined_of("a"), Some(&cls("A2")));
+        assert_eq!(env.refined_of("b"), Some(&cls("B1")));
+        env.leave_scope();
+        // Outer scope restored — `a` reverts, `b` is gone.
+        assert_eq!(env.refined_of("a"), Some(&cls("A1")));
+        assert_eq!(env.refined_of("b"), None);
+        env.leave_scope();
+        assert_eq!(env.refined_of("a"), None);
+    }
+
+    #[test]
+    fn sibling_scopes_do_not_leak_refinements() {
+        // Models if/else: positive facts in the true branch must not be
+        // visible inside the else branch. Each sibling enter snapshots
+        // the same outer state; the leftover from the first branch must
+        // not be reused by the second.
+        let mut env = RefinementEnv::default();
+        env.enter_scope();
+        env.refine("sh", cls("Circle"));
+        assert_eq!(env.refined_of("sh"), Some(&cls("Circle")));
+        env.leave_scope();
+
+        env.enter_scope();
+        assert_eq!(env.refined_of("sh"), None);
+        env.refine("sh", cls("Square"));
+        assert_eq!(env.refined_of("sh"), Some(&cls("Square")));
+        env.leave_scope();
+
+        assert_eq!(env.refined_of("sh"), None);
+    }
+
+    #[test]
+    fn extra_leave_resets_to_empty_without_panicking() {
+        // Defensive: a codegen bug that emits an unmatched `leave_scope`
+        // must not panic in tests — it just clears the env. The
+        // observable effect is "narrowing is lost", which downstream
+        // type-checks will surface as a clear error rather than as a
+        // runtime crash.
+        let mut env = RefinementEnv::default();
+        env.refine("sh", cls("Circle"));
+        env.leave_scope();
+        assert_eq!(env.refined_of("sh"), None);
+        assert_eq!(env.depth(), 0);
+    }
+
+    #[test]
+    fn refinement_variants_round_trip() {
+        // All three Refinement variants survive the env's
+        // snapshot/restore round trip. Subunion equality respects the
+        // canonical-sort invariant: members declared in different orders
+        // compare equal iff the canonical token sets match.
+        let mut env = RefinementEnv::default();
+        let sub = Refinement::Subunion(vec![
+            UnionMember::Shape("Square".to_string()),
+            UnionMember::Shape("Rect".to_string()),
+        ]);
+        let lit_sub = Refinement::Subunion(vec![
+            UnionMember::Literal(TagValue::Str("red".to_string())),
+            UnionMember::Literal(TagValue::Str("green".to_string())),
+        ]);
+        env.enter_scope();
+        env.refine("sh", sub.clone());
+        env.refine("color", lit_sub.clone());
+        env.refine("dead", Refinement::Never);
+        assert_eq!(env.refined_of("sh"), Some(&sub));
+        assert_eq!(env.refined_of("color"), Some(&lit_sub));
+        assert_eq!(env.refined_of("dead"), Some(&Refinement::Never));
+        env.leave_scope();
+        assert_eq!(env.refined_of("sh"), None);
     }
 }

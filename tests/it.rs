@@ -39,3 +39,5 @@ mod splicer;
 mod strings;
 #[path = "it/tuples.rs"]
 mod tuples;
+#[path = "it/unions.rs"]
+mod unions;

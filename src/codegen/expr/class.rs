@@ -1,11 +1,13 @@
 use oxc_ast::ast::*;
 use wasm_encoder::{Instruction, ValType};
 
-use crate::codegen::func::FuncContext;
+use crate::codegen::func::{FuncContext, Refinement, peel_parens};
+use crate::codegen::unions::UnionMember;
 use crate::error::CompileError;
 use crate::types::WasmType;
 
 use super::ARRAY_HEADER_SIZE;
+use super::member::{SharedMethodIssue, resolve_shared_method_in_members};
 
 impl<'a> FuncContext<'a> {
     // ---- Phase 3: Classes ----
@@ -45,6 +47,7 @@ impl<'a> FuncContext<'a> {
                     p,
                     &self.module_ctx.class_names,
                     self.type_bindings.as_ref(),
+                    &self.module_ctx.non_i32_union_wasm_types,
                 )?;
                 tokens.push(bt.mangle_token());
             }
@@ -65,8 +68,12 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::I32Const(size as i32));
         let ptr_local = self.emit_arena_alloc_to_local(true)?;
 
-        // Write vtable pointer at offset 0 for polymorphic classes
-        if layout.is_polymorphic && !layout.vtable_methods.is_empty() {
+        // Write vtable pointer at offset 0 for polymorphic classes. Stored
+        // unconditionally — even methodless polymorphic classes need a
+        // unique runtime tag for Phase 2 `instanceof` narrowing, and the
+        // vtable allocator now guarantees each polymorphic class has its
+        // own 4-byte region (see `module.rs` vtable construction).
+        if layout.is_polymorphic {
             self.push(Instruction::LocalGet(ptr_local));
             self.push(Instruction::I32Const(layout.vtable_offset as i32));
             self.push(Instruction::I32Store(wasm_encoder::MemArg {
@@ -125,11 +132,13 @@ impl<'a> FuncContext<'a> {
             &type_args.params[0],
             &self.module_ctx.class_names,
             self.type_bindings.as_ref(),
+            &self.module_ctx.non_i32_union_wasm_types,
         )?;
         let value_ty = crate::codegen::generics::resolve_bound_type(
             &type_args.params[1],
             &self.module_ctx.class_names,
             self.type_bindings.as_ref(),
+            &self.module_ctx.non_i32_union_wasm_types,
         )?;
         let mangled = map_builtins::mangle_map_name(&key_ty, &value_ty);
         let info = self.module_ctx.hash_table_info.get(&mangled).ok_or_else(|| {
@@ -228,6 +237,7 @@ impl<'a> FuncContext<'a> {
             &type_args.params[0],
             &self.module_ctx.class_names,
             self.type_bindings.as_ref(),
+            &self.module_ctx.non_i32_union_wasm_types,
         )?;
         let mangled = set_builtins::mangle_set_name(&elem_ty);
         let info = self.module_ctx.hash_table_info.get(&mangled).ok_or_else(|| {
@@ -725,7 +735,12 @@ impl<'a> FuncContext<'a> {
         if let Some(type_params) = &new_expr.type_arguments
             && let Some(first) = type_params.params.first()
         {
-            return crate::types::resolve_ts_type(first, &self.module_ctx.class_names);
+            return crate::types::resolve_ts_type_full(
+                first,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                Some(&self.module_ctx.non_i32_union_wasm_types),
+            );
         }
         Err(CompileError::type_err(
             "new Array requires a type parameter: new Array<f64>(n)",
@@ -756,6 +771,27 @@ impl<'a> FuncContext<'a> {
             Ok(name) => name,
             Err(_) => return Ok(None), // Not a class method call, let it fall through
         };
+
+        // Phase 2 sub-phase 3 — union receiver. If the resolved name names
+        // a union (i.e. the local's static type is `type U = A | B | …`),
+        // dispatch via the vtable when every variant carries the method at
+        // the same slot with matching parameter / return WasmTypes. The
+        // polymorphism gate (sub-phase 1) guarantees every class member
+        // already has a vtable pointer at offset 0; the shared-slot
+        // constraint here is the method-side mirror of the Phase 1
+        // shared-field rule. `Refinement::Class(c)` is invisible at this
+        // point because `current_class_of` collapsed it to `c` — so only
+        // the unrefined / `Subunion(_)` / `Never` cases reach this arm.
+        if let Some(union) = self
+            .module_ctx
+            .union_registry
+            .get_by_name(&class_name)
+            .cloned()
+        {
+            return self
+                .emit_union_method_call(call, member, &class_name, &union.members, method_name)
+                .map(Some);
+        }
 
         // Look up the method — may be inherited from a parent class.
         // Walk up the parent chain checking method_map (which has entries only for declared methods).
@@ -904,6 +940,132 @@ impl<'a> FuncContext<'a> {
         }
     }
 
+    /// Phase 2 sub-phase 3 — emit a method call on a union receiver. The
+    /// receiver's static type is `union_name`; `union_members` carries the
+    /// declared member set. If the receiver is a refined identifier we
+    /// substitute its `Subunion(_)` member set and reject `Never`. The
+    /// shared-method helper either yields a `(slot, sig)` pair or names
+    /// the failure mode; the latter is mapped to a narrow-first
+    /// diagnostic that distinguishes missing / mis-slotted / mis-signed.
+    fn emit_union_method_call(
+        &mut self,
+        call: &CallExpression<'a>,
+        member: &StaticMemberExpression<'a>,
+        union_name: &str,
+        union_members: &[UnionMember],
+        method_name: &str,
+    ) -> Result<WasmType, CompileError> {
+        // Apply per-receiver refinement (mirror of `emit_member_access`):
+        // a `Subunion` narrows the candidate member list; `Never` is
+        // unreachable; `Class(_)` was already collapsed to a class name
+        // by `current_class_of`, so it never reaches this branch.
+        let receiver_refinement = if let Expression::Identifier(ident) = peel_parens(&member.object)
+        {
+            self.current_refinement_of(ident.name.as_str()).cloned()
+        } else {
+            None
+        };
+        let (effective_members, refined): (Vec<UnionMember>, bool) = match receiver_refinement {
+            Some(Refinement::Never) => {
+                return Err(CompileError::type_err(format!(
+                    "value of union '{union_name}' is unreachable here — every \
+                     variant has been ruled out by prior narrowing"
+                )));
+            }
+            Some(Refinement::Subunion(members)) => (members, true),
+            Some(Refinement::Class(_)) | None => (union_members.to_vec(), false),
+        };
+        let suffix = if refined { " (after refinement)" } else { "" };
+        let (slot, sig) = resolve_shared_method_in_members(self, &effective_members, method_name)
+            .map_err(|issue| match issue {
+                SharedMethodIssue::MissingOnVariant(v) => CompileError::type_err(format!(
+                    "method '{method_name}' is not declared on every variant of union \
+                     '{union_name}'{suffix} (variant '{v}' lacks it) — narrow the value with \
+                     `if (x instanceof …)` before calling variant-specific methods"
+                )),
+                SharedMethodIssue::ShapeHasNoMethods(v) => CompileError::type_err(format!(
+                    "method '{method_name}' cannot be called on union '{union_name}'{suffix} \
+                     because shape variant '{v}' has no methods (only classes carry a vtable). \
+                     Narrow the value with `if (x instanceof <Class>)` so the receiver is a \
+                     concrete class before calling '{method_name}'"
+                )),
+                SharedMethodIssue::SlotMismatch => CompileError::type_err(format!(
+                    "method '{method_name}' on union '{union_name}'{suffix} is declared \
+                     independently per variant — no common base owns the method, so \
+                     dispatch slots differ. Add a common base class that declares \
+                     '{method_name}', or narrow with `if (x instanceof …)` first"
+                )),
+                SharedMethodIssue::SignatureMismatch => CompileError::type_err(format!(
+                    "method '{method_name}' on union '{union_name}'{suffix} has different \
+                     parameter or return types across variants — narrow with \
+                     `if (x instanceof …)` first"
+                )),
+            })?;
+
+        // Polymorphic dispatch via call_indirect. Standard idiom: load
+        // vtable pointer at offset 0, index by slot, call_indirect with a
+        // synthesized type for `(this, params...) -> ret`.
+        if let Some(recv_local) = self.method_receiver_override {
+            self.push(Instruction::LocalGet(recv_local));
+        } else {
+            self.emit_expr(&member.object)?;
+        }
+        let this_tmp = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalTee(this_tmp));
+
+        // Emit args. We thread `param_classes` from the resolved
+        // representative `MethodSig` — for shared methods inherited from a
+        // common ancestor (the typical Phase 2 case) every variant points
+        // at the same record, so this is the right hint.
+        for (i, arg) in call.arguments.iter().enumerate() {
+            let expr = arg.to_expression();
+            let expected = sig.param_classes.get(i).and_then(|c| c.as_deref());
+            match (expr, expected) {
+                (Expression::ObjectExpression(obj), Some(en)) => {
+                    self.emit_object_literal(obj, Some(en))?;
+                }
+                (Expression::ArrayExpression(arr), Some(en)) if self.is_tuple_shape(en) => {
+                    self.emit_tuple_literal(arr, en)?;
+                }
+                _ => {
+                    self.emit_expr_coerced(expr, expected)?;
+                }
+            }
+        }
+
+        // Load vtable pointer from this (offset 0), then table index at
+        // slot offset.
+        self.push(Instruction::LocalGet(this_tmp));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: (slot as u64) * 4,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // Synthesize the call_indirect type signature.
+        let mut param_types = vec![ValType::I32]; // this
+        for (_pname, pty) in &sig.params {
+            if let Some(vt) = pty.to_val_type() {
+                param_types.push(vt);
+            }
+        }
+        let result_types = crate::codegen::wasm_types::wasm_results(sig.return_type);
+        let type_idx = self
+            .module_ctx
+            .get_or_add_type_sig(param_types, result_types);
+        self.push(Instruction::CallIndirect {
+            type_index: type_idx,
+            table_index: 0,
+        });
+
+        Ok(sig.return_type)
+    }
+
     /// Emit `super(args)` — call parent constructor with `this` pointer.
     pub(crate) fn emit_super_constructor_call(
         &mut self,
@@ -1000,8 +1162,13 @@ impl<'a> FuncContext<'a> {
         match expr {
             Expression::Identifier(ident) => {
                 let name = ident.name.as_str();
-                if let Some(class_name) = self.local_class_types.get(name) {
-                    return Ok(class_name.clone());
+                // `current_class_of` consults the refinement env first and
+                // falls back to the declared class name — so inside a
+                // narrowed branch, `sh` resolves to its refined variant and
+                // all downstream consumers (coerce, member access, method
+                // dispatch) pick up the refinement automatically.
+                if let Some(class_name) = self.current_class_of(name) {
+                    return Ok(class_name.to_string());
                 }
                 Err(CompileError::codegen(format!(
                     "cannot resolve class type of variable '{name}'"
@@ -1023,6 +1190,7 @@ impl<'a> FuncContext<'a> {
                                 p,
                                 &self.module_ctx.class_names,
                                 self.type_bindings.as_ref(),
+                                &self.module_ctx.non_i32_union_wasm_types,
                             )?;
                             tokens.push(bt.mangle_token());
                         }
@@ -1134,6 +1302,7 @@ impl<'a> FuncContext<'a> {
                 if let Some(class_name) = crate::types::get_class_type_name_from_ts_type(
                     &as_expr.type_annotation,
                     Some(&self.module_ctx.shape_registry),
+                    Some(&self.module_ctx.union_registry),
                 ) && self.module_ctx.class_names.contains(&class_name)
                 {
                     return Ok(class_name);

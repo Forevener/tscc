@@ -4,7 +4,7 @@ use wasm_encoder::Instruction;
 use crate::codegen::classes::ClassLayout;
 use crate::codegen::coerce::{emit_field_load, emit_field_store};
 use crate::codegen::func::FuncContext;
-use crate::codegen::shapes::{ShapeField, fingerprint_of};
+use crate::codegen::shapes::{ShapeField, TagValue, fingerprint_of};
 use crate::error::CompileError;
 use crate::types::{BoundType, WasmType};
 
@@ -44,11 +44,13 @@ impl<'a> FuncContext<'a> {
             .clone();
 
         if has_spread(obj) {
+            check_tag_values(self, obj, &class_name)?;
             emit_with_spreads(self, obj, &layout)?;
             return Ok((WasmType::I32, class_name));
         }
 
         check_property_set(self, obj, &layout)?;
+        check_tag_values(self, obj, &class_name)?;
 
         if all_properties_pure(obj) {
             emit_inline(self, obj, &layout)?;
@@ -114,6 +116,118 @@ fn check_property_set<'a>(
     }
 
     Ok(())
+}
+
+
+/// Validate literal-tagged fields. When a target shape declares a field as
+/// a literal type (`kind: 'circle'`), the initializer for that field in any
+/// object literal targeting this shape must be a matching literal expression.
+/// Other initializers for non-tagged fields are unaffected.
+///
+/// Spread-source fields aren't checked here — Phase 1 only validates
+/// explicit `key: value` properties. A spread that fills a tagged field
+/// silently passes the source's runtime value through; the type-check side
+/// of the spread already enforces field-by-field type compatibility.
+fn check_tag_values<'a>(
+    ctx: &FuncContext<'a>,
+    obj: &ObjectExpression<'a>,
+    class_name: &str,
+) -> Result<(), CompileError> {
+    let Some(shape) = ctx.module_ctx.shape_registry.get_by_name(class_name) else {
+        return Ok(());
+    };
+    let mut tagged: std::collections::HashMap<&str, &TagValue> =
+        std::collections::HashMap::new();
+    for f in &shape.fields {
+        if let Some(tv) = &f.tag_value {
+            tagged.insert(f.name.as_str(), tv);
+        }
+    }
+    if tagged.is_empty() {
+        return Ok(());
+    }
+    for prop in &obj.properties {
+        let ObjectPropertyKind::ObjectProperty(p) = prop else {
+            continue;
+        };
+        let key = extract_property_key(p)?;
+        let Some(&expected) = tagged.get(key.as_str()) else {
+            continue;
+        };
+        match expr_to_tag_value(&p.value) {
+            Some(actual) if &actual == expected => {}
+            Some(actual) => {
+                return Err(ctx.locate(
+                    CompileError::type_err(format!(
+                        "field '{key}' of type '{}' has literal type {} — \
+                         initializer must be exactly {}, got {}",
+                        class_name,
+                        format_tag(expected),
+                        format_tag(expected),
+                        format_tag(&actual),
+                    )),
+                    p.span.start,
+                ));
+            }
+            None => {
+                return Err(ctx.locate(
+                    CompileError::type_err(format!(
+                        "field '{key}' of type '{}' has literal type {} — \
+                         initializer must be exactly that literal, not a non-literal expression",
+                        class_name,
+                        format_tag(expected),
+                    )),
+                    p.span.start,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extract a `TagValue` from a literal expression. Used by the
+/// discriminator-predicate recognizer (`func.rs::recognize_narrowing_facts`)
+/// to decode the right-hand side of `x.f === LIT` / `x === LIT` in if-test
+/// position, mirroring the tag encoding used for `TSLiteralType` fields.
+/// Returns `None` for non-literal expressions.
+pub(crate) fn expr_to_tag_value(expr: &Expression<'_>) -> Option<TagValue> {
+    match expr {
+        Expression::StringLiteral(s) => Some(TagValue::Str(s.value.as_str().to_string())),
+        Expression::BooleanLiteral(b) => Some(TagValue::Bool(b.value)),
+        Expression::NumericLiteral(n) => Some(numeric_tag(n.value, n.raw.as_deref())),
+        Expression::UnaryExpression(u) if matches!(u.operator, UnaryOperator::UnaryNegation) => {
+            let Expression::NumericLiteral(inner) = &u.argument else {
+                return None;
+            };
+            Some(match numeric_tag(inner.value, inner.raw.as_deref()) {
+                TagValue::I32(n) => TagValue::I32(-n),
+                TagValue::F64(n) => TagValue::F64(-n),
+                _ => unreachable!("numeric_tag returns I32 or F64"),
+            })
+        }
+        Expression::ParenthesizedExpression(p) => expr_to_tag_value(&p.expression),
+        _ => None,
+    }
+}
+
+fn numeric_tag(value: f64, raw: Option<&str>) -> TagValue {
+    let is_float = raw.is_some_and(|r| r.contains('.'))
+        || value.fract() != 0.0
+        || !((i32::MIN as f64)..=(i32::MAX as f64)).contains(&value);
+    if is_float {
+        TagValue::F64(value)
+    } else {
+        TagValue::I32(value as i32)
+    }
+}
+
+fn format_tag(tv: &TagValue) -> String {
+    match tv {
+        TagValue::Str(s) => format!("'{s}'"),
+        TagValue::F64(n) => format!("{n}"),
+        TagValue::I32(n) => format!("{n}"),
+        TagValue::Bool(b) => format!("{b}"),
+    }
 }
 
 fn reject_unsupported_properties<'a>(
@@ -198,6 +312,14 @@ fn has_spread(obj: &ObjectExpression<'_>) -> bool {
 
 /// Fingerprint this literal by inferring each RHS's `BoundType` standalone.
 /// Errors if any field resists standalone inference — this is the P1 case.
+///
+/// Sub-phase 2: tag-value-aware fingerprint. String/integer-literal field
+/// values produce a tag-bearing `ShapeField`; the registry is probed first
+/// at the tagged granularity so a literal like `{kind: 'circle', r: 1.0}`
+/// resolves to the `Circle` variant. If the tagged fingerprint isn't
+/// registered, we widen by stripping tags and look up again — that's the
+/// right answer for plain shape literals (`{x: 1, y: 2}`) where every
+/// sibling literal should land on the same anonymous class.
 fn fingerprint_object_expression<'a>(
     ctx: &FuncContext<'a>,
     obj: &ObjectExpression<'a>,
@@ -211,7 +333,7 @@ fn fingerprint_object_expression<'a>(
             ));
         };
         let key = extract_property_key(p)?;
-        let ty = literal_field_bound_type(ctx, &p.value).ok_or_else(|| {
+        let (ty, tag_value) = literal_field_bound_type(ctx, &p.value).ok_or_else(|| {
             ctx.locate(
                 CompileError::type_err(format!(
                     "cannot infer shape of object literal — field '{key}' needs an explicit \
@@ -221,77 +343,116 @@ fn fingerprint_object_expression<'a>(
                 p.span.start,
             )
         })?;
-        fields.push(ShapeField { name: key, ty });
+        fields.push(ShapeField {
+            name: key,
+            ty,
+            tag_value,
+        });
     }
-    Ok(fingerprint_of(&fields))
+    let tagged_fp = fingerprint_of(&fields);
+    if ctx
+        .module_ctx
+        .shape_registry
+        .get_by_fingerprint(&tagged_fp)
+        .is_some()
+    {
+        return Ok(tagged_fp);
+    }
+    // No registered shape at the tagged granularity. Drop tags and let the
+    // caller's lookup decide: a registered untagged shape resolves; anything
+    // else surfaces as the existing "cannot infer shape" diagnostic.
+    let untagged: Vec<ShapeField> = fields
+        .into_iter()
+        .map(|f| ShapeField {
+            name: f.name,
+            ty: f.ty,
+            tag_value: None,
+        })
+        .collect();
+    Ok(fingerprint_of(&untagged))
 }
 
 /// Narrow, standalone expression typer for fingerprinting. Mirrors
 /// `shapes.rs::ShapeWalker::infer_expr_bound_type` but runs at emit time so
 /// it can consult `local_class_types` / `local_string_vars`. Returns `None`
 /// when the RHS cannot be typed without more context — the caller surfaces
-/// that as the "add an annotation" error.
+/// that as the "add an annotation" error. The optional `TagValue` carries
+/// the literal value for string/integer literals so `fingerprint_object_expression`
+/// can probe the registry at the discriminator-aware granularity.
 fn literal_field_bound_type<'a>(
     ctx: &FuncContext<'a>,
     expr: &Expression<'a>,
-) -> Option<BoundType> {
+) -> Option<(BoundType, Option<TagValue>)> {
     match expr {
-        Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Some(BoundType::Str),
-        Expression::BooleanLiteral(_) => Some(BoundType::Bool),
+        Expression::StringLiteral(s) => Some((
+            BoundType::Str,
+            Some(TagValue::Str(s.value.as_str().to_string())),
+        )),
+        Expression::TemplateLiteral(_) => Some((BoundType::Str, None)),
+        Expression::BooleanLiteral(_) => Some((BoundType::Bool, None)),
         Expression::NumericLiteral(lit) => {
             let is_float = lit.raw.as_ref().is_some_and(|r| r.contains('.'))
                 || lit.value.fract() != 0.0
                 || !((i32::MIN as f64)..=(i32::MAX as f64)).contains(&lit.value);
             Some(if is_float {
-                BoundType::F64
+                (BoundType::F64, None)
             } else {
-                BoundType::I32
+                (BoundType::I32, Some(TagValue::I32(lit.value as i32)))
             })
         }
         Expression::NullLiteral(_) => None,
         Expression::ParenthesizedExpression(p) => literal_field_bound_type(ctx, &p.expression),
         Expression::UnaryExpression(u) if matches!(u.operator, UnaryOperator::UnaryNegation) => {
-            literal_field_bound_type(ctx, &u.argument)
+            match literal_field_bound_type(ctx, &u.argument)? {
+                (bt, Some(TagValue::I32(n))) => Some((bt, Some(TagValue::I32(-n)))),
+                (bt, _) => Some((bt, None)),
+            }
         }
         Expression::TSAsExpression(a) => {
             // Trust the cast when we can resolve the target.
             if let Some(class_name) = crate::types::get_class_type_name_from_ts_type(
                 &a.type_annotation,
                 Some(&ctx.module_ctx.shape_registry),
+                Some(&ctx.module_ctx.union_registry),
             ) && ctx.module_ctx.class_names.contains(&class_name)
             {
-                return Some(BoundType::Class(class_name));
+                return Some((BoundType::Class(class_name), None));
             }
-            let ty = crate::types::resolve_ts_type(&a.type_annotation, &ctx.module_ctx.class_names)
-                .ok()?;
+            let ty = crate::types::resolve_ts_type_full(
+                &a.type_annotation,
+                &ctx.module_ctx.class_names,
+                ctx.type_bindings.as_ref(),
+                Some(&ctx.module_ctx.non_i32_union_wasm_types),
+            )
+            .ok()?;
             Some(match ty {
-                WasmType::F64 => BoundType::F64,
-                WasmType::I32 => BoundType::I32,
+                WasmType::F64 => (BoundType::F64, None),
+                WasmType::I32 => (BoundType::I32, None),
                 WasmType::Void => return None,
             })
         }
         Expression::Identifier(ident) => {
             let name = ident.name.as_str();
             if let Some(cn) = ctx.local_class_types.get(name) {
-                return Some(BoundType::Class(cn.clone()));
+                return Some((BoundType::Class(cn.clone()), None));
             }
             if ctx.local_string_vars.contains(name) {
-                return Some(BoundType::Str);
+                return Some((BoundType::Str, None));
             }
             if let Some(&(_, ty)) = ctx.locals.get(name) {
                 return Some(match ty {
-                    WasmType::F64 => BoundType::F64,
-                    WasmType::I32 => BoundType::I32,
+                    WasmType::F64 => (BoundType::F64, None),
+                    WasmType::I32 => (BoundType::I32, None),
                     WasmType::Void => return None,
                 });
             }
             if let Some(cn) = ctx.module_ctx.var_class_types.get(name) {
-                return Some(BoundType::Class(cn.clone()));
+                return Some((BoundType::Class(cn.clone()), None));
             }
             if let Some(&(_, ty)) = ctx.module_ctx.globals.get(name) {
                 return Some(match ty {
-                    WasmType::F64 => BoundType::F64,
-                    WasmType::I32 => BoundType::I32,
+                    WasmType::F64 => (BoundType::F64, None),
+                    WasmType::I32 => (BoundType::I32, None),
                     WasmType::Void => return None,
                 });
             }
@@ -309,25 +470,30 @@ fn literal_field_bound_type<'a>(
                         p,
                         &ctx.module_ctx.class_names,
                         ctx.type_bindings.as_ref(),
+                        &ctx.module_ctx.non_i32_union_wasm_types,
                     )
                     .ok()?;
                     tokens.push(bt.mangle_token());
                 }
                 let mangled = format!("{base}${}", tokens.join("$"));
                 if ctx.module_ctx.class_names.contains(&mangled) {
-                    return Some(BoundType::Class(mangled));
+                    return Some((BoundType::Class(mangled), None));
                 }
             }
             if ctx.module_ctx.class_names.contains(base) {
-                return Some(BoundType::Class(base.to_string()));
+                return Some((BoundType::Class(base.to_string()), None));
             }
             None
         }
         Expression::ObjectExpression(inner) => {
-            // Nested literal: recurse through the same inference. A.1 will
-            // have pre-registered the shape whenever its fields are
+            // Nested literal: recurse through the same inference. Pass 0
+            // pre-registers the shape whenever its fields are
             // standalone-inferable — which is exactly the case this function
-            // returns `Some` for.
+            // returns `Some` for. Apply the same tagged-then-untagged
+            // fallback used by the outer fingerprint so a nested
+            // discriminated-union variant resolves at the tag-bearing
+            // granularity, while plain nested literals widen to the
+            // shared anonymous shape.
             let mut inner_fields: Vec<ShapeField> = Vec::with_capacity(inner.properties.len());
             for prop in &inner.properties {
                 let ObjectPropertyKind::ObjectProperty(p) = prop else {
@@ -341,14 +507,30 @@ fn literal_field_bound_type<'a>(
                     PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
                     _ => return None,
                 };
-                let ty = literal_field_bound_type(ctx, &p.value)?;
-                inner_fields.push(ShapeField { name: key, ty });
+                let (ty, tag_value) = literal_field_bound_type(ctx, &p.value)?;
+                inner_fields.push(ShapeField {
+                    name: key,
+                    ty,
+                    tag_value,
+                });
             }
-            let fp = fingerprint_of(&inner_fields);
+            let tagged_fp = fingerprint_of(&inner_fields);
+            if let Some(s) = ctx.module_ctx.shape_registry.get_by_fingerprint(&tagged_fp) {
+                return Some((BoundType::Class(s.name.clone()), None));
+            }
+            let untagged: Vec<ShapeField> = inner_fields
+                .into_iter()
+                .map(|f| ShapeField {
+                    name: f.name,
+                    ty: f.ty,
+                    tag_value: None,
+                })
+                .collect();
+            let untagged_fp = fingerprint_of(&untagged);
             ctx.module_ctx
                 .shape_registry
-                .get_by_fingerprint(&fp)
-                .map(|s| BoundType::Class(s.name.clone()))
+                .get_by_fingerprint(&untagged_fp)
+                .map(|s| (BoundType::Class(s.name.clone()), None))
         }
         _ => None,
     }

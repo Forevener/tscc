@@ -11,7 +11,7 @@ use oxc_ast::ast::*;
 
 use super::super::generics::{GenericClassTemplate, GenericFnTemplate, resolve_bound_type};
 use super::fingerprint::{fingerprint_of, property_signature_key, tuple_fingerprint_of};
-use super::{ANON_SHAPE_PREFIX, Shape, ShapeField, ShapeKind, ShapeRegistry, TUPLE_SHAPE_PREFIX};
+use super::{ANON_SHAPE_PREFIX, Shape, ShapeField, ShapeKind, ShapeRegistry, TUPLE_SHAPE_PREFIX, TagValue};
 use crate::error::CompileError;
 use crate::types::{BoundType, TypeBindings};
 
@@ -146,6 +146,11 @@ pub(super) struct ShapeWalker<'a, 'ctx> {
     /// shape (e.g. `type Outer = { inner: Inner }`) before Pass 0a-v
     /// merges shape names into the module-level `class_names`.
     pub(super) class_names: HashSet<String>,
+    /// Non-`I32` named-union `WasmType`s — threaded into
+    /// `resolve_bound_type` so generic-arg resolution inside shape bodies
+    /// (`type Wrap = { value: Box<Half> }`) gets the right WasmType for
+    /// pure-`f64`-literal unions.
+    pub(super) non_i32_union_wasm_types: &'ctx HashMap<String, crate::types::WasmType>,
     pub(super) class_templates: &'ctx HashMap<String, GenericClassTemplate<'a>>,
     pub(super) fn_templates: &'ctx HashMap<String, GenericFnTemplate<'a>>,
     /// Generic shape templates discovered in Pass 1b. Consulted during
@@ -531,9 +536,9 @@ impl<'a> ShapeWalker<'a, '_> {
                     let m = self.instantiate_generic_shape(tn, inner_args, bindings)?;
                     return Ok(BoundType::Class(m));
                 }
-                resolve_bound_type(ts_type, &self.class_names, bindings)
+                resolve_bound_type(ts_type, &self.class_names, bindings, self.non_i32_union_wasm_types)
             }
-            _ => resolve_bound_type(ts_type, &self.class_names, bindings),
+            _ => resolve_bound_type(ts_type, &self.class_names, bindings, self.non_i32_union_wasm_types),
         }
     }
 
@@ -645,9 +650,14 @@ impl<'a> ShapeWalker<'a, '_> {
                             "shape property '{name}' requires a type annotation"
                         ))
                     })?;
-                    let ty = self.resolve_field_type(&ann.type_annotation, bindings)?;
+                    let (ty, tag_value) =
+                        self.resolve_field_type_with_tag(&ann.type_annotation, bindings)?;
                     seen_names.insert(name.clone());
-                    fields.push(ShapeField { name, ty });
+                    fields.push(ShapeField {
+                        name,
+                        ty,
+                        tag_value,
+                    });
                 }
                 TSSignature::TSMethodSignature(_) => {
                     return Err(CompileError::unsupported(
@@ -713,11 +723,32 @@ impl<'a> ShapeWalker<'a, '_> {
                     let m = self.instantiate_generic_shape(tn, inner_args, bindings)?;
                     return Ok(BoundType::Class(m));
                 }
-                resolve_bound_type(ts_type, &self.class_names, bindings)
+                resolve_bound_type(ts_type, &self.class_names, bindings, self.non_i32_union_wasm_types)
             }
-            _ => resolve_bound_type(ts_type, &self.class_names, bindings),
+            _ => resolve_bound_type(ts_type, &self.class_names, bindings, self.non_i32_union_wasm_types),
         }
     }
+
+    /// Resolve a property-signature field type, capturing the literal
+    /// `tag_value` when the annotation is a `TSLiteralType` (e.g.
+    /// `kind: 'circle'`, `code: 1`, `flag: true`). The underlying `ty`
+    /// stays at the primitive level — the tag drives discriminator
+    /// narrowing in unions and validates initializers in object literals.
+    /// Anything other than a `TSLiteralType` falls through to the regular
+    /// `resolve_field_type` with `tag_value = None`.
+    fn resolve_field_type_with_tag(
+        &mut self,
+        ts_type: &'a TSType<'a>,
+        bindings: Option<&TypeBindings>,
+    ) -> Result<(BoundType, Option<TagValue>), CompileError> {
+        if let TSType::TSLiteralType(lit) = ts_type {
+            let (bound, tag) = literal_type_to_tag(&lit.literal)?;
+            return Ok((bound, Some(tag)));
+        }
+        let bound = self.resolve_field_type(ts_type, bindings)?;
+        Ok((bound, None))
+    }
+
 
     /// Register (or dedupe into) a tuple shape for a `TSTupleType` node.
     /// Returns the tuple's registered class name (`__Tuple$...`). Element
@@ -780,6 +811,7 @@ impl<'a> ShapeWalker<'a, '_> {
             .map(|(i, ty)| ShapeField {
                 name: format!("_{i}"),
                 ty: ty.clone(),
+                tag_value: None,
             })
             .collect();
         let fp = tuple_fingerprint_of(&element_tys);
@@ -1175,15 +1207,39 @@ impl<'a> ShapeWalker<'a, '_> {
                     "duplicate property '{key}' in object literal"
                 )));
             }
-            let Some(ty) = self.infer_expr_bound_type(&p.value)? else {
+            let Some((ty, tag_value)) = self.infer_expr_bound_type(&p.value)? else {
                 // Not inferable standalone. Leave to emit-time lazy
                 // registration (planned for Phase A.2).
                 return Ok(());
             };
             seen.insert(key.clone());
-            fields.push(ShapeField { name: key, ty });
+            fields.push(ShapeField {
+                name: key,
+                ty,
+                tag_value,
+            });
         }
-        let _ = self.insert_shape(ShapeKind::Anonymous, None, fields)?;
+        // Sub-phase 2: try the tagged fingerprint first so a literal like
+        // `{kind: 'circle', r: 1.0}` aliases into a registered `Circle`
+        // variant. If no shape matches at that granularity, fall back to
+        // the untagged fingerprint — that's the right answer for plain
+        // shape literals (`{x: 1, y: 2}`) where every sibling literal
+        // should share one anonymous class. Registration of new anonymous
+        // shapes always uses the untagged fields so per-value classes
+        // never escape to the source language.
+        let tagged_fp = fingerprint_of(&fields);
+        if self.registry.by_fingerprint.contains_key(&tagged_fp) {
+            return Ok(());
+        }
+        let any_tag = fields.iter().any(|f| f.tag_value.is_some());
+        let untagged_fields = strip_tag_values(fields);
+        if any_tag {
+            let untagged_fp = fingerprint_of(&untagged_fields);
+            if self.registry.by_fingerprint.contains_key(&untagged_fp) {
+                return Ok(());
+            }
+        }
+        let _ = self.insert_shape(ShapeKind::Anonymous, None, untagged_fields)?;
         Ok(())
     }
 
@@ -1193,31 +1249,51 @@ impl<'a> ShapeWalker<'a, '_> {
     /// known class. Returns `Ok(None)` for anything else — Phase A.2 will
     /// handle these at emit time when full locals/function context is
     /// available.
+    ///
+    /// The optional second tuple element captures the literal value for
+    /// string and integer literals (including negative-integer
+    /// `UnaryExpression(-, _)`). Sub-phase 2 of plan-unions consumes this so
+    /// `{kind: 'circle', r: 1.0}` fingerprints into the matching `Circle`
+    /// variant without an `as Circle` cast. F64 / boolean / template-literal
+    /// values intentionally don't carry a tag — distinguishing
+    /// `{x: 1.0}` from `{x: 2.0}` would split plain shape literals into
+    /// per-value classes; the caller's tagged-then-untagged fingerprint
+    /// fallback widens to the shared shape only when a tag isn't load-bearing.
     fn infer_expr_bound_type(
         &mut self,
         expr: &'a Expression<'a>,
-    ) -> Result<Option<BoundType>, CompileError> {
+    ) -> Result<Option<(BoundType, Option<TagValue>)>, CompileError> {
         Ok(match expr {
             Expression::NumericLiteral(lit) => {
                 let is_float = lit.raw.as_ref().is_some_and(|r| r.contains('.'))
                     || lit.value.fract() != 0.0
                     || !((i32::MIN as f64)..=(i32::MAX as f64)).contains(&lit.value);
                 Some(if is_float {
-                    BoundType::F64
+                    (BoundType::F64, None)
                 } else {
-                    BoundType::I32
+                    (BoundType::I32, Some(TagValue::I32(lit.value as i32)))
                 })
             }
-            Expression::BooleanLiteral(_) => Some(BoundType::Bool),
-            Expression::StringLiteral(_) | Expression::TemplateLiteral(_) => Some(BoundType::Str),
+            Expression::BooleanLiteral(_) => Some((BoundType::Bool, None)),
+            Expression::StringLiteral(s) => Some((
+                BoundType::Str,
+                Some(TagValue::Str(s.value.as_str().to_string())),
+            )),
+            Expression::TemplateLiteral(_) => Some((BoundType::Str, None)),
             Expression::NullLiteral(_) => None,
             Expression::UnaryExpression(u) if matches!(u.operator, UnaryOperator::UnaryNegation) => {
-                self.infer_expr_bound_type(&u.argument)?
+                match self.infer_expr_bound_type(&u.argument)? {
+                    Some((bt, Some(TagValue::I32(n)))) => Some((bt, Some(TagValue::I32(-n)))),
+                    Some((bt, _)) => Some((bt, None)),
+                    None => None,
+                }
             }
             Expression::ParenthesizedExpression(p) => self.infer_expr_bound_type(&p.expression)?,
             Expression::TSAsExpression(a) => {
                 // Trust the user's cast, provided we can resolve the target.
-                resolve_bound_type(&a.type_annotation, &self.class_names, None).ok()
+                resolve_bound_type(&a.type_annotation, &self.class_names, None, self.non_i32_union_wasm_types)
+                    .ok()
+                    .map(|bt| (bt, None))
             }
             Expression::NewExpression(n) => {
                 let Expression::Identifier(id) = &n.callee else {
@@ -1225,7 +1301,7 @@ impl<'a> ShapeWalker<'a, '_> {
                 };
                 let base = id.name.as_str();
                 if self.class_names.contains(base) && n.type_arguments.is_none() {
-                    return Ok(Some(BoundType::Class(base.to_string())));
+                    return Ok(Some((BoundType::Class(base.to_string()), None)));
                 }
                 if let Some(tpl) = self.class_templates.get(base)
                     && let Some(args) = n.type_arguments.as_ref()
@@ -1235,15 +1311,15 @@ impl<'a> ShapeWalker<'a, '_> {
                     }
                     let mut tokens = Vec::with_capacity(args.params.len());
                     for a in &args.params {
-                        match resolve_bound_type(a, &self.class_names, None) {
+                        match resolve_bound_type(a, &self.class_names, None, self.non_i32_union_wasm_types) {
                             Ok(bt) => tokens.push(bt.mangle_token()),
                             Err(_) => return Ok(None),
                         }
                     }
-                    return Ok(Some(BoundType::Class(format!(
-                        "{base}${}",
-                        tokens.join("$")
-                    ))));
+                    return Ok(Some((
+                        BoundType::Class(format!("{base}${}", tokens.join("$"))),
+                        None,
+                    )));
                 }
                 None
             }
@@ -1259,17 +1335,15 @@ impl<'a> ShapeWalker<'a, '_> {
                     // matched an already-registered one. Handle that via
                     // fingerprint recomputation, if the fingerprint is
                     // inferable.
-                    return Ok(
-                        self.try_fingerprint_for_object(inner)?
-                            .and_then(|fp| {
-                                self.registry
-                                    .get_by_fingerprint(&fp)
-                                    .map(|s| BoundType::Class(s.name.clone()))
-                            }),
-                    );
+                    return Ok(self.try_fingerprint_for_object(inner)?.and_then(|fp| {
+                        self.registry
+                            .get_by_fingerprint(&fp)
+                            .map(|s| (BoundType::Class(s.name.clone()), None))
+                    }));
                 }
-                Some(BoundType::Class(
-                    self.registry.shapes.last().unwrap().name.clone(),
+                Some((
+                    BoundType::Class(self.registry.shapes.last().unwrap().name.clone()),
+                    None,
                 ))
             }
             _ => None,
@@ -1279,6 +1353,11 @@ impl<'a> ShapeWalker<'a, '_> {
     /// Like `try_register_anonymous_from_object` but read-only: compute the
     /// fingerprint if every field is inferable. Used by `infer_expr_bound_type`
     /// when a nested literal aliases to an already-registered shape.
+    ///
+    /// Returns the tagged fingerprint when one is registered (so a literal
+    /// matching a discriminated-union variant resolves to the variant), and
+    /// otherwise the untagged fingerprint — same fallback rule as
+    /// `try_register_anonymous_from_object`.
     fn try_fingerprint_for_object(
         &mut self,
         obj: &'a ObjectExpression<'a>,
@@ -1296,12 +1375,20 @@ impl<'a> ShapeWalker<'a, '_> {
                 PropertyKey::StringLiteral(s) => s.value.as_str().to_string(),
                 _ => return Ok(None),
             };
-            let Some(ty) = self.infer_expr_bound_type(&p.value)? else {
+            let Some((ty, tag_value)) = self.infer_expr_bound_type(&p.value)? else {
                 return Ok(None);
             };
-            fields.push(ShapeField { name: key, ty });
+            fields.push(ShapeField {
+                name: key,
+                ty,
+                tag_value,
+            });
         }
-        Ok(Some(fingerprint_of(&fields)))
+        let tagged_fp = fingerprint_of(&fields);
+        if self.registry.by_fingerprint.contains_key(&tagged_fp) {
+            return Ok(Some(tagged_fp));
+        }
+        Ok(Some(fingerprint_of(&strip_tag_values(fields))))
     }
 
     // -- shared insertion ---------------------------------------------------
@@ -1367,5 +1454,77 @@ impl<'a> ShapeWalker<'a, '_> {
         self.registry.by_fingerprint.insert(fp, idx);
         self.registry.by_name.insert(name.clone(), idx);
         Ok((name, idx))
+    }
+}
+
+/// Drop tag values from each field, preserving names and underlying types.
+/// Used by sub-phase 2's tagged-then-untagged fingerprint fallback to
+/// recover the plain-shape match for literals where the tag isn't
+/// load-bearing (`{x: 1, y: 2}` widens to `{x: i32, y: i32}` rather than
+/// becoming a per-value class).
+fn strip_tag_values(fields: Vec<ShapeField>) -> Vec<ShapeField> {
+    fields
+        .into_iter()
+        .map(|f| ShapeField {
+            name: f.name,
+            ty: f.ty,
+            tag_value: None,
+        })
+        .collect()
+}
+
+/// Decode a `TSLiteralType` body into the underlying `BoundType` plus the
+/// captured `TagValue`. The string literal `'circle'` becomes
+/// `(BoundType::Str, TagValue::Str("circle"))`; the numeric literal `1`
+/// becomes `(BoundType::I32, TagValue::I32(1))` (or `F64` if it has a
+/// fractional part / overflows i32 range, mirroring
+/// `infer_expr_bound_type`); the boolean literal `true` becomes
+/// `(BoundType::Bool, TagValue::Bool(true))`. Negative numbers via
+/// `UnaryExpression(-, NumericLiteral)` are supported. BigInt and
+/// template literals are rejected — Phase 1 scope.
+pub(crate) fn literal_type_to_tag(
+    lit: &TSLiteral<'_>,
+) -> Result<(BoundType, TagValue), CompileError> {
+    match lit {
+        TSLiteral::StringLiteral(s) => Ok((
+            BoundType::Str,
+            TagValue::Str(s.value.as_str().to_string()),
+        )),
+        TSLiteral::BooleanLiteral(b) => Ok((BoundType::Bool, TagValue::Bool(b.value))),
+        TSLiteral::NumericLiteral(n) => Ok(decode_number_literal(n.value, n.raw.as_deref())),
+        TSLiteral::UnaryExpression(u) if matches!(u.operator, UnaryOperator::UnaryNegation) => {
+            let Expression::NumericLiteral(inner) = &u.argument else {
+                return Err(CompileError::unsupported(
+                    "literal type with unary operator other than negation of a numeric literal",
+                ));
+            };
+            let (bt, tv) = decode_number_literal(inner.value, inner.raw.as_deref());
+            let neg = match tv {
+                TagValue::I32(n) => TagValue::I32(-n),
+                TagValue::F64(n) => TagValue::F64(-n),
+                _ => unreachable!("decode_number_literal returns I32 or F64"),
+            };
+            Ok((bt, neg))
+        }
+        TSLiteral::UnaryExpression(_) => Err(CompileError::unsupported(
+            "literal type with unsupported unary operator (only negation `-` is allowed)",
+        )),
+        TSLiteral::BigIntLiteral(_) => Err(CompileError::unsupported(
+            "BigInt literal type — not supported (Phase 1 union scope)",
+        )),
+        TSLiteral::TemplateLiteral(_) => Err(CompileError::unsupported(
+            "template-literal type — not supported (Phase 1 union scope)",
+        )),
+    }
+}
+
+fn decode_number_literal(value: f64, raw: Option<&str>) -> (BoundType, TagValue) {
+    let is_float = raw.is_some_and(|r| r.contains('.'))
+        || value.fract() != 0.0
+        || !((i32::MIN as f64)..=(i32::MAX as f64)).contains(&value);
+    if is_float {
+        (BoundType::F64, TagValue::F64(value))
+    } else {
+        (BoundType::I32, TagValue::I32(value as i32))
     }
 }

@@ -42,6 +42,12 @@ pub struct ModuleContext {
     pub class_registry: ClassRegistry,
     /// Set of known class names (for type resolution)
     pub class_names: HashSet<String>,
+    /// Named unions whose `WasmType` is **not** `I32` — typically pure-`f64`
+    /// literal unions (`type X = 0.5 | 1.5`). Consulted by the type resolver
+    /// to override the default-`I32` behaviour for `class_names`-resident
+    /// names. Empty in the common case (zero overhead when no `f64` unions
+    /// appear in the program).
+    pub non_i32_union_wasm_types: HashMap<String, WasmType>,
     /// Index of the __arena_ptr global (if arena is used)
     pub arena_ptr_global: Option<u32>,
     /// Map from "ClassName.methodName" to wasm func index
@@ -101,6 +107,11 @@ pub struct ModuleContext {
     /// `ObjectExpression`) shape, deduped by its sort-by-name fingerprint.
     /// Phase A.2 consumes this to register synthetic class layouts.
     pub shape_registry: super::shapes::ShapeRegistry,
+    /// Union types discovered in the program (`type X = A | B`, inline
+    /// `function f(x: A | B)`). Populated by `discover_unions` immediately
+    /// after shape discovery so that union members can resolve to registered
+    /// shape names. Empty when the program contains no unions.
+    pub union_registry: super::unions::UnionRegistry,
     /// Output of `register_string_helpers`, stashed here so that method-body
     /// codegen can build a `RewritePlan` to feed the L_splice splicer.
     /// `None` until that pass has run; never observed `None` from method code
@@ -155,6 +166,7 @@ impl ModuleContext {
             static_data_ptr: Cell::new(0),
             class_registry: ClassRegistry::new(),
             class_names: HashSet::new(),
+            non_i32_union_wasm_types: HashMap::new(),
             arena_ptr_global: None,
             method_map: HashMap::new(),
             var_class_types: HashMap::new(),
@@ -176,6 +188,7 @@ impl ModuleContext {
             inferred_fn_calls: HashMap::new(),
             hash_table_info: HashMap::new(),
             shape_registry: super::shapes::ShapeRegistry::default(),
+            union_registry: super::unions::UnionRegistry::default(),
             helper_registration: RefCell::new(None),
             fn_param_classes: HashMap::new(),
             fn_return_classes: HashMap::new(),
@@ -390,6 +403,15 @@ pub fn compile_module<'a>(
     let mut ctx = ModuleContext::new(host_module);
     ctx.arena_overflow = arena_overflow;
 
+    // Pass 0a-pre: pre-collect non-`I32` named-union `WasmType`s. Runs
+    // *before* template discovery / class collection / instantiation
+    // walking so `resolve_bound_type` (used by `mangle_parent_name` and
+    // `collect_instantiations`) can produce correct
+    // `BoundType::Union { name, wasm_ty }` for generic arguments like
+    // `Box<Half>` where `Half = 0.5 | 1.5`. Cheap: a single pass over
+    // top-level statements, inspecting only literal-typed alias bodies.
+    super::unions::collect_named_union_wasm_types(program, &mut ctx.non_i32_union_wasm_types);
+
     // Pass 0a: discover generic templates (classes + functions with type
     // parameters). These are NOT registered as concrete classes — only their
     // monomorphized instantiations are.
@@ -419,6 +441,7 @@ pub fn compile_module<'a>(
                 &ctx.class_names,
                 &class_templates,
                 None,
+                &ctx.non_i32_union_wasm_types,
             )?;
             ctx.class_names.insert(name.clone());
             class_info.push((name.clone(), parent));
@@ -441,6 +464,12 @@ pub fn compile_module<'a>(
     for name in super::shapes::prescan_shape_names(program) {
         generic_lookup_names.insert(name);
     }
+    // Also seed pre-collected named unions so `Box<Half>`-style
+    // instantiations can be walked even though full union discovery runs
+    // later. The final population still happens in Pass 0a-vi.
+    for name in ctx.non_i32_union_wasm_types.keys() {
+        generic_lookup_names.insert(name.clone());
+    }
     let super::generics::CollectResult {
         class_insts,
         fn_insts,
@@ -452,6 +481,7 @@ pub fn compile_module<'a>(
         &class_templates,
         &fn_templates,
         &generic_lookup_names,
+        &ctx.non_i32_union_wasm_types,
     )?;
     ctx.inferred_fn_calls = inferred_call_sites;
 
@@ -469,6 +499,7 @@ pub fn compile_module<'a>(
             &ctx.class_names,
             &class_templates,
             Some(&inst.bindings),
+            &ctx.non_i32_union_wasm_types,
         )?;
         class_info.push((inst.mangled_name.clone(), parent));
         class_ast_map.insert(inst.mangled_name.clone(), template.ast);
@@ -479,6 +510,15 @@ pub fn compile_module<'a>(
         ctx.fn_bindings
             .insert(inst.mangled_name.clone(), inst.bindings.clone());
     }
+
+    // Pass 0a-iia: compute polymorphism flags now that `class_info` is
+    // complete (concrete classes from -i + monomorphized classes from -ii).
+    // Hoisted here so Pass 0a-vi (`discover_unions`) can gate class-union
+    // members on `is_polymorphic`. The set is consumed unchanged by Pass 0c
+    // (`register_class` / `mark_polymorphic`); moving it earlier is safe
+    // because nothing between -iii and -vi reads it, and the underlying
+    // (name, parent) data is already final at this point.
+    let polymorphic = super::classes::find_polymorphic_classes(&class_info);
 
     // Pass 0a-iii: register compiler-owned Map<K, V> / Set<T> instantiations.
     // Maps and Sets live outside class_info/class_ast_map — they carry no
@@ -513,6 +553,7 @@ pub fn compile_module<'a>(
         &ctx.class_names,
         &class_templates,
         &fn_templates,
+        &ctx.non_i32_union_wasm_types,
     )?;
 
     // Pass 0a-v: register each discovered shape as a synthetic ClassLayout.
@@ -550,8 +591,43 @@ pub fn compile_module<'a>(
         ctx.class_names.insert(alias.clone());
     }
 
-    // Pass 0b: determine which classes are polymorphic and topological order
-    let polymorphic = super::classes::find_polymorphic_classes(&class_info);
+    // Pass 0a-vi: discover union types (`type X = A | B`, inline `A | B`).
+    // Runs after shape names are in `class_names` so union member references
+    // like `Circle | Square` resolve to registered shapes. Empty registry
+    // when the program contains no unions — zero-cost for non-union code.
+    // Receives the `polymorphic` set (computed in Pass 0a-iia) so the gate
+    // can reject class union members that don't carry a vtable pointer.
+    ctx.union_registry = super::unions::discover_unions(
+        program,
+        &ctx.class_names,
+        &ctx.shape_registry,
+        &polymorphic,
+    )?;
+    for n in ctx.union_registry.by_name.keys() {
+        ctx.class_names.insert(n.clone());
+    }
+    // Stash non-I32 union wasm types so the type resolver can override the
+    // default `class_names`-implies-I32 mapping for pure-`f64`-literal unions
+    // (`type X = 0.5 | 1.5`). Iterating `by_name` covers user-given names,
+    // synthetic `__Union$...` aliases, and the secondary aliases inserted
+    // when an inline union resolves to a pre-existing layout.
+    for (name, &idx) in &ctx.union_registry.by_name {
+        let layout = &ctx.union_registry.unions[idx];
+        if layout.wasm_ty != crate::types::WasmType::I32 {
+            ctx.non_i32_union_wasm_types
+                .insert(name.clone(), layout.wasm_ty);
+        }
+    }
+    // Pseudo-name for the `never` type so `: never` parameters / locals flow
+    // through the same `fn_param_classes` / `local_class_types` channel that
+    // shape and union targets use. Coerce checks consult `NEVER_CLASS_NAME`
+    // directly — no class layout is registered.
+    ctx.class_names
+        .insert(crate::types::NEVER_CLASS_NAME.to_string());
+
+    // Pass 0b: topological order for layout registration (parent before
+    // child). Polymorphism flags were already computed in Pass 0a-iia so the
+    // union gate could consume them; reused here unchanged.
     let sorted_classes = super::classes::topo_sort_classes(&class_info)?;
 
     // Pass 0c: register class layouts in dependency order (parent before child)
@@ -567,6 +643,8 @@ pub fn compile_module<'a>(
                 Some(name),
                 Some(&bindings),
                 Some(&ctx.shape_registry),
+                Some(&ctx.union_registry),
+                &ctx.non_i32_union_wasm_types,
             )?;
         } else {
             ctx.class_registry.register_class(
@@ -575,6 +653,8 @@ pub fn compile_module<'a>(
                 parent.clone(),
                 is_poly,
                 Some(&ctx.shape_registry),
+                Some(&ctx.union_registry),
+                &ctx.non_i32_union_wasm_types,
             )?;
         }
     }
@@ -686,7 +766,12 @@ pub fn compile_module<'a>(
             }
         }
 
-        // Build vtable data for each polymorphic class, collect offsets
+        // Build vtable data for each polymorphic class, collect offsets.
+        // Every polymorphic class allocates at least 4 bytes (one zero word)
+        // even when it has no methods — Phase 2 `instanceof` uses
+        // `vtable_offset` as the runtime discriminator, so each polymorphic
+        // class needs a unique address. Without the floor, methodless
+        // polymorphic classes would all alias offset 0.
         let mut vtable_offsets: Vec<(String, u32)> = Vec::new();
         for (class_name, _parent) in &sorted_classes {
             if !polymorphic.contains(class_name) {
@@ -694,13 +779,11 @@ pub fn compile_module<'a>(
             }
             let layout = ctx.class_registry.get(class_name).unwrap().clone();
             let num_methods = layout.vtable_methods.len();
-            if num_methods == 0 {
-                continue;
-            }
+            let alloc_bytes = ((num_methods * 4) as u32).max(4);
 
-            let vtable_offset = ctx.alloc_static((num_methods * 4) as u32);
+            let vtable_offset = ctx.alloc_static(alloc_bytes);
 
-            let mut vtable_data = Vec::with_capacity(num_methods * 4);
+            let mut vtable_data = Vec::with_capacity(alloc_bytes as usize);
             for method_name in &layout.vtable_methods {
                 let owner = find_method_declarer(
                     &ctx.method_map,
@@ -712,6 +795,12 @@ pub fn compile_module<'a>(
                 let mangled = format!("{owner}${method_name}");
                 let table_idx = ctx.method_table_indices[&mangled];
                 vtable_data.extend_from_slice(&(table_idx as i32).to_le_bytes());
+            }
+            // Pad up to the allocated size when methodless so the data
+            // segment matches `alloc_static`'s reservation. The padding
+            // bytes are never read — only the offset itself is consulted.
+            while vtable_data.len() < alloc_bytes as usize {
+                vtable_data.push(0);
             }
             ctx.static_data_entries
                 .borrow_mut()
@@ -1045,7 +1134,12 @@ fn collect_import_from_func(
         .name
         .as_str();
 
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, None)?;
+    let (params, ret) = extract_func_signature(
+        func_decl,
+        &ctx.class_names,
+        None,
+        &ctx.non_i32_union_wasm_types,
+    )?;
     let param_types: Vec<WasmType> = params.iter().map(|(_, ty)| *ty).collect();
     ctx.add_import(name, &param_types, ret)?;
     Ok(())
@@ -1076,10 +1170,15 @@ fn register_func_from_decl(
     is_export: bool,
     bindings: Option<&TypeBindings>,
 ) -> Result<(), CompileError> {
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, bindings)?;
+    let (params, ret) = extract_func_signature(
+        func_decl,
+        &ctx.class_names,
+        bindings,
+        &ctx.non_i32_union_wasm_types,
+    )?;
     // Track if this function returns a closure
     if let Some(ann) = &func_decl.return_type {
-        if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
+        if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names, &ctx.non_i32_union_wasm_types) {
             ctx.func_return_closure_sigs.insert(name.to_string(), sig);
         }
         // Track if this function returns a string (bindings-aware so a
@@ -1088,9 +1187,12 @@ fn register_func_from_decl(
             ctx.func_return_strings.insert(name.to_string());
         }
         // Track class-typed returns so `return {...};` can resolve the shape.
-        if let Some(class_name) =
-            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
-            && ctx.class_names.contains(&class_name)
+        if let Some(class_name) = types::get_class_type_name_with_bindings(
+            ann,
+            bindings,
+            Some(&ctx.shape_registry),
+            Some(&ctx.union_registry),
+        ) && ctx.class_names.contains(&class_name)
         {
             ctx.fn_return_classes.insert(name.to_string(), class_name);
         }
@@ -1100,8 +1202,13 @@ fn register_func_from_decl(
     let mut param_classes: Vec<Option<String>> = Vec::with_capacity(func_decl.params.items.len());
     for param in &func_decl.params.items {
         let class = param.type_annotation.as_ref().and_then(|ann| {
-            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
-                .filter(|cn| ctx.class_names.contains(cn))
+            types::get_class_type_name_with_bindings(
+                ann,
+                bindings,
+                Some(&ctx.shape_registry),
+                Some(&ctx.union_registry),
+            )
+            .filter(|cn| ctx.class_names.contains(cn))
         });
         param_classes.push(class);
     }
@@ -1116,6 +1223,7 @@ fn extract_func_signature(
     func_decl: &Function,
     class_names: &HashSet<String>,
     bindings: Option<&TypeBindings>,
+    union_overrides: &HashMap<String, WasmType>,
 ) -> Result<(Vec<(String, WasmType)>, WasmType), CompileError> {
     let mut params = Vec::new();
     for param in &func_decl.params.items {
@@ -1124,7 +1232,7 @@ fn extract_func_signature(
             _ => return Err(CompileError::unsupported("destructured parameter")),
         };
         let ty = if let Some(ann) = &param.type_annotation {
-            types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
+            types::resolve_type_annotation_with_unions(ann, class_names, bindings, union_overrides)?
         } else {
             return Err(CompileError::type_err(format!(
                 "parameter '{name}' requires a type annotation — tscc does not infer parameter types; write `{name}: i32` (or f64, bool, string, or a class name)"
@@ -1134,7 +1242,7 @@ fn extract_func_signature(
     }
 
     let ret = if let Some(ann) = &func_decl.return_type {
-        types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
+        types::resolve_type_annotation_with_unions(ann, class_names, bindings, union_overrides)?
     } else {
         WasmType::Void
     };
@@ -1283,7 +1391,12 @@ fn register_class_methods(
                     _ => return Err(CompileError::unsupported("destructured method param")),
                 };
                 let pty = if let Some(ann) = &param.type_annotation {
-                    types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
+                    types::resolve_type_annotation_with_unions(
+                        ann,
+                        &ctx.class_names,
+                        bindings,
+                        &ctx.non_i32_union_wasm_types,
+                    )?
                 } else {
                     return Err(CompileError::type_err(format!(
                         "method parameter '{pname}' requires type annotation"
@@ -1296,7 +1409,12 @@ fn register_class_methods(
                 // Constructor returns the this pointer
                 WasmType::I32
             } else if let Some(ann) = &func.return_type {
-                types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
+                types::resolve_type_annotation_with_unions(
+                    ann,
+                    &ctx.class_names,
+                    bindings,
+                    &ctx.non_i32_union_wasm_types,
+                )?
             } else {
                 WasmType::Void
             };
@@ -1343,7 +1461,12 @@ fn codegen_method<'a>(
             _ => return Err(CompileError::unsupported("destructured method param")),
         };
         let pty = if let Some(ann) = &param.type_annotation {
-            types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
+            types::resolve_type_annotation_with_unions(
+                ann,
+                &ctx.class_names,
+                bindings,
+                &ctx.non_i32_union_wasm_types,
+            )?
         } else {
             return Err(CompileError::type_err(format!(
                 "method param '{pname}' requires type annotation"
@@ -1355,7 +1478,12 @@ fn codegen_method<'a>(
     let ret = if method.kind == MethodDefinitionKind::Constructor {
         WasmType::I32
     } else if let Some(ann) = &func.return_type {
-        types::resolve_type_annotation_with_bindings(ann, &ctx.class_names, bindings)?
+        types::resolve_type_annotation_with_unions(
+            ann,
+            &ctx.class_names,
+            bindings,
+            &ctx.non_i32_union_wasm_types,
+        )?
     } else {
         WasmType::Void
     };
@@ -1367,8 +1495,12 @@ fn codegen_method<'a>(
     // Thread declared return class so `return {...};` resolves to it.
     if method.kind != MethodDefinitionKind::Constructor
         && let Some(ann) = &func.return_type
-        && let Some(rc) =
-            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+        && let Some(rc) = types::get_class_type_name_with_bindings(
+            ann,
+            bindings,
+            Some(&ctx.shape_registry),
+            Some(&ctx.union_registry),
+        )
         && ctx.class_names.contains(&rc)
     {
         func_ctx.return_class = Some(rc);
@@ -1381,20 +1513,21 @@ fn codegen_method<'a>(
             _ => continue,
         };
         if let Some(ann) = &param.type_annotation {
-            if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
+            if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names, &ctx.non_i32_union_wasm_types) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
             if let Some(param_class) = types::get_class_type_name_with_bindings(
                 ann,
                 bindings,
                 Some(&ctx.shape_registry),
+                Some(&ctx.union_registry),
             ) && ctx.class_names.contains(&param_class)
             {
                 func_ctx
                     .local_class_types
                     .insert(pname.clone(), param_class);
             }
-            if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names) {
+            if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names, &ctx.non_i32_union_wasm_types) {
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
@@ -1402,6 +1535,7 @@ fn codegen_method<'a>(
                     ann,
                     bindings,
                     Some(&ctx.shape_registry),
+                    Some(&ctx.union_registry),
                 ) {
                     func_ctx
                         .local_array_elem_classes
@@ -1534,13 +1668,22 @@ fn codegen_function<'a>(
         return Err(CompileError::codegen("cannot codegen declare function"));
     }
 
-    let (params, ret) = extract_func_signature(func_decl, &ctx.class_names, bindings)?;
+    let (params, ret) = extract_func_signature(
+        func_decl,
+        &ctx.class_names,
+        bindings,
+        &ctx.non_i32_union_wasm_types,
+    )?;
     let mut func_ctx = FuncContext::new(ctx, &params, ret, source);
     func_ctx.type_bindings = bindings.cloned();
     // Thread declared return class so `return {...};` resolves to it.
     if let Some(ann) = &func_decl.return_type
-        && let Some(rc) =
-            types::get_class_type_name_with_bindings(ann, bindings, Some(&ctx.shape_registry))
+        && let Some(rc) = types::get_class_type_name_with_bindings(
+            ann,
+            bindings,
+            Some(&ctx.shape_registry),
+            Some(&ctx.union_registry),
+        )
         && ctx.class_names.contains(&rc)
     {
         func_ctx.return_class = Some(rc);
@@ -1553,20 +1696,21 @@ fn codegen_function<'a>(
             _ => continue,
         };
         if let Some(ann) = &param.type_annotation {
-            if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names) {
+            if let Some(sig) = types::get_closure_sig(ann, &ctx.class_names, &ctx.non_i32_union_wasm_types) {
                 func_ctx.local_closure_sigs.insert(pname.clone(), sig);
             }
             if let Some(param_class) = types::get_class_type_name_with_bindings(
                 ann,
                 bindings,
                 Some(&ctx.shape_registry),
+                Some(&ctx.union_registry),
             ) && ctx.class_names.contains(&param_class)
             {
                 func_ctx
                     .local_class_types
                     .insert(pname.clone(), param_class);
             }
-            if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names) {
+            if let Some(elem_ty) = types::get_array_element_type(ann, &ctx.class_names, &ctx.non_i32_union_wasm_types) {
                 func_ctx
                     .local_array_elem_types
                     .insert(pname.clone(), elem_ty);
@@ -1574,6 +1718,7 @@ fn codegen_function<'a>(
                     ann,
                     bindings,
                     Some(&ctx.shape_registry),
+                    Some(&ctx.union_registry),
                 ) {
                     func_ctx
                         .local_array_elem_classes

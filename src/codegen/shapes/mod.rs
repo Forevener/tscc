@@ -54,6 +54,7 @@ mod walker;
 mod tests;
 
 pub(crate) use fingerprint::fingerprint_of;
+pub(crate) use walker::literal_type_to_tag;
 use walker::{
     NamedShapeAst, ShapeWalker, collect_generic_shape_templates, collect_named_shape_names,
     collect_named_shapes, topo_sort_named_shapes,
@@ -64,6 +65,93 @@ use walker::{
 pub struct ShapeField {
     pub name: String,
     pub ty: BoundType,
+    /// Set when the field's annotated type was a `TSLiteralType` such as
+    /// `kind: 'circle'`, `code: 1`, or `flag: true`. The underlying `ty`
+    /// stays as the primitive (`Str` / `F64` / `I32` / `Bool`); the literal
+    /// value lives here. Drives discriminator narrowing in unions and
+    /// validates object-literal initializers against the tag.
+    pub tag_value: Option<TagValue>,
+}
+
+/// A literal value attached to a `ShapeField` whose annotation was a
+/// `TSLiteralType`. `Str` / `F64` / `I32` / `Bool` mirror the primitive
+/// flavours of literal types tscc recognises — `null`, `bigint`, and
+/// template literals are deliberately omitted (Phase 1 union scope).
+///
+/// `F64` keeps the raw `f64`; equality and fingerprint hashing route
+/// through `to_bits` so `NaN`-typed fields don't silently dedupe.
+#[derive(Debug, Clone)]
+pub enum TagValue {
+    Str(String),
+    F64(f64),
+    I32(i32),
+    Bool(bool),
+}
+
+impl PartialEq for TagValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TagValue::Str(a), TagValue::Str(b)) => a == b,
+            (TagValue::F64(a), TagValue::F64(b)) => a.to_bits() == b.to_bits(),
+            (TagValue::I32(a), TagValue::I32(b)) => a == b,
+            (TagValue::Bool(a), TagValue::Bool(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for TagValue {}
+
+impl TagValue {
+    /// Stable, fingerprint-safe encoding. Output uses only `[A-Za-z0-9_]`
+    /// so the resulting synthetic class name (`__ObjLit$kind_string$s_circle$...`)
+    /// stays printable and unambiguous. Negative numbers use `m` instead of
+    /// `-`; non-identifier bytes in strings get hex-escaped.
+    pub fn canonical(&self) -> String {
+        match self {
+            TagValue::Str(s) => format!("s_{}", sanitize_for_mangle(s)),
+            TagValue::F64(n) => format!("n_{}", canonical_number(*n)),
+            TagValue::I32(n) => format!(
+                "i_{}",
+                if *n < 0 {
+                    format!("m{}", n.unsigned_abs())
+                } else {
+                    n.to_string()
+                }
+            ),
+            TagValue::Bool(b) => format!("b_{}", if *b { "1" } else { "0" }),
+        }
+    }
+}
+
+fn sanitize_for_mangle(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push('x');
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
+}
+
+fn canonical_number(n: f64) -> String {
+    if n.is_nan() {
+        return "nan".to_string();
+    }
+    if n == 0.0 {
+        return if n.is_sign_negative() { "m0".to_string() } else { "0".to_string() };
+    }
+    let abs = n.abs();
+    let body = if abs.fract() == 0.0 && abs < 1e16 {
+        format!("{:.0}", abs)
+    } else {
+        let s = format!("{abs:?}");
+        s.replace('.', "p")
+    };
+    if n < 0.0 { format!("m{body}") } else { body }
 }
 
 /// Whether a shape was user-named (`type` / `interface`) or anonymous
@@ -155,11 +243,12 @@ const TUPLE_SHAPE_PREFIX: &str = "__Tuple$";
 /// are consulted when a field type references a generic class by bare name
 /// (e.g. `Box<i32>` inside a shape body); the token used in the
 /// fingerprint is the mangled instantiation.
-pub fn discover_shapes<'a>(
+pub fn discover_shapes<'a, 'ctx>(
     program: &'a Program<'a>,
-    class_names: &HashSet<String>,
-    class_templates: &HashMap<String, GenericClassTemplate<'a>>,
-    fn_templates: &HashMap<String, GenericFnTemplate<'a>>,
+    class_names: &'ctx HashSet<String>,
+    class_templates: &'ctx HashMap<String, GenericClassTemplate<'a>>,
+    fn_templates: &'ctx HashMap<String, GenericFnTemplate<'a>>,
+    non_i32_union_wasm_types: &'ctx HashMap<String, crate::types::WasmType>,
 ) -> Result<ShapeRegistry, CompileError> {
     // Pre-scan named-shape names so a shape body that references another
     // shape (`type Outer = { inner: Inner }`) resolves the inner reference
@@ -176,6 +265,7 @@ pub fn discover_shapes<'a>(
     let mut walker = ShapeWalker {
         real_class_names: class_names,
         class_names: combined_names,
+        non_i32_union_wasm_types,
         class_templates,
         fn_templates,
         generic_shape_templates,

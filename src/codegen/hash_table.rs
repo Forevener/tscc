@@ -39,7 +39,12 @@ pub const EMPTY_LINK: i32 = -1;
 pub(crate) fn bound_size(ty: &BoundType) -> u32 {
     match ty {
         BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
+        BoundType::I32
+        | BoundType::Bool
+        | BoundType::Str
+        | BoundType::Class(_)
+        | BoundType::Union { .. }
+        | BoundType::Never => 4,
     }
 }
 
@@ -48,7 +53,12 @@ pub(crate) fn bound_size(ty: &BoundType) -> u32 {
 pub(crate) fn bound_align(ty: &BoundType) -> u32 {
     match ty {
         BoundType::F64 => 8,
-        BoundType::I32 | BoundType::Bool | BoundType::Str | BoundType::Class(_) => 4,
+        BoundType::I32
+        | BoundType::Bool
+        | BoundType::Str
+        | BoundType::Class(_)
+        | BoundType::Union { .. }
+        | BoundType::Never => 4,
     }
 }
 
@@ -213,6 +223,13 @@ pub fn hash_helper_for(slot_ty: &BoundType) -> &'static str {
         BoundType::Bool => "__hash_fx_bool",
         BoundType::Str => "__hash_xxh3_str",
         BoundType::Class(_) => "__hash_fx_ptr",
+        // Union as a Map/Set key: Phase 1 routes through pointer hashing,
+        // good enough for shape-only and integer-only unions. Hashing a
+        // string-literal union by pointer is technically wrong (two equal
+        // strings at different memory addresses won't collide), but
+        // `Map<Color, V>` over `'red' | 'green' | 'blue'` isn't on the
+        // Phase 1 test path. Revisit if user programs need it.
+        BoundType::Union { .. } | BoundType::Never => "__hash_fx_ptr",
     }
 }
 
@@ -222,7 +239,11 @@ pub fn equality_helper_for(slot_ty: &BoundType) -> Option<&'static str> {
     match slot_ty {
         BoundType::F64 => Some("__key_eq_f64"),
         BoundType::Str => Some("__str_eq"),
-        BoundType::I32 | BoundType::Bool | BoundType::Class(_) => None,
+        BoundType::I32
+        | BoundType::Bool
+        | BoundType::Class(_)
+        | BoundType::Union { .. }
+        | BoundType::Never => None,
     }
 }
 

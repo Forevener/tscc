@@ -336,8 +336,13 @@ impl<'a> FuncContext<'a> {
                 if let Some(type_args) = call.type_arguments.as_ref()
                     && let Some(first) = type_args.params.first()
                 {
-                    return crate::types::resolve_ts_type(first, &self.module_ctx.class_names)
-                        .ok();
+                    return crate::types::resolve_ts_type_full(
+                        first,
+                        &self.module_ctx.class_names,
+                        self.type_bindings.as_ref(),
+                        Some(&self.module_ctx.non_i32_union_wasm_types),
+                    )
+                    .ok();
                 }
                 if let Some(first) = call.arguments.first() {
                     return self.infer_init_type(first.to_expression()).ok().map(|t| t.0);

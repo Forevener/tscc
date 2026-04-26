@@ -5,6 +5,7 @@ use oxc_ast::ast::*;
 use std::collections::HashSet;
 
 use super::shapes::ShapeRegistry;
+use super::unions::UnionRegistry;
 use crate::error::CompileError;
 use crate::types::{self, TypeBindings, WasmType};
 
@@ -128,7 +129,8 @@ impl ClassRegistry {
 
     #[allow(
         clippy::map_entry,
-        reason = "override and new-slot branches are not symmetric"
+        clippy::too_many_arguments,
+        reason = "override and new-slot branches are not symmetric; args are positional by design"
     )]
     pub fn register_class(
         &mut self,
@@ -137,6 +139,8 @@ impl ClassRegistry {
         parent_name: Option<String>,
         is_polymorphic: bool,
         shape_registry: Option<&ShapeRegistry>,
+        union_registry: Option<&UnionRegistry>,
+        union_overrides: &HashMap<String, crate::types::WasmType>,
     ) -> Result<(), CompileError> {
         self.register_class_with_bindings(
             class,
@@ -146,6 +150,8 @@ impl ClassRegistry {
             None,
             None,
             shape_registry,
+            union_registry,
+            union_overrides,
         )
     }
 
@@ -167,6 +173,8 @@ impl ClassRegistry {
         override_name: Option<&str>,
         bindings: Option<&TypeBindings>,
         shape_registry: Option<&ShapeRegistry>,
+        union_registry: Option<&UnionRegistry>,
+        union_overrides: &HashMap<String, crate::types::WasmType>,
     ) -> Result<(), CompileError> {
         let name = if let Some(n) = override_name {
             n.to_string()
@@ -232,7 +240,12 @@ impl ClassRegistry {
                 ClassElement::PropertyDefinition(prop) => {
                     let field_name = property_key_name(&prop.key)?;
                     let ty = if let Some(ann) = &prop.type_annotation {
-                        types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
+                        types::resolve_type_annotation_with_unions(
+                            ann,
+                            class_names,
+                            bindings,
+                            union_overrides,
+                        )?
                     } else {
                         return Err(CompileError::type_err(format!(
                             "class field '{field_name}' requires a type annotation"
@@ -241,9 +254,12 @@ impl ClassRegistry {
 
                     // Track field class type if it's a class reference
                     if let Some(ann) = &prop.type_annotation {
-                        if let Some(class_type) =
-                            types::get_class_type_name_with_bindings(ann, bindings, shape_registry)
-                            && class_names.contains(&class_type)
+                        if let Some(class_type) = types::get_class_type_name_with_bindings(
+                            ann,
+                            bindings,
+                            shape_registry,
+                            union_registry,
+                        ) && class_names.contains(&class_type)
                         {
                             field_class_types.insert(field_name.clone(), class_type);
                         }
@@ -289,7 +305,12 @@ impl ClassRegistry {
                                 }
                             };
                             if let Some(ann) = &param.type_annotation {
-                                types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?;
+                                types::resolve_type_annotation_with_unions(
+                                    ann,
+                                    class_names,
+                                    bindings,
+                                    union_overrides,
+                                )?;
                             } else {
                                 return Err(CompileError::type_err(format!(
                                     "constructor parameter '{pname}' requires type annotation"
@@ -312,7 +333,12 @@ impl ClassRegistry {
                                 }
                             };
                             let pty = if let Some(ann) = &param.type_annotation {
-                                types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
+                                types::resolve_type_annotation_with_unions(
+                                    ann,
+                                    class_names,
+                                    bindings,
+                                    union_overrides,
+                                )?
                             } else {
                                 return Err(CompileError::type_err(format!(
                                     "method parameter '{pname}' requires type annotation"
@@ -323,6 +349,7 @@ impl ClassRegistry {
                                     ann,
                                     bindings,
                                     shape_registry,
+                                    union_registry,
                                 )
                                 .filter(|cn| class_names.contains(cn))
                             });
@@ -330,7 +357,12 @@ impl ClassRegistry {
                             param_classes.push(pclass);
                         }
                         let ret = if let Some(ann) = &func.return_type {
-                            types::resolve_type_annotation_with_bindings(ann, class_names, bindings)?
+                            types::resolve_type_annotation_with_unions(
+                                ann,
+                                class_names,
+                                bindings,
+                                union_overrides,
+                            )?
                         } else {
                             WasmType::Void
                         };
@@ -343,6 +375,7 @@ impl ClassRegistry {
                                     ann,
                                     bindings,
                                     shape_registry,
+                                    union_registry,
                                 )
                             })
                             .filter(|cn| class_names.contains(cn));

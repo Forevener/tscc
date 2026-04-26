@@ -20,10 +20,16 @@ pub(super) fn property_signature_key(prop: &TSPropertySignature) -> Result<Strin
 /// Canonical fingerprint: sort `(name, mangle_token)` pairs by name, join as
 /// `name1_ty1$name2_ty2$...`. Identical to the mangled suffix used in the
 /// anonymous shape's synthetic class name.
+///
+/// Literal-typed fields (`kind: 'circle'`) extend their token with the
+/// canonical literal form (`string$s_circle`) so two shapes that differ only
+/// in their discriminator value get distinct fingerprints — and therefore
+/// distinct synthetic class layouts. Without this, every variant of a
+/// discriminated union would collapse onto the same shape.
 pub(crate) fn fingerprint_of(fields: &[ShapeField]) -> String {
     let mut pairs: Vec<(&str, String)> = fields
         .iter()
-        .map(|f| (f.name.as_str(), f.ty.mangle_token()))
+        .map(|f| (f.name.as_str(), field_token(f)))
         .collect();
     pairs.sort_by(|a, b| a.0.cmp(b.0));
     pairs
@@ -31,6 +37,13 @@ pub(crate) fn fingerprint_of(fields: &[ShapeField]) -> String {
         .map(|(n, t)| format!("{n}_{t}"))
         .collect::<Vec<_>>()
         .join("$")
+}
+
+fn field_token(f: &ShapeField) -> String {
+    match &f.tag_value {
+        None => f.ty.mangle_token(),
+        Some(tv) => format!("{}${}", f.ty.mangle_token(), tv.canonical()),
+    }
 }
 
 /// Positional fingerprint for tuples: element mangle tokens joined by `$`.

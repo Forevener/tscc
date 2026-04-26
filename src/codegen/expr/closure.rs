@@ -138,9 +138,11 @@ impl<'a> FuncContext<'a> {
                 _ => return Err(CompileError::unsupported("destructured closure parameter")),
             };
             let pty = if let Some(ann) = &param.type_annotation {
-                crate::types::resolve_type_annotation_with_classes(
+                crate::types::resolve_type_annotation_with_unions(
                     ann,
                     &self.module_ctx.class_names,
+                    self.type_bindings.as_ref(),
+                    &self.module_ctx.non_i32_union_wasm_types,
                 )?
             } else {
                 return Err(CompileError::type_err(format!(
@@ -153,7 +155,12 @@ impl<'a> FuncContext<'a> {
 
         // 2. Determine return type
         let return_type = if let Some(ann) = &arrow.return_type {
-            crate::types::resolve_type_annotation_with_classes(ann, &self.module_ctx.class_names)?
+            crate::types::resolve_type_annotation_with_unions(
+                ann,
+                &self.module_ctx.class_names,
+                self.type_bindings.as_ref(),
+                &self.module_ctx.non_i32_union_wasm_types,
+            )?
         } else if arrow.expression {
             // Infer from expression body
             if let Some(Statement::ExpressionStatement(e)) = arrow.body.statements.first() {

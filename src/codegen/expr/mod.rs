@@ -7,7 +7,7 @@ mod closure;
 mod hash_table;
 mod map;
 mod member;
-mod object;
+pub(crate) mod object;
 mod set;
 mod string;
 mod tuple;
@@ -141,9 +141,17 @@ impl<'a> FuncContext<'a> {
         let target_class = crate::types::get_class_type_name_from_ts_type(
             &as_expr.type_annotation,
             Some(&self.module_ctx.shape_registry),
+            Some(&self.module_ctx.union_registry),
         );
+        // Skip the class-cast fast-path for non-`I32` unions — those need
+        // the WasmType-based cast below (e.g. `0.5 as Half` where `Half`
+        // is `0.5 | 1.5`, target `WasmType::F64`).
+        let target_is_non_i32_union = target_class
+            .as_ref()
+            .is_some_and(|n| self.module_ctx.non_i32_union_wasm_types.contains_key(n));
         if let Some(ref target_name) = target_class
             && self.module_ctx.class_names.contains(target_name)
+            && !target_is_non_i32_union
         {
             // Class cast — validate hierarchy
             if let Ok(src_class) = self.resolve_expr_class(&as_expr.expression) {
@@ -163,8 +171,12 @@ impl<'a> FuncContext<'a> {
         }
 
         let src_ty = self.emit_expr(&as_expr.expression)?;
-        let target_ty =
-            crate::types::resolve_ts_type(&as_expr.type_annotation, &self.module_ctx.class_names)?;
+        let target_ty = crate::types::resolve_ts_type_full(
+            &as_expr.type_annotation,
+            &self.module_ctx.class_names,
+            self.type_bindings.as_ref(),
+            Some(&self.module_ctx.non_i32_union_wasm_types),
+        )?;
 
         match (src_ty, target_ty) {
             (a, b) if a == b => Ok(a), // no-op cast
@@ -186,17 +198,29 @@ impl<'a> FuncContext<'a> {
         &mut self,
         cond: &ConditionalExpression<'a>,
     ) -> Result<WasmType, CompileError> {
+        let (positive_facts, negative_facts) = self.recognize_narrowing_facts(&cond.test);
+
         self.emit_expr(&cond.test)?;
 
         self.push(Instruction::If(wasm_encoder::BlockType::Empty));
 
+        self.enter_refinement_scope();
+        for fact in positive_facts {
+            self.refine_local(&fact.local_name, fact.refined);
+        }
         let then_ty = self.emit_expr(&cond.consequent)?;
+        self.leave_refinement_scope();
         let result_local = self.alloc_local(then_ty);
         self.push(Instruction::LocalSet(result_local));
 
         self.push(Instruction::Else);
 
+        self.enter_refinement_scope();
+        for fact in negative_facts {
+            self.refine_local(&fact.local_name, fact.refined);
+        }
         let else_ty = self.emit_expr(&cond.alternate)?;
+        self.leave_refinement_scope();
         if else_ty != then_ty {
             return Err(CompileError::type_err(format!(
                 "ternary branches have different types: {then_ty:?} vs {else_ty:?}"

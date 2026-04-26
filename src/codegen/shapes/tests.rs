@@ -25,8 +25,14 @@ fn discover(source: &str) -> Result<ShapeRegistry, CompileError> {
     // Drive generic instantiation collection so mangled names land in
     // class_names — mirrors what compile_module does before shape
     // discovery.
-    let result =
-        generics::collect_instantiations(&program, &class_templates, &fn_templates, &class_names)?;
+    let empty_overrides = std::collections::HashMap::new();
+    let result = generics::collect_instantiations(
+        &program,
+        &class_templates,
+        &fn_templates,
+        &class_names,
+        &empty_overrides,
+    )?;
     for inst in &result.class_insts {
         class_names.insert(inst.mangled_name.clone());
     }
@@ -34,7 +40,7 @@ fn discover(source: &str) -> Result<ShapeRegistry, CompileError> {
     // Note: the AST is dropped when the allocator goes out of scope here
     // but the ShapeRegistry's resolved BoundType + String field data is
     // owned, so the registry survives.
-    discover_shapes(&program, &class_names, &class_templates, &fn_templates)
+    discover_shapes(&program, &class_names, &class_templates, &fn_templates, &empty_overrides)
 }
 
 #[test]

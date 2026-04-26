@@ -111,6 +111,7 @@ impl<'a> FuncContext<'a> {
                     p,
                     &self.module_ctx.class_names,
                     self.type_bindings.as_ref(),
+                    &self.module_ctx.non_i32_union_wasm_types,
                 )?;
                 tokens.push(bt.mangle_token());
             }

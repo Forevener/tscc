@@ -86,7 +86,11 @@ impl<'a> FuncContext<'a> {
         let mut annotated_array_elem_ty: Option<WasmType> = None;
         let ty = if let Some(ann) = &decl.type_annotation {
             // Track closure signature from function type annotation
-            if let Some(sig) = types::get_closure_sig(ann, &self.module_ctx.class_names) {
+            if let Some(sig) = types::get_closure_sig(
+                ann,
+                &self.module_ctx.class_names,
+                &self.module_ctx.non_i32_union_wasm_types,
+            ) {
                 self.local_closure_sigs.insert(name.clone(), sig);
             }
             // Track class type for property access resolution (threading
@@ -96,11 +100,16 @@ impl<'a> FuncContext<'a> {
                 ann,
                 self.type_bindings.as_ref(),
                 Some(&self.module_ctx.shape_registry),
+                Some(&self.module_ctx.union_registry),
             ) {
                 self.local_class_types.insert(name.clone(), class_name);
             }
             // Track array element type
-            if let Some(elem_ty) = types::get_array_element_type(ann, &self.module_ctx.class_names)
+            if let Some(elem_ty) = types::get_array_element_type(
+                ann,
+                &self.module_ctx.class_names,
+                &self.module_ctx.non_i32_union_wasm_types,
+            )
             {
                 self.local_array_elem_types.insert(name.clone(), elem_ty);
                 annotated_array_elem_ty = Some(elem_ty);
@@ -109,6 +118,7 @@ impl<'a> FuncContext<'a> {
                     ann,
                     self.type_bindings.as_ref(),
                     Some(&self.module_ctx.shape_registry),
+                    Some(&self.module_ctx.union_registry),
                 ) {
                     self.local_array_elem_classes
                         .insert(name.clone(), elem_class);
@@ -118,10 +128,11 @@ impl<'a> FuncContext<'a> {
             if types::is_string_type_with_bindings(ann, self.type_bindings.as_ref()) {
                 self.local_string_vars.insert(name.clone());
             }
-            types::resolve_type_annotation_with_bindings(
+            types::resolve_type_annotation_with_unions(
                 ann,
                 &self.module_ctx.class_names,
                 self.type_bindings.as_ref(),
+                &self.module_ctx.non_i32_union_wasm_types,
             )
             .map_err(|e| self.locate(e, decl.span.start))?
         } else if let Some(init) = &decl.init {
@@ -720,15 +731,32 @@ impl<'a> FuncContext<'a> {
     }
 
     fn emit_if(&mut self, if_stmt: &IfStatement<'a>) -> Result<(), CompileError> {
+        // Recognize narrowing facts BEFORE emitting the test expression.
+        // The recognizer inspects AST, not bytecode, so the order doesn't
+        // affect correctness — but reading the fact list before any
+        // codegen makes the lifecycle easier to follow. Sub-phase 4 stub
+        // returns empty; Sub-phase 5 fills it.
+        let (positive_facts, negative_facts) = self.recognize_narrowing_facts(&if_stmt.test);
+
         self.emit_expr(&if_stmt.test)?;
         self.push(Instruction::If(BlockType::Empty));
         self.block_depth += 1;
 
+        self.enter_refinement_scope();
+        for fact in positive_facts {
+            self.refine_local(&fact.local_name, fact.refined);
+        }
         self.emit_statement(&if_stmt.consequent)?;
+        self.leave_refinement_scope();
 
         if let Some(alt) = &if_stmt.alternate {
             self.push(Instruction::Else);
+            self.enter_refinement_scope();
+            for fact in negative_facts {
+                self.refine_local(&fact.local_name, fact.refined);
+            }
             self.emit_statement(alt)?;
+            self.leave_refinement_scope();
         }
 
         self.push(Instruction::End);
@@ -1042,14 +1070,18 @@ impl<'a> FuncContext<'a> {
     }
 
     fn emit_switch(&mut self, switch: &SwitchStatement<'a>) -> Result<(), CompileError> {
+        // Recognize narrowing facts BEFORE emitting code. The recognizer
+        // walks the AST only and never mutates the function's emit state,
+        // so reading facts up front keeps the case-by-case lifecycle
+        // (enter scope → install positive → emit body → leave scope)
+        // straightforward.
+        let cases: Vec<&SwitchCase<'a>> = switch.cases.iter().collect();
+        let narrowing = self.recognize_switch_facts(&switch.discriminant, &cases);
+
         // Evaluate discriminant once
         let disc_ty = self.emit_expr(&switch.discriminant)?;
         let disc_local = self.alloc_local(disc_ty);
         self.push(Instruction::LocalSet(disc_local));
-
-        // Simpler approach: if/else chain
-        // For each case, compare and branch
-        let cases: Vec<_> = switch.cases.iter().collect();
 
         // Outer block for break statements
         self.push(Instruction::Block(BlockType::Empty));
@@ -1088,7 +1120,14 @@ impl<'a> FuncContext<'a> {
 
             self.push(Instruction::If(BlockType::Empty));
 
-            // Case body
+            // Case body — install per-case positive refinement so
+            // `sh.kind === 'circle'` narrows `sh` inside this branch.
+            self.enter_refinement_scope();
+            if let Some(facts) = narrowing.case_facts.get(i) {
+                for fact in facts {
+                    self.refine_local(&fact.local_name, fact.refined.clone());
+                }
+            }
             for stmt in &case.consequent {
                 match stmt {
                     Statement::BreakStatement(_) => {
@@ -1099,12 +1138,18 @@ impl<'a> FuncContext<'a> {
                     _ => self.emit_statement(stmt)?,
                 }
             }
+            self.leave_refinement_scope();
 
             self.push(Instruction::End); // end if
         }
 
-        // Default case
+        // Default case — refinement is the cumulative negative: original
+        // active member set minus every shape / literal handled above.
         if let Some(idx) = default_idx {
+            self.enter_refinement_scope();
+            for fact in &narrowing.default_facts {
+                self.refine_local(&fact.local_name, fact.refined.clone());
+            }
             for stmt in &cases[idx].consequent {
                 match stmt {
                     Statement::BreakStatement(_) => {
@@ -1114,6 +1159,7 @@ impl<'a> FuncContext<'a> {
                     _ => self.emit_statement(stmt)?,
                 }
             }
+            self.leave_refinement_scope();
         }
 
         self.loop_stack.pop();
