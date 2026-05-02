@@ -13,6 +13,8 @@ mod arrays;
 mod classes;
 #[path = "it/closures.rs"]
 mod closures;
+#[path = "it/coercion.rs"]
+mod coercion;
 #[path = "it/control_flow.rs"]
 mod control_flow;
 #[path = "it/debug.rs"]
@@ -39,5 +41,7 @@ mod splicer;
 mod strings;
 #[path = "it/tuples.rs"]
 mod tuples;
+#[path = "it/typed_arrays.rs"]
+mod typed_arrays;
 #[path = "it/unions.rs"]
 mod unions;

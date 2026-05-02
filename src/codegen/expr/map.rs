@@ -77,8 +77,40 @@ impl<'a> FuncContext<'a> {
                 self.emit_hash_table_foreach(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::Void))
             }
+            "keys" => {
+                self.expect_args(call, 0, "Map.keys")?;
+                self.emit_hash_table_to_array(
+                    &member.object,
+                    &class_name,
+                    super::hash_table::HashTableColumn::Key,
+                )?;
+                Ok(Some(WasmType::I32))
+            }
+            "values" => {
+                self.expect_args(call, 0, "Map.values")?;
+                self.emit_hash_table_to_array(
+                    &member.object,
+                    &class_name,
+                    super::hash_table::HashTableColumn::Value,
+                )?;
+                Ok(Some(WasmType::I32))
+            }
+            "entries" => {
+                self.expect_args(call, 0, "Map.entries")?;
+                let info = self.hash_table_info(&class_name);
+                let elements = vec![
+                    info.slot_ty.clone(),
+                    info.value_ty.clone().expect("map has value type"),
+                ];
+                let pair_class = format!(
+                    "__Tuple${}",
+                    crate::codegen::shapes::tuple_fingerprint_of(&elements)
+                );
+                self.emit_hash_table_entries(&member.object, &class_name, &pair_class)?;
+                Ok(Some(WasmType::I32))
+            }
             other => Err(CompileError::codegen(format!(
-                "Map has no method '{other}' — supported: clear, has, get, set, delete, forEach"
+                "Map has no method '{other}' — supported: clear, has, get, set, delete, forEach, keys, values, entries"
             ))),
         }
     }

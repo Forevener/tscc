@@ -535,3 +535,290 @@ fn user_generic_class_wraps_tscc_generic_map() {
     );
     assert_eq!(values, vec![2.0, 42.0, 7.0, 2.0, 1.5, 2.5]);
 }
+
+// ─── keys() / values() / entries() ───────────────────────────────────────────
+
+/// `m.keys()` materializes the insertion-order chain into a fresh `Array<K>`.
+/// Same iteration discipline as forEach: insertion order, deletes elided.
+#[test]
+fn map_keys_returns_array_in_insertion_order() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(30, 300);
+            m.set(10, 100);
+            m.set(20, 200);
+            const ks: i32[] = m.keys();
+            sink(f64(ks.length));
+            for (const k of ks) {
+                sink(f64(k));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![3.0, 30.0, 10.0, 20.0]);
+}
+
+/// `m.values()` yields V-typed elements in insertion order.
+#[test]
+fn map_values_returns_array_in_insertion_order() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(1, 10);
+            m.set(2, 20);
+            m.set(3, 30);
+            const vs: i32[] = m.values();
+            for (const v of vs) {
+                sink(f64(v));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![10.0, 20.0, 30.0]);
+}
+
+/// `m.values()` on a Map<K, f64> picks up the f64 column width.
+#[test]
+fn map_values_carries_f64_value_type() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, f64> = new Map<i32, f64>();
+            m.set(1, 1.5);
+            m.set(2, 2.5);
+            const vs: f64[] = m.values();
+            for (const v of vs) {
+                sink(v);
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![1.5, 2.5]);
+}
+
+/// Deletes drop the entry from the materialized array — the chain walk
+/// follows the same `next_insert` pointers `forEach` does.
+#[test]
+fn map_keys_skips_deleted() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(1, 10);
+            m.set(2, 20);
+            m.set(3, 30);
+            m.delete(2);
+            const ks: i32[] = m.keys();
+            sink(f64(ks.length));
+            for (const k of ks) {
+                sink(f64(k));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 1.0, 3.0]);
+}
+
+/// Empty map → zero-length result array; the chain walk short-circuits on
+/// `head_idx == -1`.
+#[test]
+fn map_keys_on_empty_returns_empty_array() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            const ks: i32[] = m.keys();
+            sink(f64(ks.length));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![0.0]);
+}
+
+/// String-keyed maps: keys() yields `Array<string>` (currently `i32[]` of
+/// pointers; users dereference via existing string idioms). Verifies the
+/// pointer chain materializes correctly even when the slot type is a
+/// pointer-width column.
+#[test]
+fn map_keys_string_pointers() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<string, i32> = new Map<string, i32>();
+            m.set("alpha", 1);
+            m.set("beta", 2);
+            const ks: i32[] = m.keys();
+            sink(f64(ks.length));
+            // Round-trip every key back through the map: the pointers we
+            // copied out must still hash + equal-compare to themselves.
+            for (const k of ks) {
+                sink(f64(m.has(k)));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 1.0, 1.0]);
+}
+
+/// `m.keys()` composes through array HOFs — the result is a real `Array<K>`,
+/// not a special iterator type.
+#[test]
+fn map_keys_composes_with_array_filter() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(1, 10);
+            m.set(2, 20);
+            m.set(3, 30);
+            m.set(4, 40);
+            const evens: i32[] = m.keys().filter((k: i32) => k % 2 === 0);
+            sink(f64(evens.length));
+            for (const k of evens) {
+                sink(f64(k));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 2.0, 4.0]);
+}
+
+/// `m.entries()` materializes the insertion-order chain into a fresh
+/// `Array<[K, V]>` whose elements are arena-allocated tuples. Each pair
+/// holds (key, value) per the ES spec.
+#[test]
+fn map_entries_returns_array_of_pairs_in_insertion_order() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(3, 30);
+            m.set(1, 10);
+            m.set(2, 20);
+            const es: Array<[i32, i32]> = m.entries();
+            sink(f64(es.length));
+            for (const e of es) {
+                sink(f64(e[0]));
+                sink(f64(e[1]));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![3.0, 3.0, 30.0, 1.0, 10.0, 2.0, 20.0]);
+}
+
+/// `m.entries()` on a Map<string, f64> exercises the mixed-width path:
+/// pair shape carries `[string, f64]` so `_0` is i32-aligned (pointer) and
+/// `_1` is f64-aligned (8-byte slot starts at offset 8).
+#[test]
+fn map_entries_mixed_width_string_to_f64() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<string, f64> = new Map<string, f64>();
+            m.set("alpha", 1.5);
+            m.set("beta", 2.5);
+            const es: Array<[string, f64]> = m.entries();
+            sink(f64(es.length));
+            for (const e of es) {
+                sink(f64(e[0].length));
+                sink(e[1]);
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 5.0, 1.5, 4.0, 2.5]);
+}
+
+/// `m.entries()` on an empty Map returns an empty array (length 0).
+#[test]
+fn map_entries_on_empty_returns_empty_array() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            const es: Array<[i32, i32]> = m.entries();
+            sink(f64(es.length));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![0.0]);
+}
+
+/// Deletes punch holes in the bucket array but leave the chain intact;
+/// `entries()` walks `head_idx → next_insert` so it skips deleted slots.
+#[test]
+fn map_entries_skips_deleted_entries() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(1, 10);
+            m.set(2, 20);
+            m.set(3, 30);
+            m.delete(2);
+            const es: Array<[i32, i32]> = m.entries();
+            sink(f64(es.length));
+            for (const e of es) {
+                sink(f64(e[0] * 100 + e[1]));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 110.0, 330.0]);
+}
+
+/// `m.entries()` aliases to a registered tuple shape — when user code also
+/// declares `[K, V]` syntactically, both paths share the same synthetic
+/// class. Verifies the pair is read-write through the same field offsets.
+#[test]
+fn map_entries_shares_shape_with_user_tuple() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const m: Map<i32, i32> = new Map<i32, i32>();
+            m.set(7, 70);
+            m.set(8, 80);
+            const es: Array<[i32, i32]> = m.entries();
+            // Mix the entries result with a hand-written [i32, i32] in the
+            // same array — they must coexist as the same tuple shape.
+            const more: Array<[i32, i32]> = [[9, 90], [10, 100]];
+            sink(f64(es.length + more.length));
+            for (const e of es) {
+                sink(f64(e[0] + e[1]));
+            }
+            for (const e of more) {
+                sink(f64(e[0] + e[1]));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![4.0, 77.0, 88.0, 99.0, 110.0]);
+}

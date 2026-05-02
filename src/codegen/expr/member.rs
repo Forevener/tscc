@@ -40,6 +40,19 @@ impl<'a> FuncContext<'a> {
                 self.push(Instruction::F64Const(val));
                 return Ok(WasmType::F64);
             }
+            // Typed-array statics on the type identifier itself, e.g.
+            // `Int32Array.BYTES_PER_ELEMENT`. Sub-phase 2 only ships
+            // `BYTES_PER_ELEMENT`; future statics (`name`, etc.) slot
+            // into this same dispatcher.
+            if let Some(desc) =
+                crate::codegen::typed_arrays::descriptor_for(obj_ident.name.as_str())
+                && let Some(ty) = self.try_emit_typed_array_static_property(
+                    desc,
+                    member.property.name.as_str(),
+                )?
+            {
+                return Ok(ty);
+            }
         }
 
         let field_name = member.property.name.as_str();
@@ -47,6 +60,13 @@ impl<'a> FuncContext<'a> {
         // Check if this is a string property access (str.length)
         if self.resolve_expr_is_string(&member.object) {
             return self.emit_string_property(member, field_name);
+        }
+
+        // Typed-array instance properties (length / byteLength). Routed
+        // before the array path because typed-array locals don't appear in
+        // `local_array_elem_types`, so the array path would error.
+        if let Some(desc) = self.resolve_expr_typed_array(&member.object) {
+            return self.emit_typed_array_property(desc, member, field_name);
         }
 
         // Check if this is an array property access (arr.length)
@@ -276,6 +296,14 @@ impl<'a> FuncContext<'a> {
             return Ok(ty);
         }
 
+        // Typed-array element read: `ta[i]` where ta is Int32Array /
+        // Float64Array / Uint8Array. Routed before the regular Array<T>
+        // path because typed arrays are class-typed (not in
+        // `local_array_elem_types`), so the Array<T> path would error.
+        if let Some(desc) = self.resolve_expr_typed_array(&member.object) {
+            return self.emit_typed_array_indexed_read(desc, member);
+        }
+
         let elem_ty = self
             .resolve_expr_array_elem(&member.object)
             .ok_or_else(|| {
@@ -402,6 +430,11 @@ impl<'a> FuncContext<'a> {
         value: &Expression<'a>,
         operator: AssignmentOperator,
     ) -> Result<WasmType, CompileError> {
+        // Typed-array element write: `ta[i] = v` / `ta[i] += v` etc.
+        if let Some(desc) = self.resolve_expr_typed_array(&member.object) {
+            return self.emit_typed_array_indexed_write(desc, member, value, operator);
+        }
+
         let elem_ty = self
             .resolve_expr_array_elem(&member.object)
             .ok_or_else(|| {

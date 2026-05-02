@@ -68,8 +68,34 @@ impl<'a> FuncContext<'a> {
                 self.emit_hash_table_foreach(&member.object, &class_name, arg)?;
                 Ok(Some(WasmType::Void))
             }
+            // ES `Set.prototype.keys` and `.values` are aliases that both
+            // yield the elements in insertion order; we map both onto the
+            // same shared emitter with `Key` (Set has no value column).
+            "keys" | "values" => {
+                self.expect_args(call, 0, &format!("Set.{method_name}"))?;
+                self.emit_hash_table_to_array(
+                    &member.object,
+                    &class_name,
+                    super::hash_table::HashTableColumn::Key,
+                )?;
+                Ok(Some(WasmType::I32))
+            }
+            "entries" => {
+                // Per ES spec, `Set.prototype.entries` returns
+                // `Array<[T, T]>` where each pair is `[v, v]` — included for
+                // API parity with Map (a `Set<T>` viewed as a `Map<T, T>`).
+                self.expect_args(call, 0, "Set.entries")?;
+                let info = self.hash_table_info(&class_name);
+                let elements = vec![info.slot_ty.clone(), info.slot_ty.clone()];
+                let pair_class = format!(
+                    "__Tuple${}",
+                    crate::codegen::shapes::tuple_fingerprint_of(&elements)
+                );
+                self.emit_hash_table_entries(&member.object, &class_name, &pair_class)?;
+                Ok(Some(WasmType::I32))
+            }
             other => Err(CompileError::codegen(format!(
-                "Set has no method '{other}' — supported: clear, has, add, delete, forEach"
+                "Set has no method '{other}' — supported: clear, has, add, delete, forEach, keys, values, entries"
             ))),
         }
     }

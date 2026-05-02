@@ -879,6 +879,22 @@ impl Scanner {
             add("__str_parseFloat", &mut used);
         }
 
+        // Coercion constructors. The scan is syntactic — we conservatively
+        // pull in the helpers any program calls them, matching the parseInt /
+        // parseFloat treatment above. Helpers go unused (as `unreachable`
+        // stubs) when a user-declared `function String/Number(...)` shadows
+        // the built-in; the cost is small.
+        // - `String(x)` → numeric stringifiers (i32 + f64 paths).
+        // - `Number(x)` → `parseFloat` for the string-operand path.
+        // - `Boolean(x)` → fully inline; no helper.
+        if self.identifier_calls.contains("String") {
+            add("__str_from_i32", &mut used);
+            add("__str_from_f64", &mut used);
+        }
+        if self.identifier_calls.contains("Number") {
+            add("__str_parseFloat", &mut used);
+        }
+
         // Array.join: runtime-loop concatenation needs __str_concat plus the
         // numeric stringifiers for non-string element arrays. Over-includes
         // for string-element arrays — cheap in tree-shaking terms.

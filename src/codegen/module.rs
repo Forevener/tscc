@@ -403,6 +403,15 @@ pub fn compile_module<'a>(
     let mut ctx = ModuleContext::new(host_module);
     ctx.arena_overflow = arena_overflow;
 
+    // Pass 0a-prelude: register the typed-array pseudo-classes
+    // (`Int32Array`, `Float64Array`, `Uint8Array`). Lands their names in
+    // `ctx.class_names` and a synthetic `ClassLayout` each in
+    // `ctx.class_registry` before any pass that walks user types — so the
+    // generic-instantiation collector resolves `Array<Int32Array>`, the
+    // shape walker leaves typed-array names alone, and field-type
+    // resolution treats `arr: Float64Array;` as an i32 pointer.
+    super::typed_arrays::register_typed_arrays(&mut ctx)?;
+
     // Pass 0a-pre: pre-collect non-`I32` named-union `WasmType`s. Runs
     // *before* template discovery / class collection / instantiation
     // walking so `resolve_bound_type` (used by `mangle_parent_name` and
@@ -555,6 +564,21 @@ pub fn compile_module<'a>(
         &fn_templates,
         &ctx.non_i32_union_wasm_types,
     )?;
+
+    // Pre-register a tuple shape for each Map<K, V> / Set<T> instantiation so
+    // `m.entries()` / `s.entries()` have a target class to load into. Map
+    // entries land in `[K, V]`; Set entries land in `[T, T]` (the ES spec
+    // returns `Array<[T, T]>` from `Set.prototype.entries`). Idempotent: if
+    // user code already wrote `[K, V]` syntactically the fingerprint dedupes
+    // back into the existing shape. The registry is mutated before Pass 0a-v
+    // so the synthetic-class registration loop picks the new entries up.
+    for inst in map_insts.iter().chain(set_insts.iter()) {
+        let elements = match &inst.value_ty {
+            Some(v_ty) => vec![inst.slot_ty.clone(), v_ty.clone()],
+            None => vec![inst.slot_ty.clone(), inst.slot_ty.clone()],
+        };
+        super::shapes::ensure_tuple_shape(&mut ctx.shape_registry, &elements);
+    }
 
     // Pass 0a-v: register each discovered shape as a synthetic ClassLayout.
     // Iteration follows shape-discovery order, so a nested shape that another

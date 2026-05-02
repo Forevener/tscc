@@ -313,6 +313,7 @@ pub fn register_layout(
             vtable_method_map: HashMap::new(),
             vtable_offset: 0,
             own_field_names,
+            is_typed_array: false,
         },
     );
     Ok(())

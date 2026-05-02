@@ -30,6 +30,16 @@ pub(super) enum ArrowArity {
     OneOrTwo,
 }
 
+/// Which bucket field `keys()` / `values()` should materialize.
+/// `Key` reads `slot_offset` and is valid for both Map and Set.
+/// `Value` reads `value_offset` and is Map-only — passing it for a Set
+/// receiver is a programmer error and the emitter panics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HashTableColumn {
+    Key,
+    Value,
+}
+
 impl<'a> FuncContext<'a> {
     /// Push `buckets_ptr + slot * bucket_size` onto the stack.
     pub(super) fn emit_bucket_addr(
@@ -329,6 +339,309 @@ impl<'a> FuncContext<'a> {
 
         // Leave `found` on the stack as the return value.
         self.push(Instruction::LocalGet(ctx.found_local));
+        Ok(())
+    }
+
+    /// `m.keys()` / `m.values()` / `s.keys()` / `s.values()` — materialize
+    /// the insertion chain into a freshly-allocated `Array<X>` whose element
+    /// type matches the requested column. `target` selects which bucket
+    /// field to copy out:
+    /// - `HashTableColumn::Key` reads `slot_offset` (typed `info.slot_ty`).
+    /// - `HashTableColumn::Value` reads `value_offset` (typed
+    ///   `info.value_ty`). Caller must ensure the receiver is a Map; this
+    ///   emitter panics on a Set with `Value` because `value_offset` is
+    ///   `None`.
+    ///
+    /// Capacity is snapped to the current `size` and length is set to the
+    /// post-walk index, so a concurrent modification (unsupported semantics
+    /// either way) at worst short-circuits with `len < cap`. Order matches
+    /// `forEach` because we walk the same chain.
+    pub(super) fn emit_hash_table_to_array(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        target: HashTableColumn,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+
+        let (target_ty, target_offset) = match target {
+            HashTableColumn::Key => (info.slot_ty.clone(), info.bucket.slot_offset),
+            HashTableColumn::Value => (
+                info.value_ty
+                    .clone()
+                    .expect("value column requested on Set"),
+                info.bucket
+                    .value_offset
+                    .expect("value column requested on Set"),
+            ),
+        };
+        let elem_wasm = target_ty.wasm_ty();
+        let esize: i32 = match elem_wasm {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            WasmType::Void => unreachable!("hash table column is void"),
+        };
+
+        // Pin the receiver pointer once.
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        // Allocate a result array with capacity = size and length = 0; we'll
+        // patch the length to `i` after the walk so partial writes from a
+        // concurrent (unsupported) mutator stay self-consistent.
+        let size_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(size_off));
+        self.push(Instruction::LocalSet(size_local));
+        let arr_local = crate::codegen::array_builtins::emit_alloc_array(
+            self,
+            size_local,
+            elem_wasm,
+        )?;
+
+        let buckets_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::LocalSet(buckets_local));
+
+        let slot_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(head_off));
+        self.push(Instruction::LocalSet(slot_local));
+
+        let i_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(i_local));
+
+        let addr_local = self.alloc_local(WasmType::I32);
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        // if slot == EMPTY_LINK: break.
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::BrIf(1));
+
+        // addr = buckets + slot * bucket_size
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(Instruction::LocalSet(addr_local));
+
+        // arr[i] = bucket.<column>. Compute the destination address inline:
+        // arr_local + ARRAY_HEADER + i * esize.
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(
+            crate::codegen::expr::ARRAY_HEADER_SIZE as i32,
+        ));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(esize));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+
+        self.push(Instruction::LocalGet(addr_local));
+        self.push(load_typed(&target_ty, target_offset));
+        match elem_wasm {
+            WasmType::F64 => self.push(Instruction::F64Store(MemArg {
+                offset: 0,
+                align: 3,
+                memory_index: 0,
+            })),
+            _ => self.push(Instruction::I32Store(MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            })),
+        }
+
+        // i += 1
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(i_local));
+
+        // slot = bucket.next_insert; continue.
+        self.push(Instruction::LocalGet(addr_local));
+        self.push(load_i32(info.bucket.next_offset));
+        self.push(Instruction::LocalSet(slot_local));
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End); // loop
+        self.push(Instruction::End); // block
+
+        // length = i
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(arr_local));
+        Ok(())
+    }
+
+    /// `m.entries()` / `s.entries()` — materialize the insertion chain into a
+    /// freshly-allocated `Array<__Tuple$K$V>` (Map) or `Array<__Tuple$T$T>`
+    /// (Set), with each row writing a brand-new tuple instance into the
+    /// result. The tuple shapes are pre-registered per Map/Set
+    /// instantiation in `module.rs` (see `ensure_tuple_shape`), so the
+    /// `pair_class_name` lookup is always populated by the time codegen
+    /// runs. Per ES spec, `Set.entries()` returns `Array<[T, T]>` (each pair
+    /// is `[v, v]`); Map returns `Array<[K, V]>` in insertion order.
+    ///
+    /// Capacity / length bookkeeping mirrors `emit_hash_table_to_array`:
+    /// snap to current `size`, patch length to the post-walk index. Tuples
+    /// are written through the registered `__Tuple$...` synthetic class
+    /// layout so field offsets and slot widths follow the same alignment
+    /// rules as user-declared tuples — `_0` and `_1` may end up at offsets
+    /// other than `0` / `4` when one of K / V is `f64` (8-byte alignment).
+    pub(super) fn emit_hash_table_entries(
+        &mut self,
+        receiver: &Expression<'a>,
+        class_name: &str,
+        pair_class_name: &str,
+    ) -> Result<(), CompileError> {
+        let info = self.hash_table_info(class_name);
+        let size_off = self.hash_table_field_offset(class_name, "size");
+        let buckets_off = self.hash_table_field_offset(class_name, "buckets_ptr");
+        let head_off = self.hash_table_field_offset(class_name, "head_idx");
+
+        let pair_layout = self
+            .module_ctx
+            .class_registry
+            .get(pair_class_name)
+            .unwrap_or_else(|| panic!("entries() pair shape '{pair_class_name}' not registered"))
+            .clone();
+        let &(k_offset, k_wasm) = pair_layout
+            .field_map
+            .get("_0")
+            .expect("tuple shape has field _0");
+        let &(v_offset, v_wasm) = pair_layout
+            .field_map
+            .get("_1")
+            .expect("tuple shape has field _1");
+        let pair_size = pair_layout.size;
+
+        // Pin the receiver pointer once so subsequent arena allocations
+        // (every iteration allocates a fresh tuple) can't move it.
+        let this_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(receiver)?;
+        self.push(Instruction::LocalSet(this_local));
+
+        // Allocate `Array<i32>` to hold pointer-typed tuple slots. Element
+        // width is always 4 bytes — the array carries pair pointers, not
+        // inline tuple bytes.
+        let size_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(size_off));
+        self.push(Instruction::LocalSet(size_local));
+        let arr_local = crate::codegen::array_builtins::emit_alloc_array(
+            self,
+            size_local,
+            WasmType::I32,
+        )?;
+
+        let buckets_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(buckets_off));
+        self.push(Instruction::LocalSet(buckets_local));
+
+        let slot_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(this_local));
+        self.push(load_i32(head_off));
+        self.push(Instruction::LocalSet(slot_local));
+
+        let i_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(i_local));
+
+        let bucket_addr_local = self.alloc_local(WasmType::I32);
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.push(Instruction::Loop(BlockType::Empty));
+        // if slot == EMPTY_LINK: break.
+        self.push(Instruction::LocalGet(slot_local));
+        self.push(Instruction::I32Const(EMPTY_LINK));
+        self.push(Instruction::I32Eq);
+        self.push(Instruction::BrIf(1));
+
+        // bucket_addr = buckets + slot * bucket_size.
+        self.emit_bucket_addr(buckets_local, slot_local, info.bucket.total_size);
+        self.push(Instruction::LocalSet(bucket_addr_local));
+
+        // Allocate a fresh tuple instance: `pair_local = arena_alloc(pair_size)`.
+        // `emit_arena_alloc_to_local` returns the local index that holds the
+        // result; that local is fixed at compile time (the wasm op runs every
+        // loop iteration, but the variable slot is reused).
+        self.push(Instruction::I32Const(pair_size as i32));
+        let pair_local = self.emit_arena_alloc_to_local(true)?;
+
+        // pair._0 = bucket.slot (key for Map; element for Set).
+        self.push(Instruction::LocalGet(pair_local));
+        self.push(Instruction::LocalGet(bucket_addr_local));
+        self.push(load_typed(&info.slot_ty, info.bucket.slot_offset));
+        self.push(emit_field_store_inst(k_wasm, k_offset));
+
+        // pair._1 = bucket.value (Map) | bucket.slot (Set — duplicate of _0
+        // per the ES spec for Set.entries()).
+        self.push(Instruction::LocalGet(pair_local));
+        self.push(Instruction::LocalGet(bucket_addr_local));
+        match info.value_ty.as_ref() {
+            Some(value_ty) => self.push(load_typed(
+                value_ty,
+                info.bucket.value_offset.expect("map bucket has value slot"),
+            )),
+            None => self.push(load_typed(&info.slot_ty, info.bucket.slot_offset)),
+        }
+        self.push(emit_field_store_inst(v_wasm, v_offset));
+
+        // arr[i] = pair_local. Compute destination as
+        // `arr + ARRAY_HEADER + i * 4` since we're storing pointers.
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(
+            crate::codegen::expr::ARRAY_HEADER_SIZE as i32,
+        ));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(4));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(pair_local));
+        self.push(Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        // i += 1
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(i_local));
+
+        // slot = bucket.next_insert; continue.
+        self.push(Instruction::LocalGet(bucket_addr_local));
+        self.push(load_i32(info.bucket.next_offset));
+        self.push(Instruction::LocalSet(slot_local));
+        self.push(Instruction::Br(0));
+        self.push(Instruction::End); // loop
+        self.push(Instruction::End); // block
+
+        // length = i (post-walk count).
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Store(MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+
+        self.push(Instruction::LocalGet(arr_local));
         Ok(())
     }
 
@@ -1074,6 +1387,25 @@ impl<'a> FuncContext<'a> {
             slot_local,
             found_local,
         })
+    }
+}
+
+/// `i32.store` / `f64.store` for a tuple field at `offset`, picked by
+/// `WasmType`. Used by `emit_hash_table_entries` to write the K and V
+/// columns into a fresh tuple instance — the alignment hint follows the
+/// width (`align=2` for i32, `align=3` for f64, matching `mem_align`).
+fn emit_field_store_inst(wasm_ty: WasmType, offset: u32) -> Instruction<'static> {
+    match wasm_ty {
+        WasmType::F64 => Instruction::F64Store(MemArg {
+            offset: offset as u64,
+            align: 3,
+            memory_index: 0,
+        }),
+        _ => Instruction::I32Store(MemArg {
+            offset: offset as u64,
+            align: 2,
+            memory_index: 0,
+        }),
     }
 }
 

@@ -47,6 +47,21 @@ impl<'a> FuncContext<'a> {
             return Ok(result);
         }
 
+        // Typed-array statics: Int32Array.of / Int32Array.from (and the
+        // Float64Array / Uint8Array variants). Routed before the generic
+        // dispatch so the typed-array name doesn't fall through to a
+        // method-not-found error on the synthetic, methodless layout.
+        if let Some(result) = self.try_emit_typed_array_static_call(call)? {
+            return Ok(result);
+        }
+
+        // Object.<keys|values|entries>(p) — lowered against the shape's
+        // compile-time layout. Dispatched here, before generic free-function
+        // lookup, so a user `function Object(...)` doesn't shadow it.
+        if let Some(result) = self.try_emit_object_static_call(call)? {
+            return Ok(result);
+        }
+
         // Check for Math.* member calls first
         if let Some(result) = self.try_emit_math_call(call)? {
             return Ok(result);
@@ -64,6 +79,14 @@ impl<'a> FuncContext<'a> {
 
         // Check for string method calls (str.indexOf, str.slice, etc.)
         if let Some(result) = self.try_emit_string_method_call(call)? {
+            return Ok(result);
+        }
+
+        // Typed-array instance methods (`ta.at`, `ta.slice`, `ta.subarray`,
+        // …). Routed before the generic `Array<T>` dispatch so the typed-array
+        // receiver doesn't fall through to a method-not-found error on the
+        // synthesized, methodless layout.
+        if let Some(result) = self.try_emit_typed_array_method_call(call)? {
             return Ok(result);
         }
 
@@ -86,6 +109,14 @@ impl<'a> FuncContext<'a> {
 
         // Check for number instance method calls (x.toString(), x.toFixed())
         if let Some(result) = self.try_emit_number_instance_call(call)? {
+            return Ok(result);
+        }
+
+        // Coercion constructors: `String(x)`, `Number(x)`, `Boolean(x)`. Routed
+        // before the generic bare-identifier path so the names act as built-ins,
+        // but a user `function String(...)` (or class) takes precedence — the
+        // dispatcher checks `get_func` / `class_names` first.
+        if let Some(result) = self.try_emit_coercion_call(call)? {
             return Ok(result);
         }
 
@@ -373,6 +404,44 @@ impl<'a> FuncContext<'a> {
             }
             _ => Err(CompileError::unsupported(format!(
                 "Array.{method_name} is not supported"
+            ))),
+        }
+    }
+
+    /// Dispatch `<TypedArray>.<static>(...)` calls. Returns `Some` if the
+    /// receiver identifier names a registered typed-array variant. The
+    /// typed-array statics are a deliberately tiny surface (`of`, `from`) —
+    /// any other static (e.g. `Int32Array.foo()`) is a clear error rather
+    /// than a fall-through.
+    pub(crate) fn try_emit_typed_array_static_call(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
+        let (obj_name, method_name) = match &call.callee {
+            Expression::StaticMemberExpression(member) => {
+                let obj = match &member.object {
+                    Expression::Identifier(ident) => ident.name.as_str(),
+                    _ => return Ok(None),
+                };
+                (obj, member.property.name.as_str())
+            }
+            _ => return Ok(None),
+        };
+        let Some(desc) = crate::codegen::typed_arrays::descriptor_for(obj_name) else {
+            return Ok(None);
+        };
+        match method_name {
+            "of" => {
+                self.emit_typed_array_static_of(desc, call)?;
+                Ok(Some(WasmType::I32))
+            }
+            "from" => {
+                self.emit_typed_array_static_from(desc, call)?;
+                Ok(Some(WasmType::I32))
+            }
+            _ => Err(CompileError::unsupported(format!(
+                "{}.{method_name} is not supported (typed-array statics: of, from)",
+                desc.name
             ))),
         }
     }
@@ -899,6 +968,214 @@ impl<'a> FuncContext<'a> {
                 Ok(Some(WasmType::I32))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Coercion constructors: `String(x)`, `Number(x)`, `Boolean(x)`. Returns
+    /// `Some(_)` when the call site is one of these built-ins, `None` for any
+    /// other identifier-form call. A user-declared function or class with the
+    /// same name takes precedence — we look it up first and bail out so the
+    /// shadow path is preserved.
+    pub(crate) fn try_emit_coercion_call(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<Option<WasmType>, CompileError> {
+        let name = match &call.callee {
+            Expression::Identifier(ident) => ident.name.as_str(),
+            _ => return Ok(None),
+        };
+        if !matches!(name, "String" | "Number" | "Boolean") {
+            return Ok(None);
+        }
+        // Respect user shadowing: `function String(...)` or `class String {...}`
+        // wins. The post-fall-through dispatch will pick it up.
+        if self.module_ctx.get_func(name).is_some()
+            || self.module_ctx.class_names.contains(name)
+        {
+            return Ok(None);
+        }
+        if call.arguments.len() > 1 {
+            return Err(CompileError::codegen(format!(
+                "{name}() takes 0 or 1 arguments, got {}",
+                call.arguments.len()
+            )));
+        }
+        match name {
+            "String" => self.emit_string_coercion(call).map(Some),
+            "Number" => self.emit_number_coercion(call).map(Some),
+            "Boolean" => self.emit_boolean_coercion(call).map(Some),
+            _ => unreachable!(),
+        }
+    }
+
+    /// `String(x)` — return a string pointer.
+    /// - 0 args → `""`.
+    /// - string operand → identity.
+    /// - boolean operand (literal or detectable boolean expression) → static
+    ///   `"true"` / `"false"`. Runtime values whose source-level type cannot be
+    ///   recovered post-emit (e.g. an `i32` local that happens to hold 0/1)
+    ///   fall through to the numeric `i32` path and stringify as `"0"`/`"1"`.
+    /// - numeric operand → `__str_from_i32` / `__str_from_f64`.
+    fn emit_string_coercion(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        if call.arguments.is_empty() {
+            let off = self.module_ctx.alloc_static_string("");
+            self.push(Instruction::I32Const(off as i32));
+            return Ok(WasmType::I32);
+        }
+        let arg = call.arguments[0].to_expression();
+        // Boolean-literal fast path: emit the static string directly.
+        if let Expression::BooleanLiteral(lit) = arg {
+            let off = self
+                .module_ctx
+                .alloc_static_string(if lit.value { "true" } else { "false" });
+            self.push(Instruction::I32Const(off as i32));
+            return Ok(WasmType::I32);
+        }
+        // Detectable boolean expression (`!x`, `a === b`, `a && b`, …) →
+        // branch between two pre-allocated statics.
+        if self.resolve_expr_is_bool(arg) {
+            let true_off = self.module_ctx.alloc_static_string("true");
+            let false_off = self.module_ctx.alloc_static_string("false");
+            self.emit_expr(arg)?;
+            self.push(Instruction::If(wasm_encoder::BlockType::Result(
+                wasm_encoder::ValType::I32,
+            )));
+            self.push(Instruction::I32Const(true_off as i32));
+            self.push(Instruction::Else);
+            self.push(Instruction::I32Const(false_off as i32));
+            self.push(Instruction::End);
+            return Ok(WasmType::I32);
+        }
+        // Reuse the existing string-coercion path: identity for strings,
+        // numeric helpers otherwise.
+        self.emit_expr_coerce_to_string(arg)?;
+        Ok(WasmType::I32)
+    }
+
+    /// `Number(x)` — return an `f64`.
+    /// - 0 args → `0.0` (ES § 21.1.1.1: `Number()` returns `+0`).
+    /// - string operand → `__str_parseFloat` (returns `NaN` on parse failure).
+    /// - i32 operand → widen with `f64.convert_i32_s`.
+    /// - f64 operand → identity.
+    fn emit_number_coercion(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        if call.arguments.is_empty() {
+            self.push(Instruction::F64Const(0.0));
+            return Ok(WasmType::F64);
+        }
+        let arg = call.arguments[0].to_expression();
+        if self.resolve_expr_is_string(arg) {
+            self.emit_expr(arg)?;
+            let (func_idx, _) = self.module_ctx.get_func("__str_parseFloat").ok_or_else(
+                || CompileError::codegen("__str_parseFloat not registered"),
+            )?;
+            self.push(Instruction::Call(func_idx));
+            return Ok(WasmType::F64);
+        }
+        let ty = self.emit_expr(arg)?;
+        match ty {
+            WasmType::F64 => Ok(WasmType::F64),
+            WasmType::I32 => {
+                self.push(Instruction::F64ConvertI32S);
+                Ok(WasmType::F64)
+            }
+            WasmType::Void => Err(CompileError::type_err(
+                "Number() argument must be a value, got void",
+            )),
+        }
+    }
+
+    /// `Boolean(x)` — return an `i32` 0/1.
+    /// - 0 args → `0`.
+    /// - string operand → length test (the null guard's zero bytes mean a
+    ///   null pointer also reads `len = 0`, so `Boolean(null)` → 0 falls out
+    ///   for free).
+    /// - f64 operand → `(x === x) && (x !== 0)` — filters NaN and ±0.
+    /// - i32 operand → `x !== 0` (works for ints, bools, class refs, nullable
+    ///   pointers).
+    fn emit_boolean_coercion(
+        &mut self,
+        call: &CallExpression<'a>,
+    ) -> Result<WasmType, CompileError> {
+        if call.arguments.is_empty() {
+            self.push(Instruction::I32Const(0));
+            return Ok(WasmType::I32);
+        }
+        let arg = call.arguments[0].to_expression();
+        if self.resolve_expr_is_string(arg) {
+            self.emit_expr(arg)?;
+            self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.push(Instruction::I32Const(0));
+            self.push(Instruction::I32Ne);
+            return Ok(WasmType::I32);
+        }
+        let ty = self.emit_expr(arg)?;
+        match ty {
+            WasmType::I32 => {
+                self.push(Instruction::I32Const(0));
+                self.push(Instruction::I32Ne);
+                Ok(WasmType::I32)
+            }
+            WasmType::F64 => {
+                let tmp = self.alloc_local(WasmType::F64);
+                self.push(Instruction::LocalTee(tmp));
+                self.push(Instruction::LocalGet(tmp));
+                self.push(Instruction::F64Eq); // (x === x) — 0 iff NaN
+                self.push(Instruction::LocalGet(tmp));
+                self.push(Instruction::F64Const(0.0));
+                self.push(Instruction::F64Ne); // (x !== 0)
+                self.push(Instruction::I32And);
+                Ok(WasmType::I32)
+            }
+            WasmType::Void => Err(CompileError::type_err(
+                "Boolean() argument must be a value, got void",
+            )),
+        }
+    }
+
+    /// Best-effort detection that an expression evaluates to a 0/1 boolean.
+    /// Conservative: returns `true` only when the AST shape guarantees the
+    /// result is bool-typed. Used by `String(x)` to pick "true"/"false" over
+    /// "0"/"1" stringification. Identifier-form variables fall through to
+    /// `false` because tscc doesn't track bool-typed locals separately.
+    fn resolve_expr_is_bool(&self, expr: &Expression<'a>) -> bool {
+        match expr {
+            Expression::BooleanLiteral(_) => true,
+            Expression::ParenthesizedExpression(p) => self.resolve_expr_is_bool(&p.expression),
+            Expression::UnaryExpression(u) => matches!(u.operator, UnaryOperator::LogicalNot),
+            Expression::BinaryExpression(b) => matches!(
+                b.operator,
+                BinaryOperator::Equality
+                    | BinaryOperator::Inequality
+                    | BinaryOperator::StrictEquality
+                    | BinaryOperator::StrictInequality
+                    | BinaryOperator::LessThan
+                    | BinaryOperator::LessEqualThan
+                    | BinaryOperator::GreaterThan
+                    | BinaryOperator::GreaterEqualThan
+                    | BinaryOperator::Instanceof
+                    | BinaryOperator::In
+            ),
+            Expression::LogicalExpression(l) => match l.operator {
+                LogicalOperator::And | LogicalOperator::Or => {
+                    self.resolve_expr_is_bool(&l.left) && self.resolve_expr_is_bool(&l.right)
+                }
+                LogicalOperator::Coalesce => false,
+            },
+            Expression::ConditionalExpression(c) => {
+                self.resolve_expr_is_bool(&c.consequent)
+                    && self.resolve_expr_is_bool(&c.alternate)
+            }
+            _ => false,
         }
     }
 

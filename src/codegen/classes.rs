@@ -37,6 +37,16 @@ pub struct ClassLayout {
     pub vtable_offset: u32,
     /// Fields declared directly in this class (not inherited from parent)
     pub own_field_names: HashSet<String>,
+    /// True for the typed-array pseudo-classes (`Int32Array`, `Float64Array`,
+    /// `Uint8Array`) registered by `typed_arrays::register_typed_arrays`.
+    /// Gates them off the regular class machinery: vtable allocation,
+    /// constructor lookup, method dispatch, and field-of-class layout
+    /// recursion all branch on this bit. The header layout (`[len][buf_ptr]`)
+    /// and per-variant element codegen are dispatched via
+    /// `typed_arrays::descriptor_for(name)` rather than this struct's
+    /// `fields` (which stays empty for typed arrays).
+    #[allow(dead_code, reason = "consumed by typed-array sub-phases 2+")]
+    pub is_typed_array: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +458,7 @@ impl ClassRegistry {
                 vtable_method_map,
                 vtable_offset: 0, // set later during vtable construction
                 own_field_names,
+                is_typed_array: false,
             },
         );
 
@@ -514,6 +525,7 @@ impl ClassRegistry {
                 vtable_method_map: HashMap::new(),
                 vtable_offset: 0,
                 own_field_names,
+                is_typed_array: false,
             },
         );
 

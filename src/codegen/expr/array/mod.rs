@@ -277,6 +277,31 @@ impl<'a> FuncContext<'a> {
                     {
                         return self.resolve_array_static_call_elem(call, method);
                     }
+                    // Object.keys / values / entries — element WasmType
+                    // depends on the receiver's shape layout. keys is always
+                    // i32 (string pointers); values follows the field
+                    // WasmType; entries is i32 (tuple pointers).
+                    if let Expression::Identifier(obj) = &member.object
+                        && obj.name.as_str() == "Object"
+                        && let Some(arg) = call.arguments.first()
+                    {
+                        return self.resolve_object_static_call_elem(method, arg.to_expression());
+                    }
+                    // `mapOrSet.keys()` / `.values()` materialize the
+                    // insertion chain into a fresh `Array<X>`. Element type
+                    // comes from the receiver's `HashTableInfo`: keys() pulls
+                    // `slot_ty`, values() pulls `value_ty` (Map only).
+                    if matches!(method, "keys" | "values")
+                        && let Ok(recv_class) = self.resolve_expr_class(&member.object)
+                        && let Some(info) =
+                            self.module_ctx.hash_table_info.get(&recv_class)
+                    {
+                        return Some(match method {
+                            "keys" => info.slot_ty.wasm_ty(),
+                            "values" => info.value_ty.as_ref().unwrap_or(&info.slot_ty).wasm_ty(),
+                            _ => unreachable!(),
+                        });
+                    }
                     match method {
                         "filter" | "sort" | "splice" | "slice" | "concat" | "toReversed"
                         | "toSorted" | "toSpliced" | "with" => {
@@ -427,6 +452,49 @@ impl<'a> FuncContext<'a> {
                             call.arguments[0].to_expression(),
                         );
                     }
+                    // `mapOrSet.keys()` / `.values()` carry through the
+                    // class name when the column is class-typed
+                    // (`BoundType::Class(name)`). `.entries()` always
+                    // produces an `Array<__Tuple$K$V>` whose element class
+                    // is the synthetic pair shape registered per Map/Set
+                    // instantiation (see `module.rs` :: `ensure_tuple_shape`).
+                    if matches!(method, "keys" | "values" | "entries")
+                        && let Ok(recv_class) = self.resolve_expr_class(&member.object)
+                        && let Some(info) =
+                            self.module_ctx.hash_table_info.get(&recv_class)
+                    {
+                        if method == "entries" {
+                            let elements = match info.value_ty.as_ref() {
+                                Some(v_ty) => vec![info.slot_ty.clone(), v_ty.clone()],
+                                None => vec![info.slot_ty.clone(), info.slot_ty.clone()],
+                            };
+                            let pair_class = format!(
+                                "__Tuple${}",
+                                crate::codegen::shapes::tuple_fingerprint_of(&elements)
+                            );
+                            return Some(pair_class);
+                        }
+                        let column = match method {
+                            "keys" => &info.slot_ty,
+                            "values" => info.value_ty.as_ref().unwrap_or(&info.slot_ty),
+                            _ => unreachable!(),
+                        };
+                        if let crate::types::BoundType::Class(name) = column {
+                            return Some(name.clone());
+                        }
+                        return None;
+                    }
+                    // Object.entries(p) — element class is the registered
+                    // tuple shape `[string, T]` derived from p's layout.
+                    // Object.keys / values produce primitive-element arrays
+                    // (no element class).
+                    if let Expression::Identifier(obj) = &member.object
+                        && obj.name.as_str() == "Object"
+                        && method == "entries"
+                        && let Some(arg) = call.arguments.first()
+                    {
+                        return self.resolve_object_entries_elem_class(arg.to_expression());
+                    }
                     match method {
                         "filter" | "sort" | "splice" | "slice" | "concat" | "toReversed"
                         | "toSorted" | "toSpliced" | "with" => {
@@ -440,5 +508,70 @@ impl<'a> FuncContext<'a> {
             }
             _ => None,
         }
+    }
+
+    /// Element WasmType for `Object.<keys|values|entries>(arg)`. `keys` /
+    /// `entries` always yield i32 element arrays (string ptrs / tuple ptrs);
+    /// `values` follows the receiver shape's homogeneous field WasmType.
+    fn resolve_object_static_call_elem(
+        &self,
+        method: &str,
+        arg: &Expression<'a>,
+    ) -> Option<WasmType> {
+        match method {
+            "keys" | "entries" => Some(WasmType::I32),
+            "values" => {
+                let class_name = self.resolve_expr_class(arg).ok()?;
+                let layout = self.module_ctx.class_registry.get(&class_name)?;
+                layout.fields.first().map(|(_, _, ty)| *ty)
+            }
+            _ => None,
+        }
+    }
+
+    /// Tuple class for `Object.entries(arg)` elements. Returns `None` if the
+    /// receiver isn't a registered shape, isn't homogeneous, or the
+    /// `[string, T]` tuple shape wasn't pre-registered (in which case
+    /// emission produces a clearer diagnostic anyway).
+    fn resolve_object_entries_elem_class(
+        &self,
+        arg: &Expression<'a>,
+    ) -> Option<String> {
+        use crate::types::BoundType;
+        let class_name = self.resolve_expr_class(arg).ok()?;
+        let layout = self.module_ctx.class_registry.get(&class_name)?;
+        let first_name = &layout.fields.first()?.0;
+        let first_ty = layout.fields.first()?.2;
+        let first_bt = field_bound_type_for_layout(layout, first_name, first_ty);
+        for (n, _, ty) in &layout.fields {
+            let bt = field_bound_type_for_layout(layout, n, *ty);
+            if bt != first_bt {
+                return None;
+            }
+        }
+        let elements = vec![BoundType::Str, first_bt];
+        let fp = crate::codegen::shapes::tuple_fingerprint_of(&elements);
+        self.module_ctx
+            .shape_registry
+            .get_by_fingerprint(&fp)
+            .map(|s| s.name.clone())
+    }
+}
+
+fn field_bound_type_for_layout(
+    layout: &crate::codegen::classes::ClassLayout,
+    name: &str,
+    wasm_ty: WasmType,
+) -> crate::types::BoundType {
+    use crate::types::BoundType;
+    if layout.field_string_types.contains(name) {
+        return BoundType::Str;
+    }
+    if let Some(cn) = layout.field_class_types.get(name) {
+        return BoundType::Class(cn.clone());
+    }
+    match wasm_ty {
+        WasmType::F64 => BoundType::F64,
+        _ => BoundType::I32,
     }
 }

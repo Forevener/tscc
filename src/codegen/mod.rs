@@ -17,6 +17,7 @@ pub(crate) mod shapes;
 pub(crate) mod splice;
 mod stmt;
 pub(crate) mod string_builtins;
+pub(crate) mod typed_arrays;
 pub(crate) mod unions;
 pub(crate) mod wasm_types;
 

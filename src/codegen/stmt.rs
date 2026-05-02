@@ -940,6 +940,14 @@ impl<'a> FuncContext<'a> {
             }
         };
 
+        // Typed-array iteree: same i=0..len skeleton as Array<T>, but element
+        // address is `buf_ptr + i*stride` (loaded once at the top — Cranelift
+        // hoists no further than tscc has) and the load opcode comes from
+        // the descriptor.
+        if let Some(desc) = self.resolve_expr_typed_array(&for_of.right) {
+            return self.emit_for_of_typed_array(for_of, &elem_name, desc);
+        }
+
         // Resolve array element type from the right-hand expression
         let elem_ty = self.resolve_expr_array_elem(&for_of.right).ok_or_else(|| {
             CompileError::codegen("for..of requires an Array<T> — cannot resolve element type")
@@ -1064,6 +1072,110 @@ impl<'a> FuncContext<'a> {
         self.push(Instruction::End); // end loop
         self.block_depth -= 1;
         self.push(Instruction::End); // end block
+        self.block_depth -= 1;
+
+        Ok(())
+    }
+
+    /// `for (const x of ta)` over a typed array. Same desugaring as the
+    /// `Array<T>` path, but body addresses are `buf_ptr + i*stride` (with the
+    /// descriptor's load opcode) so view sources work transparently and the
+    /// stride dispatch slots in cleanly under sub-phase 5's `Uint8Array`.
+    fn emit_for_of_typed_array(
+        &mut self,
+        for_of: &ForOfStatement<'a>,
+        elem_name: &str,
+        desc: &'static crate::codegen::typed_arrays::TypedArrayDescriptor,
+    ) -> Result<(), CompileError> {
+        // Evaluate ta, save to local.
+        let ta_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(&for_of.right)?;
+        self.push(Instruction::LocalSet(ta_local));
+
+        // Load len once at the top — typed-array len is a header word and
+        // never changes during iteration (typed arrays don't grow).
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(ta_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+
+        // Load buf_ptr once — explicit LICM. Even though Cranelift hoists
+        // `i32.load offset=4` from a hot loop, we'd still emit one wasm
+        // instruction per iteration without this; pulling it into a local
+        // up-front keeps the emit tight and the loop body identical to the
+        // flat-layout path beyond the address calc.
+        let buf_ptr_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(ta_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 4,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(buf_ptr_local));
+
+        let i_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(i_local));
+
+        // Declare element local with the descriptor's element type.
+        let elem_local = self.declare_local(elem_name, desc.elem_wasm_ty);
+        if let ForStatementLeft::VariableDeclaration(var_decl) = &for_of.left
+            && var_decl.kind == VariableDeclarationKind::Const
+        {
+            self.const_locals.insert(elem_name.to_string());
+        }
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let break_depth = self.block_depth;
+        self.push(Instruction::Loop(BlockType::Empty));
+        self.block_depth += 1;
+
+        // if i >= len, break.
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32GeU);
+        self.push(Instruction::BrIf(1));
+
+        // elem = buf_ptr + i*stride; load via descriptor.
+        self.push(Instruction::LocalGet(buf_ptr_local));
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(desc.byte_stride as i32));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        self.push(desc.load_inst(0));
+        self.push(Instruction::LocalSet(elem_local));
+
+        // Continue target.
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let continue_depth = self.block_depth;
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
+
+        self.emit_statement(&for_of.body)?;
+
+        self.loop_stack.pop();
+        self.push(Instruction::End); // continue block
+        self.block_depth -= 1;
+
+        // i++
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(i_local));
+
+        self.push(Instruction::Br(0));
+
+        self.push(Instruction::End); // loop
+        self.block_depth -= 1;
+        self.push(Instruction::End); // outer block
         self.block_depth -= 1;
 
         Ok(())

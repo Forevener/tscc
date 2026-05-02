@@ -50,7 +50,7 @@ fn field_token(f: &ShapeField) -> String {
 /// Distinct from `fingerprint_of` because token elements never contain the
 /// `_` separator that object-field pairs produce (`name_ty`) — so the two
 /// fingerprint namespaces cannot collide.
-pub(super) fn tuple_fingerprint_of(elems: &[BoundType]) -> String {
+pub(crate) fn tuple_fingerprint_of(elems: &[BoundType]) -> String {
     elems
         .iter()
         .map(|t| t.mangle_token())

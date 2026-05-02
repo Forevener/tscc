@@ -8,9 +8,13 @@ mod hash_table;
 mod map;
 mod member;
 pub(crate) mod object;
+mod object_static;
 mod set;
 mod string;
 mod tuple;
+mod typed_array;
+mod typed_array_hofs;
+mod typed_array_methods;
 
 use oxc_ast::ast::*;
 use wasm_encoder::Instruction;

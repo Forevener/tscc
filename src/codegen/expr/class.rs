@@ -36,6 +36,15 @@ impl<'a> FuncContext<'a> {
             return self.emit_new_set(new_expr);
         }
 
+        // Typed arrays — Int32Array / Float64Array / Uint8Array. Routed here
+        // (before the generic class lookup) because their `ClassLayout` is
+        // synthetic — methodless, fieldless — and the generic path would
+        // happily allocate an 8-byte zeroed pseudo-instance instead of a
+        // proper typed-array header + body.
+        if let Some(desc) = crate::codegen::typed_arrays::descriptor_for(base_name) {
+            return self.emit_new_typed_array(desc, new_expr);
+        }
+
         // Generic instantiation: `new Box<i32>(...)` → look up the mangled
         // monomorphization. Type args may themselves reference the enclosing
         // function's type parameters, so we thread through `type_bindings`.
@@ -1231,6 +1240,28 @@ impl<'a> FuncContext<'a> {
                     // Try method call: obj.method()
                     if let Ok(obj_class) = self.resolve_expr_class(&member.object) {
                         let method_name = member.property.name.as_str();
+                        // Typed-array methods that return the same kind as
+                        // the receiver — `slice` / `subarray` / `map` /
+                        // `filter` / `fill` / `reverse` / `sort` /
+                        // `copyWithin`. Without this, chained HOF calls
+                        // (e.g. `ta.filter(...).map(...)`) lose their
+                        // typed-array kind and fall through to the
+                        // generic call dispatch.
+                        if crate::codegen::typed_arrays::descriptor_for(&obj_class).is_some()
+                            && matches!(
+                                method_name,
+                                "slice"
+                                    | "subarray"
+                                    | "map"
+                                    | "filter"
+                                    | "fill"
+                                    | "reverse"
+                                    | "sort"
+                                    | "copyWithin"
+                            )
+                        {
+                            return Ok(obj_class);
+                        }
                         if let Some(layout) = self.module_ctx.class_registry.get(&obj_class)
                             && let Some(method_sig) = layout.methods.get(method_name)
                             && let Some(ref ret_class) = method_sig.return_class

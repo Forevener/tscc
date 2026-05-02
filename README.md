@@ -59,6 +59,7 @@ tscc has: full closures, arena allocation (no GC), deterministic output, complet
 - **Strings:** arena-allocated, with a tree-shaken set of runtime helpers for the standard string methods.
 - **Classes:** arena-allocated structs, single inheritance, vtable-based polymorphic dispatch, override validation.
 - **Arrays:** `Array<T>` / `T[]`, growable with capacity doubling. Literal syntax `[a, b, c]` and spread `[a, ...xs, b]`.
+- **Typed arrays:** `Int32Array`, `Float64Array`, `Uint8Array` — fixed-element-width buffers with the standard immutable / mutable / HOF method surface. `subarray` is a true aliasing view (mutations propagate to the parent); `slice` is an independent copy. `Uint8Array` reads zero-extend; stores wrap modulo 256 via `i32.store8`. Composes as a class field, generic arg, function param/return, and through chained HOFs (`filter→map→reduce` carries kind through every step).
 - **Nullable:** `T | null`, with `null` represented as pointer 0.
 - **Const enums.**
 - **Generics (Phase A):** explicit type-arg form — `class Box<T>`, `class Pair<K, V>`, `function identity<T>(x: T): T`. Monomorphized per instantiation.
@@ -105,7 +106,13 @@ tscc has: full closures, arena allocation (no GC), deterministic output, complet
 
 **Array:** `push`, `pop`, `indexOf`, `lastIndexOf`, `includes`, `reverse`, `at`, `fill`, `slice`, `concat`, `join`, `splice`, `isArray` (compile-time). HOFs with `(value, index)` callbacks: `filter`, `map`, `forEach`, `reduce`, `sort` (merge sort), `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`.
 
-**Globals:** `NaN`, `Infinity`, `isNaN()`, `isFinite()`.
+**TypedArray (`Int32Array`, `Float64Array`, `Uint8Array`):** `length`, `byteLength`, static `BYTES_PER_ELEMENT`. Construction: `new T(n)` (zero-fill), `new T([...])`, `new T(src)` (`Array<T>` or another typed array — copies), `T.of(...items)`, `T.from(src)`, `T.from(src, mapFn)`. Methods: `at`, `indexOf`, `lastIndexOf`, `includes`, `join`, `slice` (copy), `subarray` (view), `fill`, `set` (cross-kind widen/narrow with element-wise loop, same-kind `memory.copy`), `reverse`, `sort` (numeric default + comparator), `copyWithin`. HOFs: `forEach`, `map`, `filter`, `reduce`, `reduceRight`, `find`, `findIndex`, `findLast`, `findLastIndex`, `some`, `every`. `map` / `filter` return same-kind typed arrays.
+
+**Object:** `keys`, `values`, `entries` on shape-typed objects — lowered against the compile-time field set, so the result is a fresh `Array<string>` (keys) or `Array<T>` (values, when fields share a type) or `Array<[string, T]>` (entries, requires the tuple shape to be reachable from the program's annotations). Heterogeneous shapes are rejected with a "mixed types" diagnostic.
+
+**Map / Set:** `size`, `clear`, `has`, `get` (Map), `set` (Map), `add` (Set), `delete`, `forEach`, `keys`, `values`, `entries`. `keys()` / `values()` materialize the insertion-order chain into a fresh `Array<K>` / `Array<V>` (and `Set.keys` is the ES-spec alias of `Set.values`); `entries()` does the same with each row written into a freshly arena-allocated pair (`[K, V]` for Map, `[T, T]` for Set per the ES spec). All three return real `Array<T>` so they compose through HOFs (`m.keys().filter(...)`, `m.entries().forEach(...)`) and `for..of`.
+
+**Globals:** `NaN`, `Infinity`, `isNaN()`, `isFinite()`. Coercion constructors `String(x)`, `Number(x)`, `Boolean(x)` — `String(true)`/`String(false)` and detectable boolean expressions stringify as `"true"`/`"false"`; runtime values whose source-level type is opaque post-emit fall through to the numeric path. User-declared `function String(...)` (or class) shadows the built-in.
 
 ## Memory model
 

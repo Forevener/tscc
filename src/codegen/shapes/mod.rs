@@ -53,7 +53,7 @@ mod walker;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use fingerprint::fingerprint_of;
+pub(crate) use fingerprint::{fingerprint_of, tuple_fingerprint_of};
 pub(crate) use walker::literal_type_to_tag;
 use walker::{
     NamedShapeAst, ShapeWalker, collect_generic_shape_templates, collect_named_shape_names,
@@ -297,6 +297,45 @@ pub fn discover_shapes<'a, 'ctx>(
     }
 
     Ok(walker.registry)
+}
+
+/// Register a synthetic tuple shape for the given element types, returning
+/// the tuple's class name. Idempotent: if a tuple with the same positional
+/// fingerprint already exists (e.g. because the user wrote `[K, V]`
+/// syntactically, or a previous call registered the same pair), the
+/// existing entry's name is returned without inserting a duplicate.
+///
+/// Used by `module.rs` after shape discovery to pre-register tuple shapes
+/// for `Map.entries()` / `Set.entries()` result types — those tuples don't
+/// appear syntactically in user source, so the walker can't discover them
+/// the usual way, but the synthetic-class registration loop still needs an
+/// entry in the registry to pick up.
+pub fn ensure_tuple_shape(registry: &mut ShapeRegistry, element_tys: &[BoundType]) -> String {
+    let fp = tuple_fingerprint_of(element_tys);
+    if let Some(&idx) = registry.by_fingerprint.get(&fp) {
+        return registry.shapes[idx].name.clone();
+    }
+    let name = format!("{TUPLE_SHAPE_PREFIX}{fp}");
+    let fields: Vec<ShapeField> = element_tys
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| ShapeField {
+            name: format!("_{i}"),
+            ty: ty.clone(),
+            tag_value: None,
+        })
+        .collect();
+    let idx = registry.shapes.len();
+    registry.shapes.push(Shape {
+        kind: ShapeKind::Anonymous,
+        name: name.clone(),
+        fingerprint: fp.clone(),
+        fields,
+        is_tuple: true,
+    });
+    registry.by_fingerprint.insert(fp, idx);
+    registry.by_name.insert(name.clone(), idx);
+    name
 }
 
 /// Walk the program and collect every named / generic shape name

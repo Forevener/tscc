@@ -386,3 +386,200 @@ fn set_with_different_element_types_coexist() {
     );
     assert_eq!(values, vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0]);
 }
+
+// ─── values() / keys() / entries() ──────────────────────────────────────────
+
+/// `s.values()` materializes the insertion chain into a fresh `Array<T>`.
+/// `s.keys()` is the ES-spec alias for `.values()` on Set — same emitter,
+/// same output.
+#[test]
+fn set_values_returns_array_in_insertion_order() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            s.add(30);
+            s.add(10);
+            s.add(20);
+            const xs: i32[] = s.values();
+            sink(f64(xs.length));
+            for (const x of xs) {
+                sink(f64(x));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![3.0, 30.0, 10.0, 20.0]);
+}
+
+/// `Set.keys()` is identical to `Set.values()` per the ES spec — both
+/// dispatch onto the same emitter.
+#[test]
+fn set_keys_aliases_values() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            s.add(1);
+            s.add(2);
+            const ks: i32[] = s.keys();
+            const vs: i32[] = s.values();
+            sink(f64(ks.length));
+            sink(f64(vs.length));
+            for (const k of ks) { sink(f64(k)); }
+            for (const v of vs) { sink(f64(v)); }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 2.0, 1.0, 2.0, 1.0, 2.0]);
+}
+
+#[test]
+fn set_values_skips_deleted() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            s.add(1);
+            s.add(2);
+            s.add(3);
+            s.delete(2);
+            const xs: i32[] = s.values();
+            sink(f64(xs.length));
+            for (const x of xs) {
+                sink(f64(x));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 1.0, 3.0]);
+}
+
+#[test]
+fn set_values_on_empty_returns_empty_array() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            const xs: i32[] = s.values();
+            sink(f64(xs.length));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![0.0]);
+}
+
+#[test]
+fn set_values_carries_f64_element_type() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<f64> = new Set<f64>();
+            s.add(1.5);
+            s.add(2.5);
+            const xs: f64[] = s.values();
+            for (const x of xs) {
+                sink(x);
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![1.5, 2.5]);
+}
+
+#[test]
+fn set_values_composes_with_array_reduce() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            s.add(1);
+            s.add(2);
+            s.add(3);
+            s.add(4);
+            const sum: i32 = s.values().reduce((acc: i32, x: i32) => acc + x, 0);
+            sink(f64(sum));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![10.0]);
+}
+
+/// `s.entries()` returns `Array<[T, T]>` with each pair `[v, v]` — Set's
+/// entries are duplicated for API parity with Map per the ES spec.
+#[test]
+fn set_entries_returns_array_of_duplicated_pairs() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            s.add(7);
+            s.add(3);
+            s.add(11);
+            const es: Array<[i32, i32]> = s.entries();
+            sink(f64(es.length));
+            for (const e of es) {
+                sink(f64(e[0]));
+                sink(f64(e[1]));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![3.0, 7.0, 7.0, 3.0, 3.0, 11.0, 11.0]);
+}
+
+/// `s.entries()` on a string Set: the duplicated pair carries the same
+/// pointer in `_0` and `_1`, which round-trips through `s.has(...)`.
+#[test]
+fn set_entries_string_pair_is_duplicate_pointer() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<string> = new Set<string>();
+            s.add("apple");
+            s.add("pear");
+            const es: Array<[string, string]> = s.entries();
+            sink(f64(es.length));
+            for (const e of es) {
+                sink(f64(s.has(e[0])));
+                sink(f64(s.has(e[1])));
+                sink(f64(e[0].length === e[1].length ? 1 : 0));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+}
+
+/// `s.entries()` on an empty Set is an empty array.
+#[test]
+fn set_entries_on_empty_returns_empty_array() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        export function tick(_me: i32): void {
+            const s: Set<i32> = new Set<i32>();
+            const es: Array<[i32, i32]> = s.entries();
+            sink(f64(es.length));
+        }
+        "#,
+    );
+    assert_eq!(values, vec![0.0]);
+}

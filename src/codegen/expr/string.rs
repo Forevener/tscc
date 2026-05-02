@@ -268,6 +268,15 @@ impl<'a> FuncContext<'a> {
                 }
             }
             Expression::CallExpression(call) => {
+                // `String(x)` coercion constructor returns a string. Skip if
+                // a user function or class has shadowed the name.
+                if let Expression::Identifier(callee) = &call.callee
+                    && callee.name.as_str() == "String"
+                    && self.module_ctx.get_func("String").is_none()
+                    && !self.module_ctx.class_names.contains("String")
+                {
+                    return true;
+                }
                 if let Expression::StaticMemberExpression(member) = &call.callee {
                     // String.fromCharCode(...) / String.fromCodePoint(...)
                     if let Expression::Identifier(obj) = &member.object

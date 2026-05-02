@@ -582,6 +582,18 @@ impl<'a> FuncContext<'a> {
                 {
                     return Ok((WasmType::I32, None));
                 }
+                // Object.keys / Object.values / Object.entries — all return
+                // a fresh array (i32 pointer). Element-type tracking is the
+                // responsibility of `resolve_expr_array_elem` (Array<string>
+                // for keys, Array<T> for values, Array<[string, T]> for
+                // entries with the tuple class threaded through).
+                if let Expression::StaticMemberExpression(member) = &call.callee
+                    && let Expression::Identifier(ident) = &member.object
+                    && ident.name.as_str() == "Object"
+                    && matches!(member.property.name.as_str(), "keys" | "values" | "entries")
+                {
+                    return Ok((WasmType::I32, None));
+                }
                 Err(CompileError::type_err(
                     "cannot infer type from this expression — add a type annotation",
                 ))

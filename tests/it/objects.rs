@@ -1522,3 +1522,260 @@ fn shorthand_anonymous_without_annotation_errors_like_nonshorthand() {
         err.message
     );
 }
+
+// ---- Object.keys / values / entries ----
+
+#[test]
+fn object_keys_returns_field_names() {
+    // Keys come back in declaration order. Dump them through a length probe
+    // and per-element pointer lookups so we can read the strings out of WASM
+    // memory and verify both the count and the contents.
+    let wasm = compile(
+        r#"
+        type Point = { x: f64; y: f64; z: f64 };
+
+        export function tick(_me: i32): void {}
+
+        export function len(): i32 {
+            const p: Point = { x: 1.0, y: 2.0, z: 3.0 };
+            const ks = Object.keys(p);
+            return ks.length;
+        }
+        export function key(i: i32): i32 {
+            const p: Point = { x: 1.0, y: 2.0, z: 3.0 };
+            const ks = Object.keys(p);
+            return ks[i];
+        }
+        "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &module).unwrap();
+    let len = instance
+        .get_typed_func::<(), i32>(&mut store, "len")
+        .unwrap();
+    assert_eq!(len.call(&mut store, ()).unwrap(), 3);
+
+    let key_ptr = instance
+        .get_typed_func::<i32, i32>(&mut store, "key")
+        .unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let p0 = key_ptr.call(&mut store, 0).unwrap();
+    let p1 = key_ptr.call(&mut store, 1).unwrap();
+    let p2 = key_ptr.call(&mut store, 2).unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, p0), "x");
+    assert_eq!(read_wasm_string(&store, &memory, p1), "y");
+    assert_eq!(read_wasm_string(&store, &memory, p2), "z");
+}
+
+#[test]
+fn object_values_f64_fields() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        type Point = { x: f64; y: f64; z: f64 };
+
+        export function tick(_me: i32): void {
+            const p: Point = { x: 1.5, y: 2.5, z: 3.5 };
+            const vs = Object.values(p);
+            for (let i: i32 = 0; i < vs.length; i = i + 1) {
+                sink(vs[i]);
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![1.5, 2.5, 3.5]);
+}
+
+#[test]
+fn object_values_i32_fields() {
+    let values = run_sink_tick(
+        r#"
+        declare function sink(x: f64): void;
+
+        type Hit = { id: i32; dmg: i32; team: i32 };
+
+        export function tick(_me: i32): void {
+            const h: Hit = { id: 7, dmg: 42, team: 1 };
+            const vs = Object.values(h);
+            for (let i: i32 = 0; i < vs.length; i = i + 1) {
+                sink(f64(vs[i]));
+            }
+        }
+        "#,
+    );
+    assert_eq!(values, vec![7.0, 42.0, 1.0]);
+}
+
+#[test]
+fn object_values_string_fields() {
+    // All-string shape: values lower to a fresh `Array<string>` (i32 ptrs).
+    // The result is read back through manual indexing, then each ptr is
+    // unwrapped through the standard string-pointer layout.
+    let wasm = compile(
+        r#"
+        type Names = { first: string; last: string };
+
+        export function tick(_me: i32): void {}
+
+        export function val(i: i32): i32 {
+            const n: Names = { first: "Ada", last: "Lovelace" };
+            const vs = Object.values(n);
+            return vs[i];
+        }
+        "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &module).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let val = instance.get_typed_func::<i32, i32>(&mut store, "val").unwrap();
+    let p0 = val.call(&mut store, 0).unwrap();
+    let p1 = val.call(&mut store, 1).unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, p0), "Ada");
+    assert_eq!(read_wasm_string(&store, &memory, p1), "Lovelace");
+}
+
+#[test]
+fn object_keys_evaluates_argument_for_side_effects() {
+    // Field names are a compile-time view of the layout, but the argument
+    // expression itself must still execute (in case the user is calling a
+    // function with side effects). Use a host-side counter to verify the
+    // arg is evaluated exactly once.
+    use std::sync::{Arc, Mutex};
+    let counter: Arc<Mutex<i32>> = Arc::new(Mutex::new(0));
+    let source = r#"
+        type P = { a: i32; b: i32 };
+        declare function bump(): i32;
+
+        export function tick(_me: i32): void {}
+        export function len_after_bump(): i32 {
+            const p: P = { a: bump(), b: 0 };
+            const ks = Object.keys(p);
+            return ks.length;
+        }
+        "#;
+    let wasm = compile(source);
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, counter.clone());
+    let mut linker = Linker::new(&engine);
+    linker
+        .func_wrap("host", "bump", |caller: Caller<'_, Arc<Mutex<i32>>>| -> i32 {
+            let mut g = caller.data().lock().unwrap();
+            *g += 1;
+            *g
+        })
+        .unwrap();
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let f = instance
+        .get_typed_func::<(), i32>(&mut store, "len_after_bump")
+        .unwrap();
+    assert_eq!(f.call(&mut store, ()).unwrap(), 2);
+    // bump() ran once during the literal, plus zero times during keys().
+    assert_eq!(*counter.lock().unwrap(), 1);
+}
+
+#[test]
+fn object_values_rejects_mixed_field_types() {
+    let err = compile_err(
+        r#"
+        type Mixed = { id: i32; dist: f64 };
+
+        export function tick(_me: i32): void {
+            const m: Mixed = { id: 1, dist: 2.5 };
+            const vs = Object.values(m);
+        }
+        "#,
+    );
+    assert!(
+        err.message.contains("mixed types"),
+        "expected 'mixed types' diagnostic, got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn object_keys_rejects_non_shape_argument() {
+    let err = compile_err(
+        r#"
+        export function tick(_me: i32): void {
+            const x: f64 = 1.5;
+            const ks = Object.keys(x);
+        }
+        "#,
+    );
+    assert!(
+        err.message.contains("shape-typed"),
+        "expected 'shape-typed' in error, got: {}",
+        err.message
+    );
+}
+
+#[test]
+fn object_entries_i32_fields() {
+    // Round-trip: build a shape, take entries, and read each [key, value]
+    // pair back out via tuple slot access. Annotation on the receiver is
+    // what registers the `[string, i32]` tuple shape during the pre-codegen
+    // walk — without it, Object.entries errors with a hint to add the
+    // annotation.
+    let wasm = compile(
+        r#"
+        type Hit = { id: i32; dmg: i32 };
+
+        export function tick(_me: i32): void {}
+
+        export function entry_key(i: i32): i32 {
+            const h: Hit = { id: 7, dmg: 42 };
+            const e: Array<[string, i32]> = Object.entries(h);
+            return e[i][0];
+        }
+        export function entry_val(i: i32): i32 {
+            const h: Hit = { id: 7, dmg: 42 };
+            const e: Array<[string, i32]> = Object.entries(h);
+            return e[i][1];
+        }
+        "#,
+    );
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let mut store = Store::new(&engine, ());
+    let instance = Linker::new(&engine).instantiate(&mut store, &module).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+    let entry_key = instance
+        .get_typed_func::<i32, i32>(&mut store, "entry_key")
+        .unwrap();
+    let entry_val = instance
+        .get_typed_func::<i32, i32>(&mut store, "entry_val")
+        .unwrap();
+    let k0 = entry_key.call(&mut store, 0).unwrap();
+    let k1 = entry_key.call(&mut store, 1).unwrap();
+    assert_eq!(read_wasm_string(&store, &memory, k0), "id");
+    assert_eq!(read_wasm_string(&store, &memory, k1), "dmg");
+    assert_eq!(entry_val.call(&mut store, 0).unwrap(), 7);
+    assert_eq!(entry_val.call(&mut store, 1).unwrap(), 42);
+}
+
+#[test]
+fn object_entries_errors_without_tuple_annotation() {
+    // No `[string, T][]` annotation anywhere in the program — the tuple
+    // shape never gets registered, so emission errors with a clear hint.
+    let err = compile_err(
+        r#"
+        type Hit = { id: i32; dmg: i32 };
+
+        export function tick(_me: i32): void {
+            const h: Hit = { id: 7, dmg: 42 };
+            const e = Object.entries(h);
+        }
+        "#,
+    );
+    assert!(
+        err.message.contains("tuple shape [string, i32]"),
+        "expected tuple-shape hint in error, got: {}",
+        err.message
+    );
+}
