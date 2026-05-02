@@ -234,6 +234,8 @@ fn register_typed_array_layout(
             field_map: HashMap::new(),
             field_class_types: HashMap::new(),
             field_string_types: HashSet::new(),
+            field_array_elem_types: HashMap::new(),
+            field_array_elem_classes: HashMap::new(),
             methods: HashMap::new(),
             parent: None,
             is_polymorphic: false,
@@ -242,6 +244,7 @@ fn register_typed_array_layout(
             vtable_offset: 0,
             own_field_names: HashSet::new(),
             is_typed_array: true,
+            iterator_method: None,
         },
     );
     Ok(())

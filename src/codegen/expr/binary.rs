@@ -34,6 +34,20 @@ impl<'a> FuncContext<'a> {
             return Ok(WasmType::F64);
         }
 
+        // `Symbol` is a compile-time-only token: tscc has no runtime `Symbol`
+        // type. The only recognized form is `[Symbol.iterator]()` as a class
+        // method computed key (handled in `classes::property_key_name`).
+        // Catch any other use early so the user gets a precise hint rather
+        // than the generic "undefined variable" error below.
+        if name == "Symbol" {
+            return Err(self.locate(
+                CompileError::codegen(
+                    "'Symbol' is a compile-time-only token; only `[Symbol.iterator]() {...}` as a class method key is recognized",
+                ),
+                ident.span.start,
+            ));
+        }
+
         // Check boxed variables first — load through pointer
         if let Some(&actual_ty) = self.boxed_var_types.get(name) {
             let &(ptr_idx, _) = self.locals.get(name).unwrap();

@@ -27,6 +27,8 @@ mod generics;
 mod hashers;
 #[path = "it/inheritance.rs"]
 mod inheritance;
+#[path = "it/iterators.rs"]
+mod iterators;
 #[path = "it/maps.rs"]
 mod maps;
 #[path = "it/math.rs"]

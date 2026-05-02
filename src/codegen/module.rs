@@ -128,6 +128,13 @@ pub struct ModuleContext {
     /// populate `FuncContext::return_class` so `return {...};` can thread the
     /// expected shape.
     pub fn_return_classes: HashMap<String, String>,
+    /// Iterable classes whose iterator is a trivial single-cursor walk over a
+    /// backing `Array<T>` field. Populated by
+    /// `iterators::detect_trivial_iterables` after class registration.
+    /// `emit_for_of` consults this map and rewrites against the underlying
+    /// array directly (no `next()` call survives in the wasm). Keyed by the
+    /// iterable class name; empty when no class qualifies.
+    pub trivial_iterables: HashMap<String, super::iterators::TrivialIterableInfo>,
 }
 
 /// A lifted closure function to be added to the WASM module's function table.
@@ -192,6 +199,7 @@ impl ModuleContext {
             helper_registration: RefCell::new(None),
             fn_param_classes: HashMap::new(),
             fn_return_classes: HashMap::new(),
+            trivial_iterables: HashMap::new(),
         }
     }
 
@@ -683,6 +691,19 @@ pub fn compile_module<'a>(
         }
     }
     ctx.class_registry.mark_polymorphic(&polymorphic);
+
+    // Pass 0d: detect iterables whose iterator is a trivial single-cursor walk
+    // over a backing `Array<T>`. Runs after layout registration so the field
+    // map is final, but before any function-body codegen so `emit_for_of` can
+    // dispatch through `ctx.trivial_iterables` without a second AST pass.
+    // Generic templates and monomorphizations are skipped — they keep the
+    // protocol path until per-instantiation bindings are threaded.
+    ctx.trivial_iterables = super::iterators::detect_trivial_iterables(
+        &class_ast_map,
+        &ctx.class_registry,
+        &ctx.class_names,
+        &ctx.non_i32_union_wasm_types,
+    );
 
     // Always initialize arena — it's cheap (one global) and arrays need it even without classes.
     // Reserve the first 8 bytes as a null guard (pointer 0 = null).
@@ -1400,10 +1421,10 @@ fn register_class_methods(
 ) -> Result<(), CompileError> {
     for element in &class.body.body {
         if let ClassElement::MethodDefinition(method) = element {
-            let method_name_str = match &method.key {
-                PropertyKey::StaticIdentifier(ident) => ident.name.as_str(),
-                _ => return Err(CompileError::unsupported("computed method name")),
-            };
+            // Share recognition with `register_class_with_bindings` so the
+            // mangled wasm function name and `method_map` key agree on the
+            // canonical `@@iterator` for `[Symbol.iterator]() { ... }`.
+            let method_name_str = super::classes::property_key_name(&method.key)?;
 
             let func = &method.value;
 

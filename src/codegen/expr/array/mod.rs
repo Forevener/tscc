@@ -343,6 +343,17 @@ impl<'a> FuncContext<'a> {
                     None
                 }
             }
+            // `obj.<F>` / `this.<F>` where `<F>` is an `Array<T>` field on the
+            // owner class. Routes through `field_array_elem_types`, populated
+            // at class-registration time.
+            Expression::StaticMemberExpression(member) => {
+                let class_name = self.resolve_expr_class(&member.object).ok()?;
+                let layout = self.module_ctx.class_registry.get(&class_name)?;
+                layout
+                    .field_array_elem_types
+                    .get(member.property.name.as_str())
+                    .copied()
+            }
             _ => None,
         }
     }
@@ -505,6 +516,17 @@ impl<'a> FuncContext<'a> {
                 } else {
                     None
                 }
+            }
+            // `obj.<F>` / `this.<F>` where `<F>` is an `Array<C>` field for
+            // some class `C`. Threads the element class through the same path
+            // as `local_array_elem_classes` does for local bindings.
+            Expression::StaticMemberExpression(member) => {
+                let class_name = self.resolve_expr_class(&member.object).ok()?;
+                let layout = self.module_ctx.class_registry.get(&class_name)?;
+                layout
+                    .field_array_elem_classes
+                    .get(member.property.name.as_str())
+                    .cloned()
             }
             _ => None,
         }

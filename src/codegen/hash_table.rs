@@ -306,6 +306,8 @@ pub fn register_layout(
             field_map,
             field_class_types: HashMap::new(),
             field_string_types: HashSet::new(),
+            field_array_elem_types: HashMap::new(),
+            field_array_elem_classes: HashMap::new(),
             methods: HashMap::new(),
             parent: None,
             is_polymorphic: false,
@@ -314,6 +316,7 @@ pub fn register_layout(
             vtable_offset: 0,
             own_field_names,
             is_typed_array: false,
+            iterator_method: None,
         },
     );
     Ok(())

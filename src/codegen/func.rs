@@ -24,8 +24,7 @@ pub struct FuncContext<'a> {
     pub emitted: Vec<EmittedChunk>,
     local_types: Vec<ValType>,
     param_count: u32,
-    #[allow(dead_code)]
-    return_type: WasmType,
+    pub(crate) return_type: WasmType,
     /// Stack of (break_depth, continue_depth) for loops
     pub(crate) loop_stack: Vec<LoopLabels>,
     /// Current WASM block nesting depth
@@ -75,11 +74,32 @@ pub struct FuncContext<'a> {
     /// `Never` cases) so guarded branches see the refined effective
     /// type.
     pub(crate) refinement_env: RefinementEnv,
+    /// Active `for..of` cleanup frames for user-defined iterables whose
+    /// iterator class declared `return()`. Pushed at the top of
+    /// `emit_for_of_user_iterable`, popped at the bottom. Read by
+    /// `emit_return` to call `__it.return()` on each active frame
+    /// (innermost first, mirroring spec) before the wasm `Return`.
+    /// Empty in the common case — zero overhead when no iterable
+    /// declares `return()`.
+    pub(crate) for_of_cleanups: Vec<ForOfCleanup>,
 }
 
 pub(crate) struct LoopLabels {
     pub(crate) break_depth: u32,
     pub(crate) continue_depth: u32,
+}
+
+/// One active iterator that needs cleanup on early function-return. The
+/// `break`-cleanup case is handled inline by the loop's block structure
+/// (no stack consultation needed); this stack only exists so `emit_return`
+/// can run cleanup for outer iterables when nested inside the loop body.
+#[derive(Debug, Clone)]
+pub(crate) struct ForOfCleanup {
+    /// Local index holding the iterator pointer.
+    pub iter_local: u32,
+    /// Static class name of the iterator — drives the parent-chain method
+    /// lookup for `return`, including polymorphic vs monomorphic dispatch.
+    pub iter_class: String,
 }
 
 impl<'a> FuncContext<'a> {
@@ -117,6 +137,7 @@ impl<'a> FuncContext<'a> {
             type_bindings: None,
             return_class: None,
             refinement_env: RefinementEnv::default(),
+            for_of_cleanups: Vec::new(),
         }
     }
 

@@ -90,6 +90,13 @@ tscc has: full closures, arena allocation (no GC), deterministic output, complet
 - `extends`, `super()`, `super.method()`, vtable-based polymorphic dispatch
 - Override validation
 
+### User-defined iterables
+
+- A class declaring `[Symbol.iterator](): It` participates in `for..of` when `It` declares `next(): { value: T; done: boolean }`. `[Symbol.iterator]` is the only computed key recognized; other computed keys still error. Self-iterable (`[Symbol.iterator]() { return this; }`) and separate iterator-class shapes both work; subclasses inherit iterability without re-declaring.
+- `iterator.return()` runs on `break` and on early function-return through the loop (innermost first for nested loops); normal completion (`done=true`) skips it per spec. Its declared return type is ignored — `return(): void` and `return(): { value: T; done: boolean }` are interchangeable for cleanup.
+- `iterator.throw()` is rejected with a deferred-feature error — gated on the long-term exceptions roadmap.
+- Built-in `for..of` over `Array<T>` / typed arrays is unchanged (lowers via direct desugaring, not the protocol path).
+
 ### Closures
 
 - First-class: store in variables, pass to and return from functions

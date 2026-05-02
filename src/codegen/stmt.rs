@@ -5,7 +5,7 @@ use wasm_encoder::{BlockType, Instruction};
 use crate::error::CompileError;
 use crate::types::{self, WasmType};
 
-use super::func::{FuncContext, LoopLabels};
+use super::func::{ForOfCleanup, FuncContext, LoopLabels};
 
 impl<'a> FuncContext<'a> {
     pub fn emit_statement(&mut self, stmt: &Statement<'a>) -> Result<(), CompileError> {
@@ -702,7 +702,8 @@ impl<'a> FuncContext<'a> {
     }
 
     fn emit_return(&mut self, ret: &ReturnStatement<'a>) -> Result<(), CompileError> {
-        if let Some(arg) = &ret.argument {
+        // Step 1: emit the return value onto the stack (when present).
+        let returns_value = if let Some(arg) = &ret.argument {
             match arg {
                 Expression::ObjectExpression(obj) => {
                     let expected = self.return_class.clone();
@@ -725,7 +726,43 @@ impl<'a> FuncContext<'a> {
                     self.emit_expr_coerced(arg, target.as_deref())?;
                 }
             }
+            true
+        } else {
+            false
+        };
+
+        // Step 2: when `return` lands inside one or more `for..of` loops over
+        // user iterables that declared `return()`, run cleanup before the
+        // wasm `Return`. Spec order: innermost iterator first. Stash the
+        // return value (if any) in a temp local so cleanup calls don't
+        // disturb the stack, restore right before the actual `Return`.
+        if !self.for_of_cleanups.is_empty() {
+            let return_value_local = if returns_value {
+                let local = self.alloc_local(self.return_type);
+                self.push(Instruction::LocalSet(local));
+                Some(local)
+            } else {
+                None
+            };
+
+            // Clone first — the cleanup loop calls helpers that mutate self.
+            let frames = self.for_of_cleanups.clone();
+            for frame in frames.iter().rev() {
+                let ret_ty = self.emit_zero_arg_method_call_on_local(
+                    frame.iter_local,
+                    &frame.iter_class,
+                    "return",
+                )?;
+                if ret_ty != WasmType::Void {
+                    self.push(Instruction::Drop);
+                }
+            }
+
+            if let Some(local) = return_value_local {
+                self.push(Instruction::LocalGet(local));
+            }
         }
+
         self.push(Instruction::Return);
         Ok(())
     }
@@ -948,10 +985,37 @@ impl<'a> FuncContext<'a> {
             return self.emit_for_of_typed_array(for_of, &elem_name, desc);
         }
 
-        // Resolve array element type from the right-hand expression
-        let elem_ty = self.resolve_expr_array_elem(&for_of.right).ok_or_else(|| {
-            CompileError::codegen("for..of requires an Array<T> — cannot resolve element type")
-        })?;
+        // Resolve array element type from the right-hand expression. When this
+        // misses we fall through to the user-iterable path: the receiver may
+        // be a class implementing `[Symbol.iterator]()`. Only after both
+        // arms miss do we surface the "not iterable" diagnostic.
+        let elem_ty = match self.resolve_expr_array_elem(&for_of.right) {
+            Some(t) => t,
+            None => {
+                if let Ok(class_name) = self.resolve_expr_class(&for_of.right) {
+                    // Fast path: iterable's iterator is a trivial single-cursor
+                    // walk over a backing `Array<T>`. Lower against that array
+                    // directly — no `next()` call survives in the wasm.
+                    if let Some(trivial) =
+                        self.module_ctx.trivial_iterables.get(&class_name).cloned()
+                    {
+                        return self.emit_for_of_trivial_iterable(for_of, &elem_name, trivial);
+                    }
+                    if let Some(info) = super::iterators::resolve_iterator_protocol(
+                        &self.module_ctx.class_registry,
+                        &class_name,
+                    )? {
+                        return self.emit_for_of_user_iterable(
+                            for_of, &elem_name, &class_name, info,
+                        );
+                    }
+                }
+                return Err(CompileError::codegen(
+                    "for..of requires an Array<T>, typed array, or a class implementing \
+                     `[Symbol.iterator](): Iterator<T>`",
+                ));
+            }
+        };
         let elem_class = self.resolve_expr_array_elem_class(&for_of.right);
         let elem_size: i32 = match elem_ty {
             WasmType::F64 => 8,
@@ -1179,6 +1243,415 @@ impl<'a> FuncContext<'a> {
         self.block_depth -= 1;
 
         Ok(())
+    }
+
+
+    /// Trivial-iterator inlining: `for (const x of iterable)` where
+    /// `iterable.<bufferField>: Array<T>` is the single backing buffer and
+    /// the iterator class does nothing more than walk it with a cursor.
+    /// `iterators::detect_trivial_iterables` validates the shape ahead of
+    /// time; here we just unwrap one level of indirection (load the buffer
+    /// pointer) and run the standard `Array<T>` lowering — same wasm as
+    /// writing `for (const x of iterable.<bufferField>)`.
+    fn emit_for_of_trivial_iterable(
+        &mut self,
+        for_of: &ForOfStatement<'a>,
+        elem_name: &str,
+        info: super::iterators::TrivialIterableInfo,
+    ) -> Result<(), CompileError> {
+        use super::expr::ARRAY_HEADER_SIZE;
+
+        let elem_size: i32 = match info.elem_wasm_ty {
+            WasmType::F64 => 8,
+            WasmType::I32 => 4,
+            _ => {
+                return Err(CompileError::type_err(
+                    "invalid array element type for for..of",
+                ));
+            }
+        };
+
+        // Evaluate iterable, save to local; load buffer field once.
+        let iterable_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(&for_of.right)?;
+        self.push(Instruction::LocalSet(iterable_local));
+
+        let arr_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(iterable_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: info.buffer_offset as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(arr_local));
+
+        // Length, counter — same skeleton as the array path.
+        let len_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: 0,
+            align: 2,
+            memory_index: 0,
+        }));
+        self.push(Instruction::LocalSet(len_local));
+
+        let i_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::I32Const(0));
+        self.push(Instruction::LocalSet(i_local));
+
+        let elem_local = self.declare_local(elem_name, info.elem_wasm_ty);
+        if let Some(class_name) = &info.elem_class {
+            self.local_class_types
+                .insert(elem_name.to_string(), class_name.clone());
+        }
+        if info.elem_is_string {
+            self.local_string_vars.insert(elem_name.to_string());
+        }
+        if let ForStatementLeft::VariableDeclaration(var_decl) = &for_of.left
+            && var_decl.kind == VariableDeclarationKind::Const
+        {
+            self.const_locals.insert(elem_name.to_string());
+        }
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let break_depth = self.block_depth;
+        self.push(Instruction::Loop(BlockType::Empty));
+        self.block_depth += 1;
+
+        // if i >= len, break.
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::LocalGet(len_local));
+        self.push(Instruction::I32GeU);
+        self.push(Instruction::BrIf(1));
+
+        // elem = arr[HEADER + i*size]
+        self.push(Instruction::LocalGet(arr_local));
+        self.push(Instruction::I32Const(ARRAY_HEADER_SIZE as i32));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(elem_size));
+        self.push(Instruction::I32Mul);
+        self.push(Instruction::I32Add);
+        match info.elem_wasm_ty {
+            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 3,
+                memory_index: 0,
+            })),
+            WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            })),
+            _ => unreachable!(),
+        }
+        self.push(Instruction::LocalSet(elem_local));
+
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let continue_depth = self.block_depth;
+        self.loop_stack.push(LoopLabels {
+            break_depth,
+            continue_depth,
+        });
+
+        self.emit_statement(&for_of.body)?;
+
+        self.loop_stack.pop();
+        self.push(Instruction::End); // continue block
+        self.block_depth -= 1;
+
+        // i++
+        self.push(Instruction::LocalGet(i_local));
+        self.push(Instruction::I32Const(1));
+        self.push(Instruction::I32Add);
+        self.push(Instruction::LocalSet(i_local));
+
+        self.push(Instruction::Br(0));
+
+        self.push(Instruction::End); // loop
+        self.block_depth -= 1;
+        self.push(Instruction::End); // outer block
+        self.block_depth -= 1;
+
+        Ok(())
+    }
+
+    /// `for (const x of obj)` over a class implementing the user iterable
+    /// protocol — `[Symbol.iterator](): It` where `It` has
+    /// `next(): { value: T; done: boolean }`. Lowers to the canonical
+    /// protocol loop, with an extra cleanup block when the iterator class
+    /// declares `return()` (Phase 2b spec divergence fix):
+    ///
+    /// ```text
+    /// __it = obj.[Symbol.iterator]()
+    /// block $break_target
+    ///   block $cleanup_target           // only when has_return_method
+    ///     loop $loop
+    ///       __r = __it.next()
+    ///       if __r.done: br $break_target   // skip cleanup on normal end
+    ///       elem = __r.value
+    ///       block $continue
+    ///         body                       // user `break` -> br $cleanup_target
+    ///       end
+    ///       br $loop
+    ///     end
+    ///   end
+    ///   __it.return(); drop              // emitted iff has_return_method
+    /// end
+    /// ```
+    ///
+    /// Early function-return cleanup is handled separately by `emit_return`,
+    /// which walks `for_of_cleanups` (pushed/popped here) to call `return()`
+    /// on every active outer iterator before the wasm `Return`.
+    fn emit_for_of_user_iterable(
+        &mut self,
+        for_of: &ForOfStatement<'a>,
+        elem_name: &str,
+        iterable_class: &str,
+        info: super::iterators::IteratorInfo,
+    ) -> Result<(), CompileError> {
+        // 1. Evaluate the iterable expression, save to a local. We only
+        //    call `[Symbol.iterator]()` once (per spec), so the receiver
+        //    can be discarded after the call returns the iterator.
+        let iterable_local = self.alloc_local(WasmType::I32);
+        self.emit_expr(&for_of.right)?;
+        self.push(Instruction::LocalSet(iterable_local));
+
+        // 2. Call `iterable.[Symbol.iterator]()`, save iterator pointer.
+        self.emit_zero_arg_method_call_on_local(
+            iterable_local,
+            iterable_class,
+            super::classes::ITERATOR_METHOD_NAME,
+        )?;
+        let iter_local = self.alloc_local(WasmType::I32);
+        self.push(Instruction::LocalSet(iter_local));
+
+        // 3. Result-pointer local, reused per iteration. The iterator
+        //    typically allocates a fresh result object inside `next()`,
+        //    but the consumer side only needs one slot.
+        let result_local = self.alloc_local(WasmType::I32);
+
+        // 4. Element local with the value type from the result shape.
+        let elem_local = self.declare_local(elem_name, info.value_wasm_ty);
+        if let Some(class_name) = &info.value_class {
+            self.local_class_types
+                .insert(elem_name.to_string(), class_name.clone());
+        }
+        if info.value_is_string {
+            self.local_string_vars.insert(elem_name.to_string());
+        }
+        if let ForStatementLeft::VariableDeclaration(var_decl) = &for_of.left
+            && var_decl.kind == VariableDeclarationKind::Const
+        {
+            self.const_locals.insert(elem_name.to_string());
+        }
+
+        // 5. Open block(s). With cleanup, we have two: outer `break_target`
+        //    (skipped on normal completion) and inner `cleanup_target`
+        //    (where user-`break` lands so the cleanup code below runs as
+        //    the block falls through to its end).
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let break_target_depth = self.block_depth;
+
+        let cleanup_target_depth = if info.has_return_method {
+            self.push(Instruction::Block(BlockType::Empty));
+            self.block_depth += 1;
+            // Push cleanup frame so a `return` inside the body can locate
+            // this iterator. Frame is popped after the body emits.
+            self.for_of_cleanups.push(ForOfCleanup {
+                iter_local,
+                iter_class: info.iter_class.clone(),
+            });
+            Some(self.block_depth)
+        } else {
+            None
+        };
+
+        self.push(Instruction::Loop(BlockType::Empty));
+        self.block_depth += 1;
+
+        // 6. __r = __it.next()
+        self.emit_zero_arg_method_call_on_local(iter_local, &info.iter_class, "next")?;
+        self.push(Instruction::LocalSet(result_local));
+
+        // 7. If __r.done is nonzero, the iterator is finished — jump past
+        //    the cleanup block (normal completion does NOT call return()).
+        self.push(Instruction::LocalGet(result_local));
+        self.push(Instruction::I32Load(wasm_encoder::MemArg {
+            offset: info.done_offset as u64,
+            align: 2,
+            memory_index: 0,
+        }));
+        let done_relative = self.block_depth - break_target_depth;
+        self.push(Instruction::BrIf(done_relative));
+
+        // 8. elem = __r.value (load via the value field's WasmType).
+        self.push(Instruction::LocalGet(result_local));
+        match info.value_wasm_ty {
+            WasmType::F64 => self.push(Instruction::F64Load(wasm_encoder::MemArg {
+                offset: info.value_offset as u64,
+                align: 3,
+                memory_index: 0,
+            })),
+            WasmType::I32 => self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: info.value_offset as u64,
+                align: 2,
+                memory_index: 0,
+            })),
+            other => {
+                return Err(CompileError::type_err(format!(
+                    "iterator value type {other:?} is not supported in `for..of` (only i32 / f64)"
+                )));
+            }
+        }
+        self.push(Instruction::LocalSet(elem_local));
+
+        // 9. Continue target, body, loop-back. `break_depth` points at
+        //    the cleanup_target (when present) so user-`break` falls
+        //    through to the cleanup code below; the array path's
+        //    direct-to-break_target wiring is preserved when no cleanup.
+        self.push(Instruction::Block(BlockType::Empty));
+        self.block_depth += 1;
+        let continue_depth = self.block_depth;
+        let break_routes_to = cleanup_target_depth.unwrap_or(break_target_depth);
+        self.loop_stack.push(LoopLabels {
+            break_depth: break_routes_to,
+            continue_depth,
+        });
+
+        self.emit_statement(&for_of.body)?;
+
+        self.loop_stack.pop();
+        self.push(Instruction::End); // continue block
+        self.block_depth -= 1;
+
+        self.push(Instruction::Br(0)); // loop back
+
+        self.push(Instruction::End); // loop
+        self.block_depth -= 1;
+
+        // 10. Cleanup-target end + cleanup code, when present. Falls
+        //     through here on user-`break`; on normal completion the
+        //     done-check above jumped over it. The `return()` result
+        //     is dropped — for..of consumes only `next()`'s done flag.
+        if info.has_return_method {
+            self.push(Instruction::End); // cleanup block
+            self.block_depth -= 1;
+            let ret_ty = self.emit_zero_arg_method_call_on_local(
+                iter_local,
+                &info.iter_class,
+                "return",
+            )?;
+            if ret_ty != WasmType::Void {
+                self.push(Instruction::Drop);
+            }
+            // Pop cleanup frame after emitting it — outer for..ofs around
+            // this one keep their own frames in place for nested cleanup.
+            self.for_of_cleanups.pop();
+        }
+
+        self.push(Instruction::End); // break_target
+        self.block_depth -= 1;
+
+        Ok(())
+    }
+
+    /// Emit a zero-argument method call where the receiver is already in
+    /// `receiver_local`. Walks the parent chain to find the declaring
+    /// class (since `methods` only carries directly-declared entries), and
+    /// dispatches via vtable for polymorphic classes or `Call(idx)` for
+    /// monomorphic ones. Used by `emit_for_of_user_iterable` —
+    /// `try_emit_method_call` only handles AST-rooted calls, but the
+    /// `[Symbol.iterator]()` and `next()` calls have no AST node.
+    fn emit_zero_arg_method_call_on_local(
+        &mut self,
+        receiver_local: u32,
+        receiver_class: &str,
+        method_name: &str,
+    ) -> Result<WasmType, CompileError> {
+        // Walk parent chain via method_map (mirrors try_emit_method_call).
+        let (func_idx, ret_ty) = {
+            let mut found = None;
+            let mut cur = receiver_class.to_string();
+            loop {
+                let key = format!("{cur}.{method_name}");
+                if let Some(&v) = self.module_ctx.method_map.get(&key) {
+                    found = Some(v);
+                    break;
+                }
+                match self.module_ctx.class_registry.get(&cur) {
+                    Some(layout) => match &layout.parent {
+                        Some(p) => cur = p.clone(),
+                        None => break,
+                    },
+                    None => break,
+                }
+            }
+            found.ok_or_else(|| {
+                CompileError::codegen(format!(
+                    "internal: class '{receiver_class}' has no method '{method_name}'"
+                ))
+            })?
+        };
+
+        let layout = self
+            .module_ctx
+            .class_registry
+            .get(receiver_class)
+            .ok_or_else(|| {
+                CompileError::codegen(format!("unknown class '{receiver_class}'"))
+            })?;
+
+        if layout.is_polymorphic {
+            let &slot = layout.vtable_method_map.get(method_name).ok_or_else(|| {
+                CompileError::codegen(format!(
+                    "method '{method_name}' not in vtable of '{receiver_class}'"
+                ))
+            })?;
+            let method_sig = layout.methods.get(method_name).ok_or_else(|| {
+                CompileError::codegen(format!(
+                    "method '{method_name}' not declared on '{receiver_class}' \
+                     (vtable lookup needs the signature)"
+                ))
+            })?;
+
+            // (this) for the call; (this) again for vtable lookup.
+            self.push(Instruction::LocalGet(receiver_local));
+            self.push(Instruction::LocalGet(receiver_local));
+            self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            self.push(Instruction::I32Load(wasm_encoder::MemArg {
+                offset: (slot as u64) * 4,
+                align: 2,
+                memory_index: 0,
+            }));
+
+            let mut param_types = vec![wasm_encoder::ValType::I32]; // this
+            for (_, pty) in &method_sig.params {
+                if let Some(vt) = pty.to_val_type() {
+                    param_types.push(vt);
+                }
+            }
+            let result_types = super::wasm_types::wasm_results(method_sig.return_type);
+            let type_idx = self
+                .module_ctx
+                .get_or_add_type_sig(param_types, result_types);
+            self.push(Instruction::CallIndirect {
+                type_index: type_idx,
+                table_index: 0,
+            });
+        } else {
+            self.push(Instruction::LocalGet(receiver_local));
+            self.push(Instruction::Call(func_idx));
+        }
+
+        Ok(ret_ty)
     }
 
     fn emit_switch(&mut self, switch: &SwitchStatement<'a>) -> Result<(), CompileError> {

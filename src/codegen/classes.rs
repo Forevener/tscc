@@ -23,6 +23,17 @@ pub struct ClassLayout {
     pub field_class_types: HashMap<String, String>,
     /// Fields that are string-typed
     pub field_string_types: HashSet<String>,
+    /// Field name -> element `WasmType` for fields whose declared type is
+    /// `Array<T>` (or its `T[]` shorthand). Lets member-access codegen
+    /// (`this.<F>[i]`, `this.<F>.length`) route through the array path
+    /// without needing a temp local first. `field_array_elem_classes`
+    /// carries the element class name when `T` is itself a class.
+    pub field_array_elem_types: HashMap<String, WasmType>,
+    /// Field name -> element class name for `Array<T>`-typed fields where
+    /// `T` is a class. Threads element-class info into member-access
+    /// resolution so `for (const x of this.<F>) { x.method(); }` keeps the
+    /// loop binding's static type.
+    pub field_array_elem_classes: HashMap<String, String>,
     /// Method name -> (param_types including this, return_type)
     pub methods: HashMap<String, MethodSig>,
     /// Parent class name (for single inheritance)
@@ -47,6 +58,14 @@ pub struct ClassLayout {
     /// `fields` (which stays empty for typed arrays).
     #[allow(dead_code, reason = "consumed by typed-array sub-phases 2+")]
     pub is_typed_array: bool,
+    /// Canonical method name (e.g. `"@@iterator"`) when this class declares
+    /// `[Symbol.iterator]()`. Phase 1 only populates the slot — `for..of`
+    /// lowering against user iterables consumes it in Phase 2. `None` does
+    /// NOT mean "not iterable": a subclass may inherit the method without
+    /// re-declaring it; consult the parent chain via `methods` lookup at
+    /// the call site.
+    #[allow(dead_code, reason = "consumed by Phase 2 for..of dispatch")]
+    pub iterator_method: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +222,8 @@ impl ClassRegistry {
         let mut field_map = HashMap::new();
         let mut field_class_types = HashMap::new();
         let mut field_string_types = HashSet::new();
+        let mut field_array_elem_types: HashMap<String, WasmType> = HashMap::new();
+        let mut field_array_elem_classes: HashMap<String, String> = HashMap::new();
         let mut methods = HashMap::new();
         let mut own_field_names = HashSet::new();
         let mut vtable_methods: Vec<String> = Vec::new();
@@ -224,6 +245,8 @@ impl ClassRegistry {
             field_map = parent_layout.field_map.clone();
             field_class_types = parent_layout.field_class_types.clone();
             field_string_types = parent_layout.field_string_types.clone();
+            field_array_elem_types = parent_layout.field_array_elem_types.clone();
+            field_array_elem_classes = parent_layout.field_array_elem_classes.clone();
 
             // Inherit methods (child overrides will replace these)
             methods = parent_layout.methods.clone();
@@ -276,6 +299,24 @@ impl ClassRegistry {
                         // Track string fields
                         if types::is_string_type_with_bindings(ann, bindings) {
                             field_string_types.insert(field_name.clone());
+                        }
+                        // Track Array<T> fields — capture both element WasmType
+                        // and (when T is a class) the element class name so
+                        // `this.<F>[i]` / `this.<F>.length` codegen can route
+                        // through the array path without a temp-local detour.
+                        if let Some(elem_ty) =
+                            types::get_array_element_type(ann, class_names, union_overrides)
+                        {
+                            field_array_elem_types.insert(field_name.clone(), elem_ty);
+                            if let Some(elem_class) = types::get_array_element_class_with_bindings(
+                                ann,
+                                bindings,
+                                shape_registry,
+                                union_registry,
+                            ) && class_names.contains(&elem_class)
+                            {
+                                field_array_elem_classes.insert(field_name.clone(), elem_class);
+                            }
                         }
                     }
 
@@ -442,6 +483,12 @@ impl ClassRegistry {
         // Align total size to 8 bytes
         let size = if offset == 0 { 0 } else { (offset + 7) & !7 };
 
+        let iterator_method = if methods.contains_key(ITERATOR_METHOD_NAME) {
+            Some(ITERATOR_METHOD_NAME.to_string())
+        } else {
+            None
+        };
+
         self.classes.insert(
             name.clone(),
             ClassLayout {
@@ -451,6 +498,8 @@ impl ClassRegistry {
                 field_map,
                 field_class_types,
                 field_string_types,
+                field_array_elem_types,
+                field_array_elem_classes,
                 methods,
                 parent: parent_name,
                 is_polymorphic,
@@ -459,6 +508,7 @@ impl ClassRegistry {
                 vtable_offset: 0, // set later during vtable construction
                 own_field_names,
                 is_typed_array: false,
+                iterator_method,
             },
         );
 
@@ -518,6 +568,8 @@ impl ClassRegistry {
                 field_map,
                 field_class_types,
                 field_string_types,
+                field_array_elem_types: HashMap::new(),
+                field_array_elem_classes: HashMap::new(),
                 methods: HashMap::new(),
                 parent: None,
                 is_polymorphic: false,
@@ -526,6 +578,7 @@ impl ClassRegistry {
                 vtable_offset: 0,
                 own_field_names,
                 is_typed_array: false,
+                iterator_method: None,
             },
         );
 
@@ -609,9 +662,29 @@ pub fn find_polymorphic_classes(class_info: &[(String, Option<String>)]) -> Hash
     result
 }
 
-fn property_key_name(key: &PropertyKey) -> Result<String, CompileError> {
+/// Canonical internal name for a `[Symbol.iterator]()` method. The `@@` prefix
+/// can never collide with a TS user identifier (TS rejects `@` in identifiers),
+/// so callers can safely look up `methods["@@iterator"]` without ambiguity.
+/// Mirrors the well-known-symbol notation used in the ECMAScript spec
+/// (e.g. `@@iterator`, `@@asyncIterator`).
+pub const ITERATOR_METHOD_NAME: &str = "@@iterator";
+
+pub(crate) fn property_key_name(key: &PropertyKey) -> Result<String, CompileError> {
     match key {
         PropertyKey::StaticIdentifier(ident) => Ok(ident.name.as_str().to_string()),
-        _ => Err(CompileError::unsupported("computed property key")),
+        // `[Symbol.iterator]() {...}` — the only computed key currently
+        // recognized. oxc parses computed keys as inherited Expression
+        // variants on PropertyKey; we match the exact AST shape
+        // (Identifier `Symbol` . `iterator`) and lower to a canonical
+        // internal name. Any other computed expression remains unsupported.
+        PropertyKey::StaticMemberExpression(member)
+            if matches!(&member.object, Expression::Identifier(obj) if obj.name.as_str() == "Symbol")
+                && member.property.name.as_str() == "iterator" =>
+        {
+            Ok(ITERATOR_METHOD_NAME.to_string())
+        }
+        _ => Err(CompileError::unsupported(
+            "computed property key (only [Symbol.iterator] is recognized)",
+        )),
     }
 }

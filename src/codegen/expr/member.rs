@@ -16,6 +16,21 @@ impl<'a> FuncContext<'a> {
     ) -> Result<WasmType, CompileError> {
         // Check for enum member access: EnumName.MemberName → global lookup
         if let Expression::Identifier(obj_ident) = &member.object {
+            // `Symbol.iterator` (and any future well-known Symbol member) is a
+            // compile-time-only token — never a runtime value. It is recognized
+            // only as a class-method computed key (`classes::property_key_name`).
+            // Reject `const x = Symbol.iterator;` etc. with a precise hint.
+            if obj_ident.name.as_str() == "Symbol" {
+                return Err(self.locate(
+                    CompileError::codegen(format!(
+                        "'Symbol.{}' is a compile-time-only token, not a runtime value; \
+                         use it only as a class-method computed key, e.g. `[Symbol.iterator]() {{ ... }}`",
+                        member.property.name.as_str()
+                    )),
+                    member.span.start,
+                ));
+            }
+
             let enum_member_key = format!(
                 "{}.{}",
                 obj_ident.name.as_str(),
